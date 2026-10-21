@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from model import MARUPA, load_compatible_model_state
 from ucf_test import test
 from utils.dataset import UCFDataset
-from utils.tools import get_batch_label, get_prompt_text
+from utils.tools import get_batch_label, get_prompt_text, safe_load_checkpoint
 import ucf_option
 
 
@@ -188,7 +188,7 @@ def train(args):
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         print(f"Resuming from checkpoint: {args.checkpoint_path}", flush=True)
-        cp = torch.load(args.checkpoint_path, map_location=device)
+        cp = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         load_compatible_model_state(model, cp['model_state_dict'], strict=False)
         optimizer.load_state_dict(cp['optimizer_state_dict'])
         scheduler.load_state_dict(cp['scheduler_state_dict'])

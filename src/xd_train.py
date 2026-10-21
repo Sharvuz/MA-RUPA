@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from model import MARUPA, load_compatible_model_state
 from xd_test import test
 from utils.dataset import XDDataset
-from utils.tools import get_batch_label, get_prompt_text, xd_collate_fn
+from utils.tools import get_batch_label, get_prompt_text, xd_collate_fn, safe_load_checkpoint
 import xd_option
 
 
@@ -137,6 +137,17 @@ def train(args):
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
 
+    # Auto-detect audio feature dimension from dataset if available
+    detected_audio_dim = None
+    for idx in range(min(50, len(train_dataset))):
+        sample_audio = train_dataset[idx][3]
+        if sample_audio is not None and isinstance(sample_audio, torch.Tensor):
+            detected_audio_dim = sample_audio.shape[-1]
+            break
+    if detected_audio_dim is not None and detected_audio_dim != args.audio_dim:
+        print(f"[Auto-Detect] Audio feature dimension on disk is {detected_audio_dim}-D (command-line was {args.audio_dim}-D). Auto-adjusting args.audio_dim to {detected_audio_dim}!", flush=True)
+        args.audio_dim = detected_audio_dim
+
     # Initialize model
     model = MARUPA(
         num_class=args.classes_num,
@@ -178,7 +189,7 @@ def train(args):
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         print(f"Resuming from checkpoint: {args.checkpoint_path}", flush=True)
-        cp = torch.load(args.checkpoint_path, map_location=device)
+        cp = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         load_compatible_model_state(model, cp['model_state_dict'], strict=False)
         optimizer.load_state_dict(cp['optimizer_state_dict'])
         scheduler.load_state_dict(cp['scheduler_state_dict'])

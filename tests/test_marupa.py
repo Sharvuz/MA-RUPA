@@ -49,6 +49,13 @@ def test_modality_branch():
     assert s_aux_m.shape == (B, T, 1)
     print("  ModalityAdaptiveBranch motion residual mode passed!")
 
+    # 3. With 512-D audio (e.g. CLAP / AST features)
+    audio_512 = torch.randn(B, 32, 512)
+    f_fused_512, s_aux_512, _, _ = branch(f_base, visual_raw, audio_features=audio_512)
+    assert f_fused_512.shape == (B, T, D)
+    assert s_aux_512.shape == (B, T, 1)
+    print("  ModalityAdaptiveBranch with 512-D audio passed!")
+
 
 def test_gradient_safe_rupa():
     print("Testing GradientSafeRUPA...")

@@ -313,6 +313,8 @@ class ModalityAdaptiveBranch(nn.Module):
 
         # Audio projector (from audio_dim to embed_dim)
         self.audio_proj = TemporalConvProjector(audio_dim, embed_dim, kernel_size=3, padding=1)
+        # Dedicated projector for 512-D audio features (e.g. CLAP / AST / 512-D audio)
+        self.audio_proj_512 = TemporalConvProjector(embed_dim, embed_dim, kernel_size=3, padding=1)
 
         # Motion residual projector (from 2*embed_dim to embed_dim)
         self.motion_proj = TemporalConvProjector(embed_dim * 2, embed_dim, kernel_size=3, padding=1)
@@ -391,8 +393,18 @@ class ModalityAdaptiveBranch(nn.Module):
             else:
                 audio_t = audio_features.transpose(1, 2)  # [B, D_a, T]
 
-            # Project audio features to dimension D
-            f_a = self.audio_proj(audio_t).transpose(1, 2)  # [B, T, D]
+            # Project audio features to dimension D with automatic dimension routing
+            in_dim = audio_t.shape[1]
+            if in_dim == self.embed_dim:
+                f_a = self.audio_proj_512(audio_t).transpose(1, 2)
+            elif in_dim == self.audio_dim:
+                f_a = self.audio_proj(audio_t).transpose(1, 2)
+            else:
+                # Dynamic 1x1 conv adapter for any other dimension (e.g. 768-D from AST)
+                if not hasattr(self, '_dyn_audio_adapter') or self._dyn_audio_adapter.in_channels != in_dim:
+                    self._dyn_audio_adapter = nn.Conv1d(in_dim, self.embed_dim, kernel_size=1).to(audio_t.device)
+                adapted_audio = self._dyn_audio_adapter(audio_t)
+                f_a = self.audio_proj_512(adapted_audio).transpose(1, 2)
         else:
             # Missing-Modality / Motion-Residual Mode (UCF-Crime or Audio Fallback)
             motion = self.compute_motion_residuals(visual_raw)  # [B, T, 2*D]

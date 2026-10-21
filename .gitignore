@@ -15,6 +15,7 @@ datasets/
 features/
 outputs/
 results/
+result/
 model/
 dtset/
 rupa_artifacts/

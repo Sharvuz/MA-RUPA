@@ -7,7 +7,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from model import MARUPA, load_compatible_model_state
 from utils.dataset import XDDataset
-from utils.tools import get_batch_mask, get_prompt_text, smooth_scores
+from utils.tools import get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint
 from utils.xd_detectionMAP import getDetectionMAP as dmAP
 import xd_option
 
@@ -45,8 +45,10 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     model.eval()
 
     element_logits2_stack = []
-    ap1_list = []
-    ap2_list = []
+    ap_routing_list = []
+    ap_det_list = []
+    ap_sem_list = []
+    ap_ens_list = []
 
     smooth_eval = getattr(args, 'smooth_eval', True)
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
@@ -105,46 +107,79 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
                 logits1[0:len_cur], logits2[0:len_cur], args.temp,
                 None if routing_scores is None else routing_scores[0:len_cur],
             )
-            prob2 = 1.0 - optimized_probs[:, 0]
+            
+            # Stream 1: Routing prediction
             if routing_scores is None:
-                prob1 = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
+                prob_routing = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
             else:
-                prob1 = routing_scores[0:len_cur].squeeze(-1)
+                prob_routing = routing_scores[0:len_cur].squeeze(-1)
+
+            # Stream 2: Base detector prediction
+            if 'detector_scores' in dnp_dict:
+                prob_det = dnp_dict['detector_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
+            else:
+                prob_det = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
+
+            # Stream 3: Zero-shot semantic alignment prediction
+            p_align = F.softmax(logits2[0:len_cur] / args.temp, dim=-1)
+            prob_sem = 1.0 - p_align[:, 0]
+
+            # Stream 4: Dual ensemble
+            prob_ens = 0.5 * prob_routing + 0.5 * prob_det
 
             # Detach to numpy
-            prob1_np = prob1.cpu().numpy()
-            prob2_np = prob2.cpu().numpy()
+            p_routing_np = prob_routing.cpu().numpy()
+            p_det_np = prob_det.cpu().numpy()
+            p_sem_np = prob_sem.cpu().numpy()
+            p_ens_np = prob_ens.cpu().numpy()
 
             # Optional temporal smoothing
             if smooth_eval:
-                prob1_np = smooth_scores(prob1_np, method=smooth_method, sigma=smooth_sigma)
-                prob2_np = smooth_scores(prob2_np, method=smooth_method, sigma=smooth_sigma)
+                p_routing_np = smooth_scores(p_routing_np, method=smooth_method, sigma=smooth_sigma)
+                p_det_np = smooth_scores(p_det_np, method=smooth_method, sigma=smooth_sigma)
+                p_sem_np = smooth_scores(p_sem_np, method=smooth_method, sigma=smooth_sigma)
+                p_ens_np = smooth_scores(p_ens_np, method=smooth_method, sigma=smooth_sigma)
 
-            ap1_list.append(prob1_np)
-            ap2_list.append(prob2_np)
+            ap_routing_list.append(p_routing_np)
+            ap_det_list.append(p_det_np)
+            ap_sem_list.append(p_sem_np)
+            ap_ens_list.append(p_ens_np)
 
             elem_l2 = optimized_probs.detach().cpu().numpy()
             elem_l2 = np.repeat(elem_l2, 16, axis=0)
             element_logits2_stack.append(elem_l2)
 
-    all_scores1 = np.concatenate(ap1_list, axis=0)
-    all_scores2 = np.concatenate(ap2_list, axis=0)
+    all_scores_routing = np.concatenate(ap_routing_list, axis=0)
+    all_scores_det = np.concatenate(ap_det_list, axis=0)
+    all_scores_sem = np.concatenate(ap_sem_list, axis=0)
+    all_scores_ens = np.concatenate(ap_ens_list, axis=0)
 
     # Repeat 16x for frame-level evaluation & sanitize non-finites
-    frame_scores1 = np.nan_to_num(np.repeat(all_scores1, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores2 = np.nan_to_num(np.repeat(all_scores2, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_routing = np.nan_to_num(np.repeat(all_scores_routing, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_det = np.nan_to_num(np.repeat(all_scores_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_sem = np.nan_to_num(np.repeat(all_scores_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_ens = np.nan_to_num(np.repeat(all_scores_ens, 16), nan=0.0, posinf=1.0, neginf=0.0)
 
     # Match length with ground truth
-    min_len1 = min(len(gt), len(frame_scores1))
-    roc1 = roc_auc_score(gt[:min_len1], frame_scores1[:min_len1])
-    ap1 = average_precision_score(gt[:min_len1], frame_scores1[:min_len1])
+    min_len = min(len(gt), len(frame_scores_routing))
+    gt_eval = gt[:min_len]
 
-    min_len2 = min(len(gt), len(frame_scores2))
-    roc2 = roc_auc_score(gt[:min_len2], frame_scores2[:min_len2])
-    ap2 = average_precision_score(gt[:min_len2], frame_scores2[:min_len2])
+    roc_routing = roc_auc_score(gt_eval, frame_scores_routing[:min_len])
+    ap_routing = average_precision_score(gt_eval, frame_scores_routing[:min_len])
 
-    print(f"[Evaluation] Frame-level AP (Routing): {ap1 * 100:.2f}% | AUC: {roc1 * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AP (Semantics): {ap2 * 100:.2f}% | AUC: {roc2 * 100:.2f}%", flush=True)
+    roc_det = roc_auc_score(gt_eval, frame_scores_det[:min_len])
+    ap_det = average_precision_score(gt_eval, frame_scores_det[:min_len])
+
+    roc_sem = roc_auc_score(gt_eval, frame_scores_sem[:min_len])
+    ap_sem = average_precision_score(gt_eval, frame_scores_sem[:min_len])
+
+    roc_ens = roc_auc_score(gt_eval, frame_scores_ens[:min_len])
+    ap_ens = average_precision_score(gt_eval, frame_scores_ens[:min_len])
+
+    print(f"[Evaluation] Frame-level AP (Routing): {ap_routing * 100:.2f}% | AUC: {roc_routing * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Detector): {ap_det * 100:.2f}% | AUC: {roc_det * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Semantics): {ap_sem * 100:.2f}% | AUC: {roc_sem * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Ensemble): {ap_ens * 100:.2f}% | AUC: {roc_ens * 100:.2f}%", flush=True)
 
     avg_map = 0.0
     try:
@@ -158,8 +193,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
     sys.stdout.flush()
 
-    best_ap = max(ap1, ap2)
-    best_auc = max(roc1, roc2)
+    best_ap = max(ap_routing, ap_det, ap_sem, ap_ens)
+    best_auc = max(roc_routing, roc_det, roc_sem, roc_ens)
     return best_auc, best_ap, avg_map
 
 
@@ -184,6 +219,17 @@ if __name__ == '__main__':
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
 
+    # Auto-detect audio feature dimension from dataset if available
+    detected_audio_dim = None
+    for idx in range(min(50, len(test_dataset))):
+        sample_audio = test_dataset[idx][3]
+        if sample_audio is not None and isinstance(sample_audio, torch.Tensor):
+            detected_audio_dim = sample_audio.shape[-1]
+            break
+    if detected_audio_dim is not None and detected_audio_dim != args.audio_dim:
+        print(f"[Auto-Detect] Audio feature dimension on disk is {detected_audio_dim}-D. Auto-adjusting args.audio_dim to {detected_audio_dim}!", flush=True)
+        args.audio_dim = detected_audio_dim
+
     model = MARUPA(
         num_class=args.classes_num,
         embed_dim=args.embed_dim,
@@ -197,7 +243,7 @@ if __name__ == '__main__':
     )
 
     if args.model_path:
-        checkpoint = torch.load(args.model_path, map_location=device)
+        checkpoint = safe_load_checkpoint(args.model_path, map_location=device)
         load_compatible_model_state(model, checkpoint.get('model_state_dict', checkpoint), strict=False)
 
     test(model, test_loader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, args, device)

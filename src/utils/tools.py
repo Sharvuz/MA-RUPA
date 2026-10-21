@@ -154,3 +154,12 @@ def smooth_scores(scores: np.ndarray, method: str = 'gaussian', sigma: float = 1
         smoothed = savgol_filter(scores, window_length=wl, polyorder=1)
         return np.nan_to_num(smoothed, nan=0.0, posinf=1.0, neginf=0.0)
     return scores
+
+
+def safe_load_checkpoint(path: str, map_location=None):
+    """Safely load a PyTorch checkpoint supporting PyTorch 2.6+ weights_only policy."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
