@@ -212,6 +212,57 @@ def test_dataparallel_scalar_loss_reduction():
     print("  DataParallel multi-GPU loss reduction simulation passed!")
 
 
+def test_padded_sequence_attention_nan_guard():
+    print("Testing Padded Sequence Window Attention NaN Guard...")
+    device = 'cpu'
+    B, T, D, C = 2, 256, 512, 14
+
+    class Args:
+        no_mdtp = False
+        no_audio = False
+        no_rupa = False
+        no_safegate = False
+        sampling = 'topk'
+        visual_length = 256
+        visual_width = 512
+        visual_head = 4
+        visual_layers = 2
+        attn_window = 8
+        classes_num = 14
+        embed_dim = 512
+        temp = 5.0
+        mlp_dropout = 0.1
+
+    args = Args()
+    model = MARUPA(
+        num_class=C, embed_dim=D, visual_length=T, visual_width=D,
+        visual_head=4, visual_layers=2, attn_window=8, args=args, device=device
+    )
+    model.eval()
+
+    # Test short video (e.g., 50 frames padded to 256) where multiple windows are 100% padded
+    visual = torch.randn(B, T, D)
+    lengths = torch.tensor([50, 80])
+    padding_mask = torch.arange(T)[None, :] >= lengths[:, None]
+    text = list(DESCRIPTIONS_ORI.keys())
+
+    with torch.no_grad():
+        out = model(visual, padding_mask, text, lengths=lengths, audio=None, DNP_use=True)
+        dnp = out[5]
+        s_routing = dnp['routing_scores']
+        s_det = dnp['detector_scores']
+        s_rec = dnp['reconstruction_scores']
+        s_sem = dnp['semantic_scores']
+        s_aux = dnp['aux_scores']
+
+        assert not torch.isnan(s_routing).any(), "s_routing contains NaN on padded sequence!"
+        assert not torch.isnan(s_det).any(), "s_det contains NaN on padded sequence!"
+        assert not torch.isnan(s_rec).any(), "s_rec contains NaN on padded sequence!"
+        assert not torch.isnan(s_sem).any(), "s_sem contains NaN on padded sequence!"
+        assert not torch.isnan(s_aux).any(), "s_aux contains NaN on padded sequence!"
+    print("  Padded sequence window attention NaN guard passed!")
+
+
 if __name__ == '__main__':
     test_mdt_backbone()
     test_modality_branch()
@@ -220,4 +271,5 @@ if __name__ == '__main__':
     test_marupa_end_to_end()
     test_ablations()
     test_dataparallel_scalar_loss_reduction()
+    test_padded_sequence_attention_nan_guard()
     print("\n[SUCCESS] ALL TESTS PASSED SUCCESSFULLY!")

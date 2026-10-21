@@ -137,11 +137,13 @@ def xd_collate_fn(batch):
 
 def smooth_scores(scores: np.ndarray, method: str = 'gaussian', sigma: float = 1.5, window_length: int = 5):
     """Smooth 1D anomaly score curve using Gaussian or Savitzky-Golay filter."""
+    scores = np.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0)
     if len(scores) < 3:
         return scores
     if method == 'gaussian':
         from scipy.ndimage import gaussian_filter1d
-        return gaussian_filter1d(scores, sigma=sigma)
+        smoothed = gaussian_filter1d(scores, sigma=sigma)
+        return np.nan_to_num(smoothed, nan=0.0, posinf=1.0, neginf=0.0)
     elif method == 'savgol':
         from scipy.signal import savgol_filter
         wl = min(window_length, len(scores))
@@ -149,5 +151,6 @@ def smooth_scores(scores: np.ndarray, method: str = 'gaussian', sigma: float = 1
             wl -= 1
         if wl <= 2:
             return scores
-        return savgol_filter(scores, window_length=wl, polyorder=1)
+        smoothed = savgol_filter(scores, window_length=wl, polyorder=1)
+        return np.nan_to_num(smoothed, nan=0.0, posinf=1.0, neginf=0.0)
     return scores

@@ -130,9 +130,9 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     all_scores1 = np.concatenate(ap1_list, axis=0)
     all_scores2 = np.concatenate(ap2_list, axis=0)
 
-    # Repeat 16x for frame-level evaluation
-    frame_scores1 = np.repeat(all_scores1, 16)
-    frame_scores2 = np.repeat(all_scores2, 16)
+    # Repeat 16x for frame-level evaluation & sanitize non-finites
+    frame_scores1 = np.nan_to_num(np.repeat(all_scores1, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores2 = np.nan_to_num(np.repeat(all_scores2, 16), nan=0.0, posinf=1.0, neginf=0.0)
 
     # Match length with ground truth
     min_len1 = min(len(gt), len(frame_scores1))

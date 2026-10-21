@@ -68,8 +68,16 @@ class WindowedAttentionBlock(nn.Module):
             key_padding_mask=key_padding_mask,
             need_weights=False
         )
+        # Numerical guard: When an entire local window consists of padded frames,
+        # PyTorch MultiheadAttention computes softmax([-inf, ...]) = NaN. Replace with 0.0.
+        attn_out = torch.nan_to_num(attn_out, nan=0.0)
         x = x + attn_out
-        x = x + self.mlp(self.ln_2(x))
+        mlp_out = self.mlp(self.ln_2(x))
+        if key_padding_mask is not None:
+            mlp_out = mlp_out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+        x = x + mlp_out
+        if key_padding_mask is not None:
+            x = x.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
         return x
 
 
@@ -393,6 +401,7 @@ class ModalityAdaptiveBranch(nn.Module):
 
         # Bidirectional Cross-Modal Attention: Query=F_base, Key=F_a, Value=F_a
         attn_out, _ = self.cross_attn(query=f_base, key=f_a, value=f_a, need_weights=False)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0)
         f_v_from_a = self.ln_cross(attn_out)
 
         # Dynamic Noise Suppression Gate G_av: [B, T, D]
