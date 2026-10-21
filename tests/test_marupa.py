@@ -183,6 +183,35 @@ def test_ablations():
     print("  Ablations (--no-mdtp, --no-audio, --no-rupa, --no-safegate) passed!")
 
 
+def test_dataparallel_scalar_loss_reduction():
+    print("Testing DataParallel multi-GPU loss reduction simulation...")
+    # Simulate multi-GPU gathered losses (shape [2] for 2 GPUs)
+    g_loss_gathered = torch.tensor([0.45, 0.42], requires_grad=True)
+    orth_loss_gathered = torch.tensor([0.15, 0.18], requires_grad=True)
+    mil_loss = torch.tensor(0.69, requires_grad=True)
+
+    # Reduction via .mean()
+    loss_gather = g_loss_gathered.mean()
+    loss_orth = orth_loss_gathered.mean()
+
+    total_loss = (mil_loss + 0.1 * loss_gather + 0.1 * loss_orth).mean()
+    assert total_loss.dim() == 0, f"Expected 0-D scalar, got dim {total_loss.dim()}"
+
+    # Verify backward works without error
+    total_loss.backward()
+    assert g_loss_gathered.grad is not None
+    assert orth_loss_gathered.grad is not None
+
+    # Verify .item() works on all terms
+    val_total = total_loss.item()
+    val_gather = loss_gather.item()
+    val_orth = loss_orth.item()
+    assert isinstance(val_total, float)
+    assert isinstance(val_gather, float)
+    assert isinstance(val_orth, float)
+    print("  DataParallel multi-GPU loss reduction simulation passed!")
+
+
 if __name__ == '__main__':
     test_mdt_backbone()
     test_modality_branch()
@@ -190,4 +219,5 @@ if __name__ == '__main__':
     test_quad_safegate()
     test_marupa_end_to_end()
     test_ablations()
+    test_dataparallel_scalar_loss_reduction()
     print("\n[SUCCESS] ALL TESTS PASSED SUCCESSFULLY!")

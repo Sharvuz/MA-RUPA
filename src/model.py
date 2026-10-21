@@ -631,8 +631,8 @@ class GradientSafeRUPA(nn.Module):
             agg_prototype = blk(agg_prototype, normal_input)
 
         dynamic_normal_patterns = agg_prototype  # [B, M, D]
-        g_loss = self.gather_loss(selected_normal, dynamic_normal_patterns, reliability)
-        orth_loss = self.prototype_orthogonality_loss(dynamic_normal_patterns)
+        g_loss = self.gather_loss(selected_normal, dynamic_normal_patterns, reliability).view(1)
+        orth_loss = self.prototype_orthogonality_loss(dynamic_normal_patterns).view(1)
 
         # Counterfactual normal reconstruction
         bottleneck_features = f_fused
@@ -1066,9 +1066,9 @@ class MARUPA(nn.Module):
                 'original_features': f_fused,
                 'reconstructed_features': f_fused,
                 'residual_features': torch.zeros_like(f_fused),
-                'g_loss': torch.tensor(0.0, device=visual.device),
-                'orth_loss': torch.tensor(0.0, device=visual.device),
-                'dnp_normal_loss': torch.tensor(0.0, device=visual.device),
+                'g_loss': torch.zeros(1, device=visual.device),
+                'orth_loss': torch.zeros(1, device=visual.device),
+                'dnp_normal_loss': torch.zeros(1, device=visual.device),
             })
 
         # Event-centric & Background-centric attention pooling

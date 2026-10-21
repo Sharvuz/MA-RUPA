@@ -86,8 +86,10 @@ def compute_residual_event_loss(residual_logits: torch.Tensor, labels: torch.Ten
     return loss
 
 
-def compute_normal_contrastive_loss(text_features: torch.Tensor, device: torch.device):
+def compute_normal_contrastive_loss(text_features: torch.Tensor, device: torch.device, num_classes: int = None):
     """Encourages text representations of normal vs. anomalies to remain distinct."""
+    if num_classes is not None and text_features.shape[0] > num_classes:
+        text_features = text_features[:num_classes]
     norm_text = F.normalize(text_features, dim=-1)
     normal_vec = norm_text[0]  # [D]
     anom_vecs = norm_text[1:]  # [C-1, D]
@@ -244,21 +246,21 @@ def train(args):
             s_det = dnp_dict['detector_scores']
 
             # 1. Primary & Auxiliary MIL Losses
-            loss_mil_routing = compute_topk_mil_loss(p_routing, binary_labels, lengths_batch, device)
-            loss_mil_aux = compute_topk_mil_loss(s_aux, binary_labels, lengths_batch, device)
-            loss_mil_det = compute_topk_mil_loss(s_det, binary_labels, lengths_batch, device)
+            loss_mil_routing = compute_topk_mil_loss(p_routing, binary_labels, lengths_batch, device).mean()
+            loss_mil_aux = compute_topk_mil_loss(s_aux, binary_labels, lengths_batch, device).mean()
+            loss_mil_det = compute_topk_mil_loss(s_det, binary_labels, lengths_batch, device).mean()
 
             # 2. Temporal Smoothness & Sparsity
-            loss_smooth = compute_temporal_smoothness_loss(p_routing, lengths_batch)
+            loss_smooth = compute_temporal_smoothness_loss(p_routing, lengths_batch).mean()
 
             # 3. RUPA Prototype Losses (modulated by curriculum ramp-up omega(e))
-            loss_gather = dnp_dict.get('g_loss', torch.tensor(0.0, device=device))
-            loss_orth = dnp_dict.get('orth_loss', torch.tensor(0.0, device=device))
+            loss_gather = dnp_dict.get('g_loss', torch.tensor(0.0, device=device)).mean()
+            loss_orth = dnp_dict.get('orth_loss', torch.tensor(0.0, device=device)).mean()
 
             if 'residual_semantic_logits' in dnp_dict:
                 loss_residual = compute_residual_event_loss(
                     dnp_dict['residual_semantic_logits'], one_hot_labels, lengths_batch, device
-                )
+                ).mean()
             else:
                 loss_residual = torch.tensor(0.0, device=device)
 
@@ -266,9 +268,11 @@ def train(args):
             loss_gate = (gate_val ** 2).mean()
 
             # Text Orthogonality Regularization
-            loss_text_orth = compute_normal_contrastive_loss(text_features, device)
+            loss_text_orth = compute_normal_contrastive_loss(
+                text_features, device, num_classes=len(prompt_text)
+            ).mean()
 
-            # Total Loss Computation
+            # Total Loss Computation (guaranteed 0-D scalar for backward())
             total_loss = (
                 loss_mil_routing
                 + 0.5 * loss_mil_det
@@ -281,7 +285,7 @@ def train(args):
                     + args.lambda_residual * loss_residual
                     + args.lambda_gate * loss_gate
                 )
-            )
+            ).mean()
 
             optimizer.zero_grad()
             total_loss.backward()
