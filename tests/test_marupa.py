@@ -270,6 +270,69 @@ def test_padded_sequence_attention_nan_guard():
     print("  Padded sequence window attention NaN guard passed!")
 
 
+def test_xd_test_collate_and_split_mismatch():
+    print("Testing xd_test_collate_fn & Split Count Mismatch...")
+    from utils.tools import xd_test_collate_fn
+    from torch.utils.data import DataLoader
+
+    # 1. Test collate_fn with audio = None
+    sample_none_audio = (
+        torch.randn(256, 512),
+        "Fighting",
+        180,
+        "/path/to/test.npy",
+        "Fighting",
+        None
+    )
+    col_out = xd_test_collate_fn([sample_none_audio])
+    assert len(col_out) == 6
+    assert col_out[0].shape == (1, 256, 512)
+    assert col_out[5] is None
+    print("  xd_test_collate_fn with audio=None passed!")
+
+    # 2. Test collate_fn with audio = Tensor
+    sample_with_audio = (
+        torch.randn(256, 512),
+        "Fighting",
+        180,
+        "/path/to/test.npy",
+        "Fighting",
+        torch.randn(256, 512)
+    )
+    col_out_a = xd_test_collate_fn([sample_with_audio])
+    assert len(col_out_a) == 6
+    assert col_out_a[5].shape == (1, 256, 512)
+    print("  xd_test_collate_fn with audio=Tensor passed!")
+
+    # 3. Test DataLoader with mixed dataset containing None
+    class DummyXDTestDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 4
+        def __getitem__(self, idx):
+            if idx % 2 == 0:
+                return torch.randn(256, 512), "Normal", 256, "p", "Normal", None
+            return torch.randn(256, 512), "Fighting", 256, "p", "Fighting", torch.randn(256, 512)
+
+    loader = DataLoader(DummyXDTestDataset(), batch_size=1, shuffle=False, collate_fn=xd_test_collate_fn)
+    for batch_idx, item in enumerate(loader):
+        assert item[0].shape == (1, 256, 512)
+        if batch_idx % 2 == 0:
+            assert item[5] is None
+        else:
+            assert item[5] is not None and item[5].shape == (1, 256, 512)
+    print("  DataLoader iteration with xd_test_collate_fn passed!")
+
+    # 4. Test ModalityAdaptiveBranch split count mismatch (visual has 3 chunks, audio has 2 chunks)
+    branch = ModalityAdaptiveBranch(embed_dim=512, audio_dim=512)
+    f_base = torch.randn(3, 256, 512)
+    visual_raw = torch.randn(3, 256, 512)
+    audio_mismatch = torch.randn(2, 256, 512)
+    f_fused, s_aux, _, _ = branch(f_base, visual_raw, audio_features=audio_mismatch)
+    assert f_fused.shape == (3, 256, 512)
+    assert s_aux.shape == (3, 256, 1)
+    print("  ModalityAdaptiveBranch split count mismatch recovery passed!")
+
+
 if __name__ == '__main__':
     test_mdt_backbone()
     test_modality_branch()
@@ -279,4 +342,5 @@ if __name__ == '__main__':
     test_ablations()
     test_dataparallel_scalar_loss_reduction()
     test_padded_sequence_attention_nan_guard()
+    test_xd_test_collate_and_split_mismatch()
     print("\n[SUCCESS] ALL TESTS PASSED SUCCESSFULLY!")

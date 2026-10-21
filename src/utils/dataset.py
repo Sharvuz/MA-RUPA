@@ -9,15 +9,19 @@ import utils.tools as tools
 
 
 _KAGGLE_FILE_MAP = None
+_KAGGLE_AUDIO_MAP = None
 
 
-def get_kaggle_file_map():
-    """Scans and indexes all .npy files in /kaggle/input and /kaggle/working once."""
-    global _KAGGLE_FILE_MAP
-    if _KAGGLE_FILE_MAP is not None:
-        return _KAGGLE_FILE_MAP
+def get_kaggle_file_maps():
+    """Scans and indexes all .npy files in /kaggle/input and /kaggle/working once.
+    Maintains a general file map and an audio-prioritized file map.
+    """
+    global _KAGGLE_FILE_MAP, _KAGGLE_AUDIO_MAP
+    if _KAGGLE_FILE_MAP is not None and _KAGGLE_AUDIO_MAP is not None:
+        return _KAGGLE_FILE_MAP, _KAGGLE_AUDIO_MAP
 
     _KAGGLE_FILE_MAP = {}
+    _KAGGLE_AUDIO_MAP = {}
     search_dirs = []
     for d in ['/kaggle/input', '/kaggle/working', 'data', 'dataset']:
         if os.path.exists(d):
@@ -25,19 +29,41 @@ def get_kaggle_file_map():
 
     for root_dir in search_dirs:
         for dirpath, _, filenames in os.walk(root_dir):
+            dir_lower = dirpath.lower()
+            is_audio_dir = any(kw in dir_lower for kw in ['audio', 'vgg', 'clap', 'ast', 'sound', 'wav'])
             for fname in filenames:
                 if fname.endswith('.npy'):
                     full_p = os.path.join(dirpath, fname)
                     _KAGGLE_FILE_MAP[fname] = full_p
-                    # Map '#' and '+' equivalents for Kaggle filename safety
-                    if '+' in fname:
-                        _KAGGLE_FILE_MAP[fname.replace('+', '#')] = full_p
-                    if '#' in fname:
-                        _KAGGLE_FILE_MAP[fname.replace('#', '+')] = full_p
-                    if '_' in fname and ('+' in fname or '#' in fname):
-                        _KAGGLE_FILE_MAP[fname.replace('+', '_').replace('#', '_')] = full_p
+                    if is_audio_dir:
+                        _KAGGLE_AUDIO_MAP[fname] = full_p
 
-    return _KAGGLE_FILE_MAP
+                    # Map '#' and '+' equivalents for Kaggle filename safety
+                    variants = [fname]
+                    if '+' in fname:
+                        variants.append(fname.replace('+', '#'))
+                    if '#' in fname:
+                        variants.append(fname.replace('#', '+'))
+                    if '_' in fname and ('+' in fname or '#' in fname):
+                        variants.append(fname.replace('+', '_').replace('#', '_'))
+
+                    for v in variants:
+                        if v not in _KAGGLE_FILE_MAP:
+                            _KAGGLE_FILE_MAP[v] = full_p
+                        if is_audio_dir and v not in _KAGGLE_AUDIO_MAP:
+                            _KAGGLE_AUDIO_MAP[v] = full_p
+
+    return _KAGGLE_FILE_MAP, _KAGGLE_AUDIO_MAP
+
+
+def get_kaggle_file_map():
+    file_map, _ = get_kaggle_file_maps()
+    return file_map
+
+
+def get_kaggle_audio_map():
+    _, audio_map = get_kaggle_file_maps()
+    return audio_map
 
 
 def get_path_variants(path_or_name: str) -> list[str]:
@@ -108,15 +134,11 @@ def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
             if os.path.exists(candidate):
                 return candidate
 
-    # 2. Check Kaggle file map
-    k_map = get_kaggle_file_map()
+    # 2. Check Kaggle audio-prioritized file map
+    audio_map = get_kaggle_audio_map()
     for name in target_names:
-        if name in k_map and os.path.exists(k_map[name]):
-            # Verify it's an audio feature
-            cand = k_map[name]
-            cand_lower = cand.lower()
-            if 'audio' in cand_lower or 'vgg' in cand_lower or 'clap' in cand_lower:
-                return cand
+        if name in audio_map and os.path.exists(audio_map[name]):
+            return audio_map[name]
 
     # 3. Common directory substitutions
     substitutions = [
@@ -128,6 +150,8 @@ def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
         ('XDTestClipFeatures', 'XDTestAudioFeatures'),
         ('XDTrainClipFeatures', 'XDTrainVGGishFeatures'),
         ('XDTestClipFeatures', 'XDTestVGGishFeatures'),
+        ('clip', 'audio'),
+        ('CLIP', 'AUDIO'),
     ]
     for old_sub, new_sub in substitutions:
         if old_sub in visual_path:
@@ -144,6 +168,15 @@ def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
             for v in get_path_variants(cand_no_crop):
                 if os.path.exists(v):
                     return v
+
+    # 4. Check general Kaggle file map with audio keywords
+    k_map = get_kaggle_file_map()
+    for name in target_names:
+        if name in k_map and os.path.exists(k_map[name]):
+            cand = k_map[name]
+            cand_lower = cand.lower()
+            if any(kw in cand_lower for kw in ['audio', 'vgg', 'clap', 'ast', 'sound', 'wav']):
+                return cand
 
     return None
 

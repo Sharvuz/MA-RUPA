@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from model import MARUPA, load_compatible_model_state
 from xd_test import test
 from utils.dataset import XDDataset
-from utils.tools import get_batch_label, get_prompt_text, xd_collate_fn, safe_load_checkpoint
+from utils.tools import get_batch_label, get_prompt_text, xd_collate_fn, xd_test_collate_fn, safe_load_checkpoint
 import xd_option
 
 
@@ -130,7 +130,7 @@ def train(args):
         audio_file_path=args.audio_test_list, audio_dir=args.audio_dir,
         data_dir=args.data_dir, no_audio=args.no_audio
     )
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=xd_test_collate_fn)
 
     prompt_text = get_prompt_text(label_map)
     gt = np.load(args.gt_path)
@@ -140,7 +140,8 @@ def train(args):
     # Auto-detect audio feature dimension from dataset if available
     detected_audio_dim = None
     for idx in range(min(50, len(train_dataset))):
-        sample_audio = train_dataset[idx][3]
+        item_tuple = train_dataset[idx]
+        sample_audio = item_tuple[3] if len(item_tuple) >= 4 else item_tuple[-1]
         if sample_audio is not None and isinstance(sample_audio, torch.Tensor):
             detected_audio_dim = sample_audio.shape[-1]
             break

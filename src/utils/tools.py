@@ -135,6 +135,66 @@ def xd_collate_fn(batch):
     return visual_batch, labels, lengths, audio_batch
 
 
+def xd_test_collate_fn(batch):
+    """Custom collate function for XDDataset test dataloader (batch_size=1).
+    
+    Safely handles test samples where audio is None or missing, preventing
+    PyTorch's default_collate from raising:
+    TypeError: default_collate: batch must contain tensors... found <class 'NoneType'>.
+    """
+    if len(batch) == 1:
+        item = batch[0]
+        # In test mode, item is:
+        # (clip_tensor, label, clip_length, path, label2, audio_feature)
+        clip_tensor = item[0]
+        if isinstance(clip_tensor, torch.Tensor):
+            visual = clip_tensor.unsqueeze(0)
+        else:
+            visual = torch.tensor(clip_tensor, dtype=torch.float32).unsqueeze(0)
+
+        label = [item[1]]
+        length = item[2] if isinstance(item[2], torch.Tensor) else torch.tensor([item[2]], dtype=torch.long)
+        path = [item[3]] if len(item) > 3 else []
+        label2 = [item[4]] if len(item) > 4 else []
+
+        audio = None
+        if len(item) >= 6 and item[5] is not None:
+            if isinstance(item[5], torch.Tensor):
+                audio = item[5].unsqueeze(0)
+            else:
+                audio = torch.tensor(item[5], dtype=torch.float32).unsqueeze(0)
+
+        return visual, label, length, path, label2, audio
+
+    # Fallback for len(batch) > 1
+    visuals = torch.stack([
+        it[0] if isinstance(it[0], torch.Tensor) else torch.tensor(it[0], dtype=torch.float32)
+        for it in batch
+    ], dim=0)
+    labels = [it[1] for it in batch]
+    lengths = torch.tensor([it[2] for it in batch], dtype=torch.long)
+    paths = [it[3] for it in batch] if len(batch[0]) > 3 else []
+    labels2 = [it[4] for it in batch] if len(batch[0]) > 4 else []
+    audios = [it[5] for it in batch] if len(batch[0]) >= 6 else []
+
+    if not any(a is not None for a in audios):
+        audio_batch = None
+    else:
+        first_a = next(a for a in audios if a is not None)
+        target_shape = first_a.shape
+        audio_list = []
+        for a in audios:
+            if a is None:
+                audio_list.append(torch.zeros(target_shape, dtype=torch.float32))
+            else:
+                if not isinstance(a, torch.Tensor):
+                    a = torch.tensor(a, dtype=torch.float32)
+                audio_list.append(a)
+        audio_batch = torch.stack(audio_list, dim=0)
+
+    return visuals, labels, lengths, paths, labels2, audio_batch
+
+
 def smooth_scores(scores: np.ndarray, method: str = 'gaussian', sigma: float = 1.5, window_length: int = 5):
     """Smooth 1D anomaly score curve using Gaussian or Savitzky-Golay filter."""
     scores = np.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0)

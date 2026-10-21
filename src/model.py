@@ -384,6 +384,19 @@ class ModalityAdaptiveBranch(nn.Module):
             elif audio_features.ndim == 4:
                 audio_features = audio_features.squeeze(0)
 
+            # Align batch/split dimension with visual base features if needed
+            B_v = f_base.shape[0]
+            B_a = audio_features.shape[0]
+            if B_a != B_v:
+                if B_a < B_v:
+                    pad_splits = torch.zeros(
+                        B_v - B_a, audio_features.shape[1], audio_features.shape[2],
+                        device=audio_features.device, dtype=audio_features.dtype
+                    )
+                    audio_features = torch.cat([audio_features, pad_splits], dim=0)
+                else:
+                    audio_features = audio_features[:B_v]
+
             # If audio sequence length differs from visual, interpolate temporally
             if audio_features.shape[1] != T:
                 audio_t = F.interpolate(

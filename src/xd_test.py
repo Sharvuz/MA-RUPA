@@ -7,7 +7,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from model import MARUPA, load_compatible_model_state
 from utils.dataset import XDDataset
-from utils.tools import get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint
+from utils.tools import get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint, xd_test_collate_fn
 from utils.xd_detectionMAP import getDetectionMAP as dmAP
 import xd_option
 
@@ -212,7 +212,7 @@ if __name__ == '__main__':
         audio_file_path=args.audio_test_list, audio_dir=args.audio_dir,
         data_dir=args.data_dir, no_audio=args.no_audio
     )
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=xd_test_collate_fn)
 
     prompt_text = get_prompt_text(label_map)
     gt = np.load(args.gt_path)
@@ -222,7 +222,8 @@ if __name__ == '__main__':
     # Auto-detect audio feature dimension from dataset if available
     detected_audio_dim = None
     for idx in range(min(50, len(test_dataset))):
-        sample_audio = test_dataset[idx][3]
+        item_tuple = test_dataset[idx]
+        sample_audio = item_tuple[5] if len(item_tuple) >= 6 else item_tuple[-1]
         if sample_audio is not None and isinstance(sample_audio, torch.Tensor):
             detected_audio_dim = sample_audio.shape[-1]
             break
