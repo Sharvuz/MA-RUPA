@@ -56,13 +56,15 @@ parser.add_argument('--routing-aux-weight', default=0.15, type=float, help='Prio
 # Training & Optimization
 parser.add_argument('--max-epoch', default=12, type=int, help='Total training epochs')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size (32 normal + 32 anomaly)')
-parser.add_argument('--lr', type=float, default=2e-4, help='Learning rate for End-to-End AdamW optimizer')
+parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for End-to-End AdamW optimizer (default 1e-4)')
 parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for regularization')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to ramp up RUPA losses: omega(e) = min(1, e/curriculum_epochs)')
+parser.add_argument('--topk-ratio', type=int, default=8, help='Divisor for top-k snippet selection: k = max(1, L // topk_ratio) (default 8 -> ~12.5% frames)')
+parser.add_argument('--label-smoothing', type=float, default=0.02, help='Label smoothing factor for binary MIL loss (default 0.02)')
 
 # Loss Weighting
-parser.add_argument('--lambda-aux', type=float, default=1.0, help='Weight for auxiliary branch MIL loss')
-parser.add_argument('--lambda-smooth', type=float, default=0.1, help='Weight for temporal smoothness & sparsity loss')
+parser.add_argument('--lambda-aux', type=float, default=0.15, help='Weight for auxiliary branch MIL loss (default 0.15 for UCF-Crime)')
+parser.add_argument('--lambda-smooth', type=float, default=0.4, help='Weight for temporal smoothness & sparsity loss (default 0.4)')
 parser.add_argument('--lambda-orth', type=float, default=0.1, help='Weight for prototype orthogonality loss')
 parser.add_argument('--lambda-gather', type=float, default=1.0, help='Weight for DNP gather loss')
 parser.add_argument('--lambda-residual', type=float, default=1.0, help='Weight for residual fine-grained event alignment loss')
@@ -83,7 +85,7 @@ parser.add_argument('--use-checkpoint', default=False, type=str2bool, help='Resu
 # Post-processing & Multi-crop Test Evaluation
 parser.add_argument('--smooth-eval', default=True, type=str2bool, help='Apply temporal score smoothing during evaluation')
 parser.add_argument('--smooth-method', choices=['gaussian', 'savgol'], default='gaussian', help='Temporal smoothing filter method')
-parser.add_argument('--smooth-sigma', default=1.5, type=float, help='Gaussian filter sigma for score smoothing')
+parser.add_argument('--smooth-sigma', default=2.0, type=float, help='Gaussian filter sigma for score smoothing (default 2.0)')
 parser.add_argument('--eval-interval', default=1280, type=int, help='Step interval for mid-epoch evaluation')
 parser.add_argument('--num-workers', default=2, type=int, help='DataLoader workers')
 parser.add_argument('--grad-clip', default=1.0, type=float, help='Max gradient norm for clipping')

@@ -22,21 +22,26 @@ import xd_option
 
 
 def compute_topk_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
-                         lengths: torch.Tensor, device: torch.device):
-    """Computes Top-K Multiple Instance Learning (MIL) Binary Cross-Entropy loss."""
+                         lengths: torch.Tensor, device: torch.device,
+                         topk_ratio: int = 16, label_smoothing: float = 0.0):
+    """Computes Top-K Multiple Instance Learning (MIL) Binary Cross-Entropy loss with optional label smoothing."""
     instance_scores = []
     binary_labels = binary_labels.to(device)
     scores_flat = scores.squeeze(-1)  # [B, T]
 
     for i in range(scores.shape[0]):
         l_i = int(lengths[i].item())
-        k_count = max(1, int(l_i / 16) + 1)
+        k_count = max(1, int(l_i / topk_ratio) + 1)
         valid_scores = scores_flat[i, :l_i]
         topk_vals, _ = torch.topk(valid_scores, k=min(k_count, l_i), largest=True)
         instance_scores.append(topk_vals.mean().view(1))
 
     instance_scores = torch.cat(instance_scores, dim=0)
-    loss = F.binary_cross_entropy(instance_scores.clamp(1e-6, 1.0 - 1e-6), binary_labels.float())
+    targets = binary_labels.float()
+    if label_smoothing > 0.0:
+        targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
+
+    loss = F.binary_cross_entropy(instance_scores.clamp(1e-6, 1.0 - 1e-6), targets)
     return loss
 
 
@@ -244,9 +249,11 @@ def train(args):
             s_det = dnp_dict['detector_scores']
 
             # 1. Primary & Auxiliary MIL Losses
-            loss_mil_routing = compute_topk_mil_loss(p_routing, binary_labels, lengths_batch, device).mean()
-            loss_mil_aux = compute_topk_mil_loss(s_aux, binary_labels, lengths_batch, device).mean()
-            loss_mil_det = compute_topk_mil_loss(s_det, binary_labels, lengths_batch, device).mean()
+            topk_r = getattr(args, 'topk_ratio', 16)
+            lbl_sm = getattr(args, 'label_smoothing', 0.0)
+            loss_mil_routing = compute_topk_mil_loss(p_routing, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
+            loss_mil_aux = compute_topk_mil_loss(s_aux, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
+            loss_mil_det = compute_topk_mil_loss(s_det, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
 
             # 2. Temporal Smoothness & Sparsity
             loss_smooth = compute_temporal_smoothness_loss(p_routing, lengths_batch).mean()
