@@ -91,6 +91,67 @@ def compute_residual_event_loss(residual_logits: torch.Tensor, labels: torch.Ten
     return loss
 
 
+def compute_clasm_loss(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
+                       device: torch.device, k_ratio: int = 16, epsilon: float = 0.05):
+    """Snippet-level multi-class MIL cross-entropy loss against fine-grained categories (Normal + 13 crimes)."""
+    labels_norm = labels.to(device) / labels.to(device).sum(dim=1, keepdim=True).clamp_min(1e-6)
+    num_classes = logits.shape[-1]
+    labels_sm = (1.0 - epsilon) * labels_norm + (epsilon / num_classes)
+
+    instance_logits = []
+    for i in range(logits.shape[0]):
+        l_i = int(lengths[i].item())
+        k_count = max(1, int(l_i / k_ratio) + 1)
+        topk_vals, _ = torch.topk(logits[i, :l_i], k=min(k_count, l_i), largest=True, dim=0)
+        instance_logits.append(topk_vals.mean(dim=0, keepdim=True))
+
+    instance_logits = torch.cat(instance_logits, dim=0)
+    milloss = -torch.mean(torch.sum(labels_sm * F.log_softmax(instance_logits, dim=1), dim=1), dim=0)
+    return milloss
+
+
+def compute_bkg_loss(logits4: torch.Tensor, device: torch.device, num_classes: int = 14, epsilon: float = 0.05):
+    """Background-centric loss forcing reconstructed prototypes to classify as class 0 (Normal)."""
+    nor_logits = logits4.squeeze(1)  # [B, C]
+    target = torch.full_like(nor_logits, epsilon / num_classes, device=device)
+    target[:, 0] = 1.0 - epsilon + (epsilon / num_classes)
+    loss = -torch.mean(torch.sum(target * F.log_softmax(nor_logits, dim=1), dim=1))
+    return loss
+
+
+def compute_consistency_loss(p_routing: torch.Tensor, original_features: torch.Tensor,
+                             reconstructed_features: torch.Tensor, lengths: torch.Tensor,
+                             device: torch.device):
+    """Enforces consistency between detector routing anomaly score and prototype reconstruction error."""
+    cos_sim = F.cosine_similarity(original_features, reconstructed_features, dim=-1)  # [B, T]
+    recon_error = ((1.0 - cos_sim) / 2.0).clamp(0.0, 1.0)
+    pred_score = p_routing.squeeze(-1)  # [B, T]
+
+    B, T = pred_score.shape
+    mask = torch.arange(T, device=device)[None, :] < lengths.to(device)[:, None]
+
+    if not torch.any(mask):
+        return torch.tensor(0.0, device=device)
+
+    return F.mse_loss(pred_score[mask], recon_error[mask])
+
+
+def compute_event_loss(logits3: torch.Tensor, labels: torch.Tensor, device: torch.device, epsilon: float = 0.05):
+    """Event-centric loss matching pooled anomaly features against true crime class."""
+    anom_mask = labels[:, 1:].sum(dim=1) > 0
+    if not torch.any(anom_mask):
+        return torch.tensor(0.0, device=device)
+
+    sub_logits = logits3[anom_mask].squeeze(1)  # [B_anom, C]
+    sub_labels = labels[anom_mask].to(device)
+    num_classes = sub_logits.shape[-1]
+
+    labels_norm = sub_labels / sub_labels.sum(dim=1, keepdim=True).clamp_min(1e-6)
+    labels_sm = (1.0 - epsilon) * labels_norm + (epsilon / num_classes)
+    loss = -torch.mean(torch.sum(labels_sm * F.log_softmax(sub_logits, dim=1), dim=1))
+    return loss
+
+
 def compute_normal_contrastive_loss(text_features: torch.Tensor, device: torch.device, num_classes: int = None):
     """Encourages text representations of normal vs. anomalies to remain distinct."""
     if num_classes is not None and text_features.shape[0] > num_classes:
@@ -212,8 +273,8 @@ def train(args):
         omega = min(1.0, float(epoch_idx) / float(args.curriculum_epochs))
 
         loss_accum = {
-            'mil': 0.0, 'aux': 0.0, 'smooth': 0.0,
-            'gather': 0.0, 'orth': 0.0, 'residual': 0.0, 'gate': 0.0, 'total': 0.0
+            'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'bkg': 0.0, 'consist': 0.0,
+            'smooth': 0.0, 'gather': 0.0, 'orth': 0.0, 'residual': 0.0, 'gate': 0.0, 'total': 0.0
         }
 
         normal_iter = iter(normal_loader)
@@ -257,10 +318,24 @@ def train(args):
             loss_mil_aux = compute_topk_mil_loss(s_aux, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
             loss_mil_det = compute_topk_mil_loss(s_det, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
 
-            # 2. Temporal Smoothness & Sparsity
+            # 2. Multi-class Semantic Alignment & Consistency Losses
+            loss_clasm = compute_clasm_loss(logits2, one_hot_labels, lengths_batch, device).mean()
+            loss_bkg = compute_bkg_loss(logits4, device, num_classes=len(prompt_text)).mean()
+
+            if 'original_features' in dnp_dict and 'reconstructed_features' in dnp_dict:
+                loss_consistency = compute_consistency_loss(
+                    p_routing, dnp_dict['original_features'], dnp_dict['reconstructed_features'], lengths_batch, device
+                ).mean()
+            else:
+                loss_consistency = torch.tensor(0.0, device=device)
+
+            loss_event = compute_event_loss(logits3, one_hot_labels, device).mean()
+            loss_dnp_normal = dnp_dict.get('dnp_normal_loss', torch.tensor(0.0, device=device)).mean()
+
+            # 3. Temporal Smoothness & Sparsity
             loss_smooth = compute_temporal_smoothness_loss(p_routing, lengths_batch).mean()
 
-            # 3. RUPA Prototype Losses (modulated by curriculum ramp-up omega(e))
+            # 4. RUPA Prototype Losses (modulated by curriculum ramp-up omega(e))
             loss_gather = dnp_dict.get('g_loss', torch.tensor(0.0, device=device)).mean()
             loss_orth = dnp_dict.get('orth_loss', torch.tensor(0.0, device=device)).mean()
 
@@ -284,12 +359,17 @@ def train(args):
                 loss_mil_routing
                 + 0.5 * loss_mil_det
                 + args.lambda_aux * loss_mil_aux
+                + getattr(args, 'loss2_weight', 1.0) * loss_clasm
+                + getattr(args, 'lambda_bkg', 0.5) * loss_bkg
+                + getattr(args, 'lambda_consistency', 1.0) * loss_consistency
                 + args.lambda_smooth * loss_smooth
                 + 0.1 * loss_text_orth
                 + omega * (
                     args.lambda_gather * loss_gather
                     + args.lambda_orth * loss_orth
                     + args.lambda_residual * loss_residual
+                    + 0.5 * loss_event
+                    + 0.2 * loss_dnp_normal
                     + args.lambda_gate * loss_gate
                 )
             ).mean()
@@ -306,6 +386,9 @@ def train(args):
             # Accumulate logs
             loss_accum['mil'] += loss_mil_routing.item()
             loss_accum['aux'] += loss_mil_aux.item()
+            loss_accum['clasm'] += loss_clasm.item()
+            loss_accum['bkg'] += loss_bkg.item()
+            loss_accum['consist'] += loss_consistency.item()
             loss_accum['smooth'] += loss_smooth.item()
             loss_accum['gather'] += loss_gather.item()
             loss_accum['orth'] += loss_orth.item()
@@ -318,17 +401,19 @@ def train(args):
                 current_step = (step_idx + 1) * args.batch_size
                 percent = ((step_idx + 1) / total_batches) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}/{total_batches * args.batch_size} ({percent:.1f}%)] "
-                      f"Total Loss: {total_loss.item():.4f} | MIL: {loss_mil_routing.item():.4f} "
-                      f"Aux: {loss_mil_aux.item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"Total: {total_loss.item():.4f} | MIL: {loss_mil_routing.item():.4f} "
+                      f"CLASM: {loss_clasm.item():.4f} | Consist: {loss_consistency.item():.4f} | Aux: {loss_mil_aux.item():.4f} | omega: {omega:.2f}", flush=True)
 
         # End of Epoch Reporting
         avg_total = loss_accum['total'] / iters_per_epoch
         avg_mil = loss_accum['mil'] / iters_per_epoch
+        avg_clasm = loss_accum['clasm'] / iters_per_epoch
+        avg_consist = loss_accum['consist'] / iters_per_epoch
         avg_aux = loss_accum['aux'] / iters_per_epoch
         avg_gather = loss_accum['gather'] / iters_per_epoch
 
         print(f"\n--- Epoch {epoch_idx}/{args.max_epoch} Summary ---")
-        print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Omega: {omega:.2f}")
+        print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Omega: {omega:.2f}")
 
         # Evaluate on Test Set
         eval_model = model.module if hasattr(model, 'module') else model

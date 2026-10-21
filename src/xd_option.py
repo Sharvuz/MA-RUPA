@@ -76,6 +76,8 @@ parser.add_argument('--lambda-gather', type=float, default=1.0, help='Weight for
 parser.add_argument('--lambda-residual', type=float, default=1.0, help='Weight for residual fine-grained event alignment loss')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate regularization loss')
 parser.add_argument('--loss2_weight', type=float, default=2.0, help='Weight for snippet classification loss')
+parser.add_argument('--lambda-consistency', type=float, default=1.0, help='Weight for consistency loss between detector and reconstruction')
+parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss')
 
 # Data & Paths
 parser.add_argument('--train-list', default='list/xd_CLIP_rgb.csv', help='Path to training feature CSV list')

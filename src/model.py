@@ -763,8 +763,8 @@ class QuadSafeGate(nn.Module):
             # XD-Violence (with Audio): alpha=0.40, beta=0.25, gamma=0.15, delta=0.20
             init_w = torch.tensor([0.40, 0.25, 0.15, 0.20], dtype=torch.float32)
         else:
-            # UCF-Crime (Visual + Motion): alpha=0.45, beta=0.40, gamma=0.00, delta=0.15
-            init_w = torch.tensor([0.45, 0.40, 0.00, 0.15], dtype=torch.float32)
+            # UCF-Crime (Visual + Motion): alpha=0.35, beta=0.30, gamma=0.20, delta=0.15
+            init_w = torch.tensor([0.35, 0.30, 0.20, 0.15], dtype=torch.float32)
 
         # Softmax-constrained learnable weights initialized to target prior
         self.prior_logits = nn.Parameter(torch.log(init_w.clamp(min=1e-4)))

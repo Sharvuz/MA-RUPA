@@ -48,7 +48,11 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     ap_routing_list = []
     ap_det_list = []
     ap_sem_list = []
-    ap_ens_list = []
+    ap_sem_rupa_list = []
+    ap_ens_sem_list = []
+    ap_ens_det_list = []
+    ap_ens_tri_list = []
+    ap_hier_list = []
 
     smooth_eval = getattr(args, 'smooth_eval', True)
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
@@ -83,22 +87,26 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
                     visual, padding_mask, prompt_text, lengths, audio=None, DNP_use=True
                 )
                 routing_scores = dnp_dict.get('routing_scores')
-                logits2 = dnp_dict.get('semantic_logits', logits2)
+                semantic_logits = dnp_dict.get('semantic_logits', logits2)
             else:
                 _, logits1, logits2, _, _, dnp_dict = model(
                     visual, padding_mask, prompt_text, lengths, audio=None, DNP_use=False
                 )
                 routing_scores = dnp_dict.get('routing_scores', torch.sigmoid(logits1))
+                semantic_logits = logits2
 
             logits1 = logits1.reshape(-1, logits1.shape[-1])
             logits2 = logits2.reshape(-1, logits2.shape[-1])
             if routing_scores is not None:
                 routing_scores = routing_scores.reshape(-1, routing_scores.shape[-1])
+            if semantic_logits is not None:
+                semantic_logits = semantic_logits.reshape(-1, semantic_logits.shape[-1])
 
             optimized_probs = refine_scores_hierarchical(
                 logits1[0:len_cur], logits2[0:len_cur], args.temp,
                 None if routing_scores is None else routing_scores[0:len_cur],
             )
+            prob_hier = (1.0 - optimized_probs[:, 0]).clamp(0.0, 1.0)
             
             # Stream 1: Routing prediction
             if routing_scores is None:
@@ -112,30 +120,52 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             else:
                 prob_det = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
 
-            # Stream 3: Zero-shot semantic alignment prediction
+            # Stream 3: Zero-shot semantic alignment prediction (Backbone F_fused)
             p_align = F.softmax(logits2[0:len_cur] / args.temp, dim=-1)
             prob_sem = 1.0 - p_align[:, 0]
 
-            # Stream 4: Dual ensemble
-            prob_ens = 0.5 * prob_routing + 0.5 * prob_det
+            # Stream 4: RUPA Semantic Logits
+            p_align_rupa = F.softmax(semantic_logits[0:len_cur] / args.temp, dim=-1)
+            prob_sem_rupa = 1.0 - p_align_rupa[:, 0]
+
+            # Stream 5: SOTA Multi-modal Ensemble (Routing + Semantics)
+            prob_ens_sem = 0.5 * prob_routing + 0.5 * prob_sem
+
+            # Stream 6: Dual Ensemble (Routing + Detector)
+            prob_ens_det = 0.5 * prob_routing + 0.5 * prob_det
+
+            # Stream 7: Tri-Stream Ensemble
+            prob_ens_tri = (prob_routing + prob_det + prob_sem) / 3.0
 
             # Detach to numpy
             p_routing_np = prob_routing.cpu().numpy()
             p_det_np = prob_det.cpu().numpy()
             p_sem_np = prob_sem.cpu().numpy()
-            p_ens_np = prob_ens.cpu().numpy()
+            p_sem_rupa_np = prob_sem_rupa.cpu().numpy()
+            p_ens_sem_np = prob_ens_sem.cpu().numpy()
+            p_ens_det_np = prob_ens_det.cpu().numpy()
+            p_ens_tri_np = prob_ens_tri.cpu().numpy()
+            p_hier_np = prob_hier.cpu().numpy()
 
             # Optional temporal smoothing
             if smooth_eval:
                 p_routing_np = smooth_scores(p_routing_np, method=smooth_method, sigma=smooth_sigma)
                 p_det_np = smooth_scores(p_det_np, method=smooth_method, sigma=smooth_sigma)
                 p_sem_np = smooth_scores(p_sem_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_np = smooth_scores(p_ens_np, method=smooth_method, sigma=smooth_sigma)
+                p_sem_rupa_np = smooth_scores(p_sem_rupa_np, method=smooth_method, sigma=smooth_sigma)
+                p_ens_sem_np = smooth_scores(p_ens_sem_np, method=smooth_method, sigma=smooth_sigma)
+                p_ens_det_np = smooth_scores(p_ens_det_np, method=smooth_method, sigma=smooth_sigma)
+                p_ens_tri_np = smooth_scores(p_ens_tri_np, method=smooth_method, sigma=smooth_sigma)
+                p_hier_np = smooth_scores(p_hier_np, method=smooth_method, sigma=smooth_sigma)
 
             ap_routing_list.append(p_routing_np)
             ap_det_list.append(p_det_np)
             ap_sem_list.append(p_sem_np)
-            ap_ens_list.append(p_ens_np)
+            ap_sem_rupa_list.append(p_sem_rupa_np)
+            ap_ens_sem_list.append(p_ens_sem_np)
+            ap_ens_det_list.append(p_ens_det_np)
+            ap_ens_tri_list.append(p_ens_tri_np)
+            ap_hier_list.append(p_hier_np)
 
             elem_l2 = optimized_probs.detach().cpu().numpy()
             elem_l2 = np.repeat(elem_l2, 16, axis=0)
@@ -144,13 +174,21 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     all_scores_routing = np.concatenate(ap_routing_list, axis=0)
     all_scores_det = np.concatenate(ap_det_list, axis=0)
     all_scores_sem = np.concatenate(ap_sem_list, axis=0)
-    all_scores_ens = np.concatenate(ap_ens_list, axis=0)
+    all_scores_sem_rupa = np.concatenate(ap_sem_rupa_list, axis=0)
+    all_scores_ens_sem = np.concatenate(ap_ens_sem_list, axis=0)
+    all_scores_ens_det = np.concatenate(ap_ens_det_list, axis=0)
+    all_scores_ens_tri = np.concatenate(ap_ens_tri_list, axis=0)
+    all_scores_hier = np.concatenate(ap_hier_list, axis=0)
 
     # Repeat 16x for frame-level evaluation & sanitize non-finites
     frame_scores_routing = np.nan_to_num(np.repeat(all_scores_routing, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_det = np.nan_to_num(np.repeat(all_scores_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_sem = np.nan_to_num(np.repeat(all_scores_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_ens = np.nan_to_num(np.repeat(all_scores_ens, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_sem_rupa = np.nan_to_num(np.repeat(all_scores_sem_rupa, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_ens_sem = np.nan_to_num(np.repeat(all_scores_ens_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_ens_det = np.nan_to_num(np.repeat(all_scores_ens_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_ens_tri = np.nan_to_num(np.repeat(all_scores_ens_tri, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_hier = np.nan_to_num(np.repeat(all_scores_hier, 16), nan=0.0, posinf=1.0, neginf=0.0)
 
     min_len = min(len(gt), len(frame_scores_routing))
     gt_eval = gt[:min_len]
@@ -164,13 +202,29 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_sem = roc_auc_score(gt_eval, frame_scores_sem[:min_len])
     ap_sem = average_precision_score(gt_eval, frame_scores_sem[:min_len])
 
-    roc_ens = roc_auc_score(gt_eval, frame_scores_ens[:min_len])
-    ap_ens = average_precision_score(gt_eval, frame_scores_ens[:min_len])
+    roc_sem_rupa = roc_auc_score(gt_eval, frame_scores_sem_rupa[:min_len])
+    ap_sem_rupa = average_precision_score(gt_eval, frame_scores_sem_rupa[:min_len])
+
+    roc_ens_sem = roc_auc_score(gt_eval, frame_scores_ens_sem[:min_len])
+    ap_ens_sem = average_precision_score(gt_eval, frame_scores_ens_sem[:min_len])
+
+    roc_ens_det = roc_auc_score(gt_eval, frame_scores_ens_det[:min_len])
+    ap_ens_det = average_precision_score(gt_eval, frame_scores_ens_det[:min_len])
+
+    roc_ens_tri = roc_auc_score(gt_eval, frame_scores_ens_tri[:min_len])
+    ap_ens_tri = average_precision_score(gt_eval, frame_scores_ens_tri[:min_len])
+
+    roc_hier = roc_auc_score(gt_eval, frame_scores_hier[:min_len])
+    ap_hier = average_precision_score(gt_eval, frame_scores_hier[:min_len])
 
     print(f"[Evaluation] Frame-level AUC (Routing): {roc_routing * 100:.2f}% | AP: {ap_routing * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AUC (Detector): {roc_det * 100:.2f}% | AP: {ap_det * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Semantics): {roc_sem * 100:.2f}% | AP: {ap_sem * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Ensemble Routing+Detector): {roc_ens * 100:.2f}% | AP: {ap_ens * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AUC (Semantics Backbone): {roc_sem * 100:.2f}% | AP: {ap_sem * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AUC (Semantics RUPA): {roc_sem_rupa * 100:.2f}% | AP: {ap_sem_rupa * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AUC (Ensemble Routing+Detector): {roc_ens_det * 100:.2f}% | AP: {ap_ens_det * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AUC (Ensemble Routing+Semantics - SOTA): {roc_ens_sem * 100:.2f}% | AP: {ap_ens_sem * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AUC (Tri-Stream Ensemble): {roc_ens_tri * 100:.2f}% | AP: {ap_ens_tri * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AUC (Hierarchical Refined): {roc_hier * 100:.2f}% | AP: {ap_hier * 100:.2f}%", flush=True)
 
     try:
         dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
@@ -184,10 +238,10 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
     sys.stdout.flush()
 
-    # Use the best stream
-    best_auc = max(roc_routing, roc_det, roc_sem, roc_ens)
-    best_ap = max(ap_routing, ap_det, ap_sem, ap_ens)
-    return best_auc, best_ap
+    # Use the best stream across all WS-VAD paradigms
+    best_auc = max(roc_routing, roc_det, roc_sem, roc_sem_rupa, roc_ens_sem, roc_ens_det, roc_ens_tri, roc_hier)
+    best_ap = max(ap_routing, ap_det, ap_sem, ap_sem_rupa, ap_ens_sem, ap_ens_det, ap_ens_tri, ap_hier)
+    print(f"  ==> [BEST METRIC] Frame-level AUC: {best_auc * 100:.2f}% | AP: {best_ap * 100:.2f}%", flush=True)
     return best_auc, best_ap
 
 

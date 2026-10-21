@@ -48,9 +48,9 @@ parser.add_argument('--routing-mode', choices=['fixed', 'safe_gate'], default='s
 parser.add_argument('--routing-gate-hidden', default=16, type=int, help='Hidden dimension of dynamic safe gate MLP')
 
 # Prior weights for UCF-Crime
-parser.add_argument('--routing-det-weight', default=0.45, type=float, help='Prior weight for detector stream')
-parser.add_argument('--routing-rec-weight', default=0.40, type=float, help='Prior weight for reconstruction stream')
-parser.add_argument('--routing-sem-weight', default=0.00, type=float, help='Prior weight for semantic stream')
+parser.add_argument('--routing-det-weight', default=0.35, type=float, help='Prior weight for detector stream')
+parser.add_argument('--routing-rec-weight', default=0.30, type=float, help='Prior weight for reconstruction stream')
+parser.add_argument('--routing-sem-weight', default=0.20, type=float, help='Prior weight for semantic stream')
 parser.add_argument('--routing-aux-weight', default=0.15, type=float, help='Prior weight for auxiliary motion stream')
 
 # Training & Optimization
@@ -60,6 +60,7 @@ parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for En
 parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for regularization')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to ramp up RUPA losses: omega(e) = min(1, e/curriculum_epochs)')
 parser.add_argument('--topk-ratio', type=int, default=8, help='Divisor for top-k snippet selection: k = max(1, L // topk_ratio) (default 8 -> ~12.5% frames)')
+parser.add_argument('--topk-ratio-clasm', type=int, default=16, help='Top-k divisor for snippet multi-class classification (default 16)')
 parser.add_argument('--label-smoothing', type=float, default=0.02, help='Label smoothing factor for binary MIL loss (default 0.02)')
 
 # Loss Weighting
@@ -69,7 +70,9 @@ parser.add_argument('--lambda-orth', type=float, default=0.1, help='Weight for p
 parser.add_argument('--lambda-gather', type=float, default=1.0, help='Weight for DNP gather loss')
 parser.add_argument('--lambda-residual', type=float, default=1.0, help='Weight for residual fine-grained event alignment loss')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate regularization loss')
-parser.add_argument('--loss2_weight', type=float, default=1.0, help='Weight for snippet classification loss')
+parser.add_argument('--loss2_weight', type=float, default=1.0, help='Weight for snippet multi-class classification loss')
+parser.add_argument('--lambda-consistency', type=float, default=1.0, help='Weight for consistency loss between detector and reconstruction')
+parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss')
 
 # Data & Paths
 parser.add_argument('--train-list', default='list/ucf_CLIP_rgb.csv', help='Path to training feature CSV list')
