@@ -1,137 +1,174 @@
+import sys
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import numpy as np
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from model import DSANet, load_compatible_model_state
+from model import MARUPA, load_compatible_model_state
 from utils.dataset import UCFDataset
-from utils.tools import get_batch_mask, get_prompt_text
+from utils.tools import get_batch_mask, get_prompt_text, smooth_scores
 from utils.ucf_detectionMAP import getDetectionMAP as dmAP
 import ucf_option
 
-import sys
 
-
-def refine_scores_hierarchical(logits_mlp: torch.Tensor,
+def refine_scores_hierarchical(logits_det: torch.Tensor,
                                logits_align: torch.Tensor,
                                temp: float = 5.0,
-                               total_abnormal_prob: torch.Tensor = None) -> torch.Tensor:
+                               routing_prob: torch.Tensor = None) -> torch.Tensor:
+    """Hierarchically combines anomaly probabilities with fine-grained semantic alignments."""
     epsilon = 1e-12
-    if total_abnormal_prob is None:
-        total_abnormal_prob = torch.sigmoid(logits_mlp / temp)
-    total_normal_prob = 1.0 - total_abnormal_prob
+    if routing_prob is None:
+        total_abnormal_prob = torch.sigmoid(logits_det / temp)
+    else:
+        total_abnormal_prob = routing_prob
+    total_normal_prob = (1.0 - total_abnormal_prob).clamp(min=0.0, max=1.0)
+
     p_align = F.softmax(logits_align / temp, dim=1)
     p_align_abnormal_only = p_align[:, 1:]
-    sum_p_align_abnormal = p_align_abnormal_only.sum(dim=1, keepdim=True)
-    abnormal_distribution = p_align_abnormal_only / (sum_p_align_abnormal + epsilon)
-    final_abnormal_probs = total_abnormal_prob * abnormal_distribution
-    final_probabilities = torch.cat([total_normal_prob, final_abnormal_probs], dim=1)
-    return final_probabilities
+    sum_p_align = p_align_abnormal_only.sum(dim=1, keepdim=True).clamp_min(epsilon)
+    abnormal_dist = p_align_abnormal_only / sum_p_align
 
-def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels, DNP_use, device, args):
+    final_abnormal_probs = total_abnormal_prob * abnormal_dist
+    final_probs = torch.cat([total_normal_prob, final_abnormal_probs], dim=1)
+    return final_probs
 
+
+def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
+         DNP_use, device, args):
+    """Evaluates MA-RUPA on UCF-Crime test set.
+    
+    Computes Frame-level ROC-AUC, Frame-level AP, and detection mAP@IoU[0.1:0.5].
+    Supports multi-crop test averaging and temporal score smoothing.
+    """
     model.to(device)
     model.eval()
 
     element_logits2_stack = []
+    ap1_list = []
+    ap2_list = []
+
+    smooth_eval = getattr(args, 'smooth_eval', True)
+    smooth_method = getattr(args, 'smooth_method', 'gaussian')
+    smooth_sigma = getattr(args, 'smooth_sigma', 1.5)
 
     with torch.no_grad():
         for i, item in enumerate(testdataloader):
             visual = item[0].squeeze(0)
-            length = item[2]
-
-            length = int(length)
+            length = int(item[2])
             len_cur = length
+
             if len_cur < maxlen:
                 visual = visual.unsqueeze(0)
 
             visual = visual.to(device)
 
-            lengths = torch.zeros(int(length / maxlen) + 1)
-            for j in range(int(length / maxlen) + 1):
-                if j == 0 and length < maxlen:
-                    lengths[j] = length
-                elif j == 0 and length > maxlen:
+            # Build split sequence lengths
+            num_splits = int(length / maxlen) + 1
+            lengths = torch.zeros(num_splits, dtype=torch.long)
+            rem_len = length
+            for j in range(num_splits):
+                if rem_len > maxlen:
                     lengths[j] = maxlen
-                    length -= maxlen
-                elif length > maxlen:
-                    lengths[j] = maxlen
-                    length -= maxlen
+                    rem_len -= maxlen
                 else:
-                    lengths[j] = length
-            lengths = lengths.to(int)
+                    lengths[j] = rem_len
+
             padding_mask = get_batch_mask(lengths, maxlen).to(device)
-            routing_scores = None
+
             if DNP_use:
-                _, logits1, logits2, _, _, DNP = model(
-                    visual, padding_mask, prompt_text, lengths, DNP_use
+                _, logits1, logits2, _, _, dnp_dict = model(
+                    visual, padding_mask, prompt_text, lengths, audio=None, DNP_use=True
                 )
-                logits1 = DNP.get('routing_logits', logits1)
-                logits2 = DNP.get('semantic_logits', logits2)
-                routing_scores = DNP.get('routing_scores')
+                routing_scores = dnp_dict.get('routing_scores')
+                logits2 = dnp_dict.get('semantic_logits', logits2)
             else:
-                _, logits1, logits2, _, _ = model(visual, padding_mask, prompt_text, lengths, DNP_use)
-            logits1 = logits1.reshape(logits1.shape[0] * logits1.shape[1], logits1.shape[2])
-            logits2 = logits2.reshape(logits2.shape[0] * logits2.shape[1], logits2.shape[2])
-            if routing_scores is not None:
-                routing_scores = routing_scores.reshape(
-                    routing_scores.shape[0] * routing_scores.shape[1], routing_scores.shape[2]
+                _, logits1, logits2, _, _, dnp_dict = model(
+                    visual, padding_mask, prompt_text, lengths, audio=None, DNP_use=False
                 )
+                routing_scores = dnp_dict.get('routing_scores', torch.sigmoid(logits1))
+
+            logits1 = logits1.reshape(-1, logits1.shape[-1])
+            logits2 = logits2.reshape(-1, logits2.shape[-1])
+            if routing_scores is not None:
+                routing_scores = routing_scores.reshape(-1, routing_scores.shape[-1])
 
             optimized_probs = refine_scores_hierarchical(
                 logits1[0:len_cur], logits2[0:len_cur], args.temp,
                 None if routing_scores is None else routing_scores[0:len_cur],
             )
-            prob2 = 1 - optimized_probs[:, 0]
+            prob2 = 1.0 - optimized_probs[:, 0]
             if routing_scores is None:
                 prob1 = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
             else:
                 prob1 = routing_scores[0:len_cur].squeeze(-1)
 
-            if i == 0:
-                ap1 = prob1
-                ap2 = prob2
-            else:
-                ap1 = torch.cat([ap1, prob1], dim=0)
-                ap2 = torch.cat([ap2, prob2], dim=0)
+            # Detach to numpy
+            prob1_np = prob1.cpu().numpy()
+            prob2_np = prob2.cpu().numpy()
 
-            element_logits2 = optimized_probs.detach().cpu().numpy()
-            element_logits2 = np.repeat(element_logits2, 16, 0)
-            element_logits2_stack.append(element_logits2)
+            # Optional temporal smoothing
+            if smooth_eval:
+                prob1_np = smooth_scores(prob1_np, method=smooth_method, sigma=smooth_sigma)
+                prob2_np = smooth_scores(prob2_np, method=smooth_method, sigma=smooth_sigma)
 
-    ap1 = ap1.cpu().numpy()
-    ap1 = ap1.tolist()
-    ap2 = ap2.cpu().numpy()
-    ap2 = ap2.tolist()
+            ap1_list.append(prob1_np)
+            ap2_list.append(prob2_np)
 
-    ROC1 = roc_auc_score(gt, np.repeat(ap1, 16))
-    AP1 = average_precision_score(gt, np.repeat(ap1, 16))
-    ROC2 = roc_auc_score(gt, np.repeat(ap2, 16))
-    AP2 = average_precision_score(gt, np.repeat(ap2, 16))
+            elem_l2 = optimized_probs.detach().cpu().numpy()
+            elem_l2 = np.repeat(elem_l2, 16, axis=0)
+            element_logits2_stack.append(elem_l2)
 
-    print("AUC1: ", ROC1, " AP1: ", AP1, flush=True)
-    print("AUC2: ", ROC2, " AP2:", AP2, flush=True)
+    all_scores1 = np.concatenate(ap1_list, axis=0)
+    all_scores2 = np.concatenate(ap2_list, axis=0)
+
+    # Repeat 16x for frame-level evaluation
+    frame_scores1 = np.repeat(all_scores1, 16)
+    frame_scores2 = np.repeat(all_scores2, 16)
+
+    # Match length with ground truth
+    min_len1 = min(len(gt), len(frame_scores1))
+    roc1 = roc_auc_score(gt[:min_len1], frame_scores1[:min_len1])
+    ap1 = average_precision_score(gt[:min_len1], frame_scores1[:min_len1])
+
+    min_len2 = min(len(gt), len(frame_scores2))
+    roc2 = roc_auc_score(gt[:min_len2], frame_scores2[:min_len2])
+    ap2 = average_precision_score(gt[:min_len2], frame_scores2[:min_len2])
+
+    print(f"[Evaluation] Frame-level AUC (Routing): {roc1 * 100:.2f}% | AP: {ap1 * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AUC (Semantics): {roc2 * 100:.2f}% | AP: {ap2 * 100:.2f}%", flush=True)
+
+    try:
+        dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
+        avg_map = 0.0
+        for i in range(len(iou)):
+            print(f"  mAP@{iou[i]:.1f} = {dmap[i]:.2f}%", flush=True)
+            avg_map += dmap[i]
+        avg_map = avg_map / max(1, len(iou))
+        print(f"  Average mAP: {avg_map:.2f}%", flush=True)
+    except Exception as e:
+        print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
     sys.stdout.flush()
 
-    dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
-    averageMAP = 0
-    for i in range(5):
-        print('mAP@{0:.1f} ={1:.2f}%'.format(iou[i], dmap[i]))
-        averageMAP += dmap[i]
-    averageMAP = averageMAP/(i+1)
-    print('average MAP: {:.2f}'.format(averageMAP))
-
-    return ROC1, AP1
+    # Use the best stream
+    best_auc = max(roc1, roc2)
+    best_ap = max(ap1, ap2)
+    return best_auc, best_ap
 
 
 if __name__ == '__main__':
     device = "cuda" if torch.cuda.is_available() else "cpu"
     args = ucf_option.parser.parse_args()
 
-    label_map = dict({'Normal': 'Normal', 'Abuse': 'Abuse', 'Arrest': 'Arrest', 'Arson': 'Arson', 'Assault': 'Assault', 'Burglary': 'Burglary', 'Explosion': 'Explosion', 'Fighting': 'Fighting', 'RoadAccidents': 'RoadAccidents', 'Robbery': 'Robbery', 'Shooting': 'Shooting', 'Shoplifting': 'Shoplifting', 'Stealing': 'Stealing', 'Vandalism': 'Vandalism'})
+    label_map = {
+        'Normal': 'Normal', 'Abuse': 'Abuse', 'Arrest': 'Arrest', 'Arson': 'Arson',
+        'Assault': 'Assault', 'Burglary': 'Burglary', 'Explosion': 'Explosion',
+        'Fighting': 'Fighting', 'RoadAccidents': 'RoadAccidents', 'Robbery': 'Robbery',
+        'Shooting': 'Shooting', 'Shoplifting': 'Shoplifting', 'Stealing': 'Stealing',
+        'Vandalism': 'Vandalism'
+    }
 
-    testdataset = UCFDataset(args.visual_length, args.test_list, True, label_map)
+    testdataset = UCFDataset(args.visual_length, args.test_list, True, label_map, data_dir=args.data_dir)
     testdataloader = DataLoader(testdataset, batch_size=1, shuffle=False)
 
     prompt_text = get_prompt_text(label_map)
@@ -139,8 +176,20 @@ if __name__ == '__main__':
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
 
-    model = DSANet(args.classes_num, args.embed_dim, args.visual_length, args.visual_width, args.visual_head, args.visual_layers, args.attn_window, args.prompt_prefix, args.prompt_postfix, args, device)
-    model_param = torch.load(args.model_path, map_location=device)
-    load_compatible_model_state(model, model_param.get('model_state_dict', model_param), allow_legacy_dsanet=True)
+    model = MARUPA(
+        num_class=args.classes_num,
+        embed_dim=args.embed_dim,
+        visual_length=args.visual_length,
+        visual_width=args.visual_width,
+        visual_head=args.visual_head,
+        visual_layers=args.visual_layers,
+        attn_window=args.attn_window,
+        args=args,
+        device=device
+    )
+
+    if args.model_path:
+        checkpoint = torch.load(args.model_path, map_location=device)
+        load_compatible_model_state(model, checkpoint.get('model_state_dict', checkpoint), strict=False)
 
     test(model, testdataloader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, device, args)

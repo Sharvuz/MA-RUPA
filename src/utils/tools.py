@@ -109,3 +109,45 @@ def process_split(feat, length):
                 split_feat = np.concatenate([split_feat, pad(feat[i*length:i*length+length, :], length).reshape(1, length, feat.shape[1])], axis=0)
 
         return split_feat, clip_length
+
+
+def xd_collate_fn(batch):
+    """Custom collate function for XDDataset supporting optional/missing audio."""
+    visual_batch = torch.stack([item[0] for item in batch], dim=0)
+    labels = [item[1] for item in batch]
+    lengths = torch.tensor([item[2] for item in batch], dtype=torch.long)
+    audios = [item[3] for item in batch]
+
+    has_audio = any(a is not None for a in audios)
+    if not has_audio:
+        audio_batch = None
+    else:
+        first_audio = next(a for a in audios if a is not None)
+        target_len, audio_dim = first_audio.shape
+        padded_audios = []
+        for a in audios:
+            if a is None:
+                padded_audios.append(torch.zeros(target_len, audio_dim, dtype=torch.float32))
+            else:
+                padded_audios.append(a)
+        audio_batch = torch.stack(padded_audios, dim=0)
+
+    return visual_batch, labels, lengths, audio_batch
+
+
+def smooth_scores(scores: np.ndarray, method: str = 'gaussian', sigma: float = 1.5, window_length: int = 5):
+    """Smooth 1D anomaly score curve using Gaussian or Savitzky-Golay filter."""
+    if len(scores) < 3:
+        return scores
+    if method == 'gaussian':
+        from scipy.ndimage import gaussian_filter1d
+        return gaussian_filter1d(scores, sigma=sigma)
+    elif method == 'savgol':
+        from scipy.signal import savgol_filter
+        wl = min(window_length, len(scores))
+        if wl % 2 == 0:
+            wl -= 1
+        if wl <= 2:
+            return scores
+        return savgol_filter(scores, window_length=wl, polyorder=1)
+    return scores
