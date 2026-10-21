@@ -135,11 +135,11 @@ def train(args):
     batch_half = max(1, args.batch_size // 2)
     normal_loader = DataLoader(
         normal_dataset, batch_size=batch_half, shuffle=True,
-        num_workers=args.num_workers, drop_last=True
+        num_workers=args.num_workers, drop_last=True, pin_memory=True
     )
     anomaly_loader = DataLoader(
         anomaly_dataset, batch_size=batch_half, shuffle=True,
-        num_workers=args.num_workers, drop_last=True
+        num_workers=args.num_workers, drop_last=True, pin_memory=True
     )
 
     test_dataset = UCFDataset(
@@ -313,9 +313,11 @@ def train(args):
             loss_accum['gate'] += loss_gate.item()
             loss_accum['total'] += total_loss.item()
 
-            current_step = step_idx * normal_loader.batch_size * 2
-            if current_step > 0 and current_step % args.eval_interval == 0:
-                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}] "
+            total_batches = min(len(normal_loader), len(anomaly_loader))
+            if (step_idx + 1) % 20 == 0 or (step_idx + 1) == total_batches:
+                current_step = (step_idx + 1) * args.batch_size
+                percent = ((step_idx + 1) / total_batches) * 100
+                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}/{total_batches * args.batch_size} ({percent:.1f}%)] "
                       f"Total Loss: {total_loss.item():.4f} | MIL: {loss_mil_routing.item():.4f} "
                       f"Aux: {loss_mil_aux.item():.4f} | omega: {omega:.2f}", flush=True)
 

@@ -80,8 +80,23 @@ def get_path_variants(path_or_name: str) -> list[str]:
     return list(dict.fromkeys(variants))
 
 
+_RESOLVE_CACHE = {}
+_INFER_AUDIO_CACHE = {}
+_AUDIO_PATH_BY_BASEKEY = {}
+
+
 def resolve_feature_path(path: str, data_dir: str = None) -> str:
     """Resolve file path locally, in data_dir, or in Kaggle directories with '# <-> +' support."""
+    cache_key = (path, data_dir)
+    if cache_key in _RESOLVE_CACHE:
+        return _RESOLVE_CACHE[cache_key]
+
+    res = _resolve_feature_path_uncached(path, data_dir)
+    _RESOLVE_CACHE[cache_key] = res
+    return res
+
+
+def _resolve_feature_path_uncached(path: str, data_dir: str = None) -> str:
     # 1. Direct path check with variants
     for v in get_path_variants(path):
         if os.path.exists(v):
@@ -117,6 +132,16 @@ def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
     
     Handles 5-crop/10-crop suffix stripping and Kaggle '# <-> +' character replacements.
     """
+    cache_key = (visual_path, audio_dir)
+    if cache_key in _INFER_AUDIO_CACHE:
+        return _INFER_AUDIO_CACHE[cache_key]
+
+    res = _infer_audio_path_uncached(visual_path, audio_dir)
+    _INFER_AUDIO_CACHE[cache_key] = res
+    return res
+
+
+def _infer_audio_path_uncached(visual_path: str, audio_dir: str = None) -> str:
     base_name = os.path.basename(visual_path)
     base_no_crop = base_name
     for crop_idx in range(10):
@@ -203,13 +228,16 @@ class UCFDataset(data.Dataset):
             else:
                 self.df = self.df.loc[self.df['label'] != 'Normal'].reset_index(drop=True)
 
+        self.raw_paths = self.df['path'].tolist()
+        self.labels = self.df['label'].tolist()
+
     def __len__(self):
-        return self.df.shape[0]
+        return len(self.raw_paths)
 
     def __getitem__(self, index):
-        raw_path = self.df.loc[index]['path']
+        raw_path = self.raw_paths[index]
         path = resolve_feature_path(raw_path, self.data_dir)
-        label = self.df.loc[index]['label']
+        label = self.labels[index]
 
         if os.path.exists(path):
             clip_feature = np.load(path)
@@ -244,6 +272,10 @@ class XDDataset(data.Dataset):
         self.data_dir = data_dir
         self.no_audio = no_audio
 
+        # Fast O(1) Python list indexing (100x faster than df.loc in loops)
+        self.raw_paths = self.df['path'].tolist()
+        self.labels = self.df['label'].tolist()
+
         self.audio_dict = {}
         if audio_file_path and os.path.exists(audio_file_path):
             audio_df = pd.read_csv(audio_file_path)
@@ -256,26 +288,33 @@ class XDDataset(data.Dataset):
                 if '#' in key:
                     self.audio_dict[key.replace('#', '+')] = row['audio_path']
 
+        self._audio_path_cache = {}
+
     def __len__(self):
-        return self.df.shape[0]
+        return len(self.raw_paths)
 
     def load_audio(self, visual_path: str, target_length: int):
-        """Loads and temporally aligns audio features."""
+        """Loads and temporally aligns audio features with instant RAM caching."""
         if self.no_audio:
             return None
 
-        # 1. Lookup in explicit audio dictionary
         base_key = os.path.basename(visual_path).split('__')[0]
-        audio_path = self.audio_dict.get(base_key)
-        if not audio_path:
-            for k in get_path_variants(base_key):
-                if k in self.audio_dict:
-                    audio_path = self.audio_dict[k]
-                    break
+        if base_key in self._audio_path_cache:
+            audio_path = self._audio_path_cache[base_key]
+        else:
+            audio_path = None
+            if self.audio_dict:
+                audio_path = self.audio_dict.get(base_key)
+                if not audio_path:
+                    for k in get_path_variants(base_key):
+                        if k in self.audio_dict:
+                            audio_path = self.audio_dict[k]
+                            break
 
-        # 2. If not found, infer path
-        if not audio_path or not os.path.exists(audio_path):
-            audio_path = infer_audio_path(visual_path, self.audio_dir)
+            if not audio_path or not os.path.exists(audio_path):
+                audio_path = infer_audio_path(visual_path, self.audio_dir)
+
+            self._audio_path_cache[base_key] = audio_path
 
         if not audio_path or not os.path.exists(audio_path):
             return None
@@ -293,9 +332,9 @@ class XDDataset(data.Dataset):
             return None
 
     def __getitem__(self, index):
-        raw_path = self.df.loc[index]['path']
+        raw_path = self.raw_paths[index]
         path = resolve_feature_path(raw_path, self.data_dir)
-        label = self.df.loc[index]['label']
+        label = self.labels[index]
 
         if os.path.exists(path):
             clip_feature = np.load(path)

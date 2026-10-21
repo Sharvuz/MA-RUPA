@@ -127,7 +127,7 @@ def train(args):
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, collate_fn=xd_collate_fn, drop_last=True
+        num_workers=args.num_workers, collate_fn=xd_collate_fn, drop_last=True, pin_memory=True
     )
 
     test_dataset = XDDataset(
@@ -311,9 +311,11 @@ def train(args):
             loss_accum['gate'] += loss_gate.item()
             loss_accum['total'] += total_loss.item()
 
-            current_step = step_idx * args.batch_size
-            if current_step > 0 and current_step % args.eval_interval == 0:
-                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}] "
+            total_batches = len(train_loader)
+            if (step_idx + 1) % 25 == 0 or (step_idx + 1) == total_batches:
+                current_samples = min((step_idx + 1) * args.batch_size, len(train_dataset))
+                percent = (current_samples / len(train_dataset)) * 100
+                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_samples}/{len(train_dataset)} ({percent:.1f}%)] "
                       f"Total Loss: {total_loss.item():.4f} | MIL: {loss_mil_routing.item():.4f} "
                       f"Aux: {loss_mil_aux.item():.4f} | omega: {omega:.2f}", flush=True)
 
