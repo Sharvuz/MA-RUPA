@@ -60,7 +60,7 @@ def train(args):
     }
 
     # Data loaders: default to full 10 crops per video (16,000 steps/epoch, 250 iters/epoch)
-    sample_one_crop = getattr(args, 'enable_crop_reduction', False)
+    sample_one_crop = getattr(args, 'sample_one_crop_per_video', getattr(args, 'enable_crop_reduction', False))
     normal_dataset = UCFDataset(
         args.visual_length, args.train_list, False, label_map, normal=True,
         data_dir=args.data_dir, sample_one_crop_per_video=sample_one_crop

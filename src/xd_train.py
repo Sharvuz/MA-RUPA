@@ -57,7 +57,7 @@ def train(args):
     }
 
     # Datasets & Balanced Paired Loaders: default to full crops (250+ iters/epoch)
-    sample_one_crop = getattr(args, 'enable_crop_reduction', False)
+    sample_one_crop = getattr(args, 'sample_one_crop_per_video', getattr(args, 'enable_crop_reduction', False))
     normal_dataset = XDDataset(
         args.visual_length, args.train_list, False, label_map,
         audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
