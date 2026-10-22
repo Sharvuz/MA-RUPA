@@ -59,7 +59,7 @@ parser.add_argument('--batch-size', default=64, type=int, help='Batch size (32 n
 parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for End-to-End AdamW optimizer (default 1e-4)')
 parser.add_argument('--weight-decay', type=float, default=1e-3, help='Weight decay for regularization (default 1e-3)')
 parser.add_argument('--curriculum-epochs', type=float, default=5.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 5.0)')
-parser.add_argument('--topk-ratio', type=int, default=16, help='Divisor for top-k snippet selection: k = max(1, L // topk_ratio) (default 16 -> ~6.25% frames)')
+parser.add_argument('--topk-ratio', type=int, default=16, help='Divisor for top-k snippet selection: k = max(1, L // topk_ratio) (default 16 -> ~6.25%% frames)')
 parser.add_argument('--topk-ratio-clasm', type=int, default=16, help='Top-k divisor for snippet multi-class classification (default 16)')
 parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0 to prevent 0.0560 floor)')
 parser.add_argument('--snippet-dropout', type=float, default=0.15, help='Snippet dropout rate during training to prevent 1-frame spike collapse (default 0.15)')
