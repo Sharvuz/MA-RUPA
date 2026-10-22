@@ -743,7 +743,7 @@ class GradientSafeRUPA(nn.Module):
         sim_matrix = torch.bmm(p_norm, p_norm.transpose(1, 2))
         identity = torch.eye(self.num_prototypes, device=f_fused.device).unsqueeze(0).expand(B, -1, -1)
         off_diag = sim_matrix - identity
-        sample_orth_loss = (off_diag ** 2).sum(dim=(1, 2), keepdim=True) / max(1, self.num_prototypes * (self.num_prototypes - 1))  # [B, 1]
+        sample_orth_loss = ((off_diag ** 2).sum(dim=(1, 2)) / max(1, self.num_prototypes * (self.num_prototypes - 1))).view(B, 1)  # [B, 1]
 
         # Counterfactual normal reconstruction
         bottleneck_features = f_fused
@@ -793,8 +793,6 @@ class GradientSafeRUPA(nn.Module):
             'reconstructed_features': f_rec,
             'residual_features': residual,
             'dynamic_normal_patterns': dynamic_normal_patterns,
-            'selected_normal': selected_normal,
-            'reliability': reliability,
             'f_sem_rupa': f_sem_rupa,
             'semantic_logits': scaled_sem_logits,
             'raw_semantic_logits': semantic_logits,
