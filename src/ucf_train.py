@@ -205,7 +205,7 @@ def train(args):
             s_det = dnp_dict['detector_scores']
 
             # 1. Primary & Auxiliary MIL Losses (Dynamic Top-K + Snippet Dropout + Non-Saturating BCE)
-            topk_r = getattr(args, 'topk_ratio', 8)
+            topk_r = getattr(args, 'topk_ratio', 16)
             lbl_sm = getattr(args, 'label_smoothing', 0.0)
             snip_drop = getattr(args, 'snippet_dropout', 0.15)
 

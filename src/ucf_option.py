@@ -63,7 +63,7 @@ parser.add_argument('--topk-ratio', type=int, default=16, help='Divisor for top-
 parser.add_argument('--topk-ratio-clasm', type=int, default=16, help='Top-k divisor for snippet multi-class classification (default 16)')
 parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0 to prevent 0.0560 floor)')
 parser.add_argument('--snippet-dropout', type=float, default=0.15, help='Snippet dropout rate during training to prevent 1-frame spike collapse (default 0.15)')
-parser.add_argument('--sample-one-crop-per-video', default=True, type=str2bool, help='Randomly sample 1 crop per video per epoch to prevent 10-crop memorization (default True)')
+parser.add_argument('--sample-one-crop-per-video', default=False, type=str2bool, help='Randomly sample 1 crop per video per epoch (default False: use all crops for full 16,000 steps/epoch)')
 
 # Loss Weighting (Rebalanced to prevent RUPA loss dominance over MIL/CLASM)
 parser.add_argument('--lambda-aux', type=float, default=0.15, help='Weight for auxiliary branch MIL loss (default 0.15 for UCF-Crime)')
