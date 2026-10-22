@@ -121,7 +121,7 @@ def compute_temporal_smoothness_loss(scores: torch.Tensor,
     mean_smooth = smooth_acc / denom
     mean_sparse = sparse_acc / denom
 
-    return lambda_smooth * mean_smooth + lambda_sparse * mean_sparse
+    return mean_smooth + lambda_sparse * mean_sparse
 
 
 def compute_clasm_loss(logits: torch.Tensor,
