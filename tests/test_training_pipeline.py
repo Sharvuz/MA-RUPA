@@ -128,13 +128,13 @@ def test_losses_end_to_end():
     assert l_orth.dim() == 0 and not torch.isnan(l_orth)
     assert l_res.dim() == 0 and not torch.isnan(l_res)
 
-    # Total loss with rebalanced weights
+    # Total loss with Pareto optimal weights
     omega = 1.0
     total_loss = (
         l_mil
         + 1.0 * l_clasm
-        + 0.05 * l_consist
-        + 0.001 * l_smooth
+        + 0.25 * l_consist
+        + 0.05 * l_smooth
         + omega * (
             0.05 * l_gather
             + 0.02 * l_orth

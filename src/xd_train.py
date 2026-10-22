@@ -20,8 +20,11 @@ from utils.dataset import XDDataset
 from utils.tools import get_batch_label, get_prompt_text, xd_collate_fn, xd_test_collate_fn, safe_load_checkpoint
 from utils.losses import (
     get_curriculum_omega,
+    compute_at_bce_topk_mil_loss,
     compute_topk_mil_loss,
+    compute_fg_tv_smoothness_loss,
     compute_temporal_smoothness_loss,
+    compute_confidence_gated_consistency_loss,
     compute_residual_event_loss,
     compute_clasm_loss,
     compute_bkg_loss,
@@ -230,31 +233,43 @@ def train(args):
             s_aux = dnp_dict['aux_scores']
             s_det = dnp_dict['detector_scores']
 
-            # 1. Primary & Auxiliary MIL Losses (Dynamic Top-K + Snippet Dropout + Non-Saturating BCE)
-            topk_r = getattr(args, 'topk_ratio', 16)
-            lbl_sm = getattr(args, 'label_smoothing', 0.0)
+            # 1. Primary & Auxiliary MIL Losses (AT-BCE + VAT-K + OHNM + Snippet Dropout)
+            topk_r = getattr(args, 'topk_ratio', 8)
             snip_drop = getattr(args, 'snippet_dropout', 0.15)
 
-            loss_mil_routing = compute_topk_mil_loss(
-                p_routing, binary_labels, lengths_batch,
-                topk_ratio=topk_r, label_smoothing=lbl_sm, snippet_dropout=snip_drop, training=True
+            loss_mil_routing = compute_at_bce_topk_mil_loss(
+                p_routing, binary_labels, lengths_batch, device=device,
+                topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
+                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True
             )
-            loss_mil_aux = compute_topk_mil_loss(
-                s_aux, binary_labels, lengths_batch,
-                topk_ratio=topk_r, label_smoothing=lbl_sm, snippet_dropout=snip_drop, training=True
+            loss_mil_det = compute_at_bce_topk_mil_loss(
+                s_det, binary_labels, lengths_batch, device=device,
+                topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
+                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True
             )
-            loss_mil_det = compute_topk_mil_loss(
-                s_det, binary_labels, lengths_batch,
-                topk_ratio=topk_r, label_smoothing=lbl_sm, snippet_dropout=snip_drop, training=True
+            loss_mil_aux = compute_at_bce_topk_mil_loss(
+                s_aux, binary_labels, lengths_batch, device=device,
+                topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
+                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True
             )
 
             # 2. Multi-class Semantic Alignment & Consistency Losses
-            loss_clasm = compute_clasm_loss(logits2, one_hot_labels, lengths_batch, k_ratio=topk_r)
+            loss_clasm_bb = compute_clasm_loss(logits2, one_hot_labels, lengths_batch, k_ratio=topk_r)
+            if 'semantic_logits' in dnp_dict:
+                loss_clasm_rupa = compute_clasm_loss(dnp_dict['semantic_logits'], one_hot_labels, lengths_batch, k_ratio=topk_r)
+            else:
+                loss_clasm_rupa = torch.tensor(0.0, device=device)
+
             loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
 
-            if 'original_features' in dnp_dict and 'reconstructed_features' in dnp_dict:
+            # Confidence-Gated Asymmetric Consistency
+            if 'reconstruction_scores' in dnp_dict:
+                loss_consistency = compute_confidence_gated_consistency_loss(
+                    s_det=s_det, s_rupa=dnp_dict['reconstruction_scores'], lengths=lengths_batch, device=device
+                )
+            elif 'original_features' in dnp_dict and 'reconstructed_features' in dnp_dict:
                 loss_consistency = compute_consistency_loss(
-                    p_routing, dnp_dict['original_features'], dnp_dict['reconstructed_features'], lengths_batch
+                    p_routing, dnp_dict['original_features'], dnp_dict['reconstructed_features'], lengths_batch, s_det=s_det
                 )
             else:
                 loss_consistency = torch.tensor(0.0, device=device)
@@ -262,10 +277,18 @@ def train(args):
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dnp_normal = dnp_dict.get('dnp_normal_loss', torch.tensor(0.0, device=device)).mean()
 
-            # 3. Temporal Smoothness (prevents needle-spike collapse and preserves mAP@IoU)
-            loss_smooth = compute_temporal_smoothness_loss(p_routing, lengths_batch)
+            # 3. Feature-Guided Edge-Preserving TV Smoothness & Compactness Loss (DODO Training Stage)
+            loss_smooth = compute_fg_tv_smoothness_loss(
+                scores=p_routing,
+                visual_features=visual_batch,
+                lengths=lengths_batch,
+                gamma_edge=getattr(args, 'gamma_edge', 5.0),
+                lambda_compact=0.1,
+                binary_labels=binary_labels,
+                device=device
+            )
 
-            # 4. RUPA Prototype Losses (Rebalanced weights modulated by smooth curriculum omega(e))
+            # 4. RUPA Prototype Losses (modulated by smooth cosine curriculum omega(e))
             loss_gather = compute_gather_loss(dnp_dict)
             loss_orth = compute_orthogonality_loss(dnp_dict)
 
@@ -284,15 +307,17 @@ def train(args):
                 text_features, num_classes=len(prompt_text)
             )
 
-            # Total Loss Computation with Rebalanced Auxiliary Weights
+            # Total Loss Computation with Pareto Optimal Weighting
+            loss_clasm = loss_clasm_bb + 0.8 * loss_clasm_rupa
             total_loss = (
                 loss_mil_routing
-                + 0.5 * loss_mil_det
-                + getattr(args, 'lambda_aux', 0.1) * loss_mil_aux
-                + getattr(args, 'loss2_weight', 1.0) * loss_clasm
+                + 0.8 * loss_mil_det
+                + getattr(args, 'lambda_aux', 0.5) * loss_mil_aux
+                + getattr(args, 'loss2_weight', 1.0) * loss_clasm_bb
+                + 0.8 * loss_clasm_rupa
                 + getattr(args, 'lambda_bkg', 0.5) * loss_bkg
-                + getattr(args, 'lambda_consistency', 0.05) * loss_consistency
-                + getattr(args, 'lambda_smooth', 0.001) * loss_smooth
+                + getattr(args, 'lambda_consistency', 0.25) * loss_consistency
+                + getattr(args, 'lambda_smooth', 0.05) * loss_smooth
                 + 0.1 * loss_text_orth
                 + omega * (
                     getattr(args, 'lambda_gather', 0.05) * loss_gather

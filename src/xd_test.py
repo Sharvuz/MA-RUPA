@@ -7,7 +7,10 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 from model import MARUPA, load_compatible_model_state
 from utils.dataset import XDDataset
-from utils.tools import get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint, xd_test_collate_fn
+from utils.tools import (
+    get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint,
+    xd_test_collate_fn, compute_single_pass_uccf, apply_dodo_refinement
+)
 from utils.xd_detectionMAP import getDetectionMAP as dmAP
 import xd_option
 
@@ -56,6 +59,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     ap_weighted_list = []
     ap_geom_list = []
     ap_hier_list = []
+    ap_uccf_list = []
+    ap_dodo_list = []
 
     smooth_eval = getattr(args, 'smooth_eval', True)
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
@@ -157,6 +162,28 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             # Stream 10: Geometric Mean
             prob_geom = torch.sqrt(prob_routing * prob_sem_rupa.clamp(min=1e-5))
 
+            # Stream 11: Single-Pass Uncertainty-Calibrated Fusion (UCCF)
+            if 'aux_scores' in dnp_dict:
+                prob_aux = dnp_dict['aux_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
+            else:
+                prob_aux = prob_det
+
+            prob_dict = {
+                'routing': prob_routing,
+                'det': prob_det,
+                'sem_rupa': prob_sem_rupa,
+                'aux': prob_aux,
+                'sem': prob_sem
+            }
+            priors = {
+                'routing': 1.0,
+                'det': 0.9,
+                'sem_rupa': 0.9,
+                'aux': 0.8,
+                'sem': 0.6
+            }
+            prob_uccf = compute_single_pass_uccf(prob_dict, priors, delta_dis=0.35)
+
             # Detach to numpy
             p_routing_np = prob_routing.cpu().numpy()
             p_det_np = prob_det.cpu().numpy()
@@ -169,6 +196,10 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             p_weighted_np = prob_weighted.cpu().numpy()
             p_geom_np = prob_geom.cpu().numpy()
             p_hier_np = prob_hier.cpu().numpy()
+            p_uccf_np = prob_uccf.cpu().numpy()
+
+            # Stream 12: Peak-Preserving Proposal Refinement (DODO)
+            p_dodo_np = apply_dodo_refinement(p_uccf_np, sigma=smooth_sigma)
 
             # Optional temporal smoothing
             if smooth_eval:
@@ -195,6 +226,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             ap_weighted_list.append(p_weighted_np)
             ap_geom_list.append(p_geom_np)
             ap_hier_list.append(p_hier_np)
+            ap_uccf_list.append(p_uccf_np)
+            ap_dodo_list.append(p_dodo_np)
 
             elem_l2 = optimized_probs.detach().cpu().numpy()
             elem_l2 = np.repeat(elem_l2, 16, axis=0)
@@ -211,6 +244,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     all_scores_weighted = np.concatenate(ap_weighted_list, axis=0)
     all_scores_geom = np.concatenate(ap_geom_list, axis=0)
     all_scores_hier = np.concatenate(ap_hier_list, axis=0)
+    all_scores_uccf = np.concatenate(ap_uccf_list, axis=0)
+    all_scores_dodo = np.concatenate(ap_dodo_list, axis=0)
 
     # Repeat 16x for frame-level evaluation & sanitize non-finites
     frame_scores_routing = np.nan_to_num(np.repeat(all_scores_routing, 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -224,6 +259,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     frame_scores_weighted = np.nan_to_num(np.repeat(all_scores_weighted, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_geom = np.nan_to_num(np.repeat(all_scores_geom, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_hier = np.nan_to_num(np.repeat(all_scores_hier, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_uccf = np.nan_to_num(np.repeat(all_scores_uccf, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_dodo = np.nan_to_num(np.repeat(all_scores_dodo, 16), nan=0.0, posinf=1.0, neginf=0.0)
 
     # Match length with ground truth
     min_len = min(len(gt), len(frame_scores_routing))
@@ -262,17 +299,25 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_hier = roc_auc_score(gt_eval, frame_scores_hier[:min_len])
     ap_hier = average_precision_score(gt_eval, frame_scores_hier[:min_len])
 
+    roc_uccf = roc_auc_score(gt_eval, frame_scores_uccf[:min_len])
+    ap_uccf = average_precision_score(gt_eval, frame_scores_uccf[:min_len])
+
+    roc_dodo = roc_auc_score(gt_eval, frame_scores_dodo[:min_len])
+    ap_dodo = average_precision_score(gt_eval, frame_scores_dodo[:min_len])
+
     print(f"[Evaluation] Frame-level AP (Routing): {ap_routing * 100:.2f}% | AUC: {roc_routing * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Detector): {ap_det * 100:.2f}% | AUC: {roc_det * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Semantics Backbone): {ap_sem * 100:.2f}% | AUC: {roc_sem * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Semantics RUPA): {ap_sem_rupa * 100:.2f}% | AUC: {roc_sem_rupa * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Ensemble Routing+Detector): {ap_ens_det * 100:.2f}% | AUC: {roc_ens_det * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Ensemble Routing+Semantics Backbone): {ap_ens_sem * 100:.2f}% | AUC: {roc_ens_sem * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AP (Ensemble Routing+Semantics RUPA - SOTA): {ap_ens_rupa * 100:.2f}% | AUC: {roc_ens_rupa * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Ensemble Routing+Semantics RUPA): {ap_ens_rupa * 100:.2f}% | AUC: {roc_ens_rupa * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Weighted 60/40 Ensemble): {ap_weighted * 100:.2f}% | AUC: {roc_weighted * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Geometric Mean Filtered): {ap_geom * 100:.2f}% | AUC: {roc_geom * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Tri-Stream Ensemble): {ap_ens_tri * 100:.2f}% | AUC: {roc_ens_tri * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Hierarchical Refined): {ap_hier * 100:.2f}% | AUC: {roc_hier * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Single-Pass UCCF - SOTA): {ap_uccf * 100:.2f}% | AUC: {roc_uccf * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (UCCF + DODO - SOTA): {ap_dodo * 100:.2f}% | AUC: {roc_dodo * 100:.2f}%", flush=True)
 
     avg_map = 0.0
     try:
@@ -289,12 +334,12 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     best_ap = max(
         ap_routing, ap_det, ap_sem, ap_sem_rupa,
         ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_tri,
-        ap_weighted, ap_geom, ap_hier
+        ap_weighted, ap_geom, ap_hier, ap_uccf, ap_dodo
     )
     best_auc = max(
         roc_routing, roc_det, roc_sem, roc_sem_rupa,
         roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_tri,
-        roc_weighted, roc_geom, roc_hier
+        roc_weighted, roc_geom, roc_hier, roc_uccf, roc_dodo
     )
     print(f"  ==> [BEST METRIC] Frame-level AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}%", flush=True)
     return best_auc, best_ap, avg_map

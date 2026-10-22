@@ -1,3 +1,4 @@
+import math
 import torch
 import numpy as np
 
@@ -222,4 +223,71 @@ def safe_load_checkpoint(path: str, map_location=None):
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def compute_single_pass_uccf(prob_dict: dict, priors: dict, delta_dis: float = 0.35) -> torch.Tensor:
+    """Fast Single-Pass Uncertainty-Calibrated Fusion (UCCF).
+    
+    1. Computes normalized binary Shannon entropy u_{j,t} as instantaneous uncertainty:
+       u_{j,t} = -[p log2(p) + (1-p) log2(1-p)] + eps.
+    2. Computes inverse-uncertainty prior-aware weights:
+       w_{j,t} = (pi_j / u_{j,t}^2) / sum_k (pi_k / u_{k,t}^2).
+    3. Disagreement-Aware Gating:
+       When stream disagreement max_j p_j - min_j p_j > delta_dis, sharpens exponent
+       to u_{j,t}^-4 so the most confident stream dominates without dilution.
+    """
+    stream_keys = list(prob_dict.keys())
+    probs = [prob_dict[k].clamp(1e-6, 1.0 - 1e-6) for k in stream_keys]
+    stacked = torch.stack(probs, dim=0)  # [S, T]
+
+    log2 = math.log(2.0)
+    entropy = -(stacked * torch.log(stacked) + (1.0 - stacked) * torch.log(1.0 - stacked)) / log2
+    u = entropy + 1e-4  # [S, T]
+
+    disagreement = stacked.max(dim=0).values - stacked.min(dim=0).values
+    is_disagreed = (disagreement > delta_dis)
+
+    pi = torch.tensor(
+        [priors.get(k, 1.0) for k in stream_keys],
+        device=stacked.device, dtype=stacked.dtype
+    ).unsqueeze(-1)  # [S, 1]
+
+    u_sq = u ** 2
+    u_sharp = u ** 4
+
+    weights_normal = pi / (u_sq + 1e-5)
+    weights_normal = weights_normal / weights_normal.sum(dim=0, keepdim=True).clamp_min(1e-6)
+
+    weights_sharp = pi / (u_sharp + 1e-5)
+    weights_sharp = weights_sharp / weights_sharp.sum(dim=0, keepdim=True).clamp_min(1e-6)
+
+    weights = torch.where(is_disagreed.unsqueeze(0), weights_sharp, weights_normal)
+    fused_prob = (weights * stacked).sum(dim=0)
+    return fused_prob.clamp(0.0, 1.0)
+
+
+def apply_dodo_refinement(prob_np: np.ndarray, sigma: float = 1.5) -> np.ndarray:
+    """Peak-Preserving Morphological / Gaussian Proposal Refinement (DODO).
+    
+    Combines lightly-smoothed score (preserving sharp local peaks for ROC-AUC)
+    with connected-segment smoothed score (Gaussian + morphological closing to bridge
+    short dips within continuous anomalies for mAP@IoU).
+    
+    S_DODO = 0.65 * S_AUC + 0.35 * S_mAP.
+    """
+    prob_np = np.nan_to_num(prob_np, nan=0.0, posinf=1.0, neginf=0.0)
+    if len(prob_np) < 3:
+        return prob_np
+
+    from scipy.ndimage import gaussian_filter1d, grey_closing
+    s_auc = gaussian_filter1d(prob_np, sigma=0.5)
+    s_smooth = gaussian_filter1d(prob_np, sigma=sigma)
+    try:
+        s_closed = grey_closing(s_smooth, size=5)
+    except Exception:
+        s_closed = s_smooth
+
+    s_dodo = 0.65 * s_auc + 0.35 * s_closed
+    return np.clip(s_dodo, 0.0, 1.0)
+
 

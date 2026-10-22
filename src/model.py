@@ -475,9 +475,21 @@ class ModalityAdaptiveBranch(nn.Module):
             motion_t = motion.transpose(1, 2)  # [B, 2*D, T]
             f_a = self.motion_proj(motion_t).transpose(1, 2)  # [B, T, D]
 
-        # Bidirectional Cross-Modal Attention: Query=F_base, Key=F_a, Value=F_a
-        attn_out, _ = self.cross_attn(query=f_base, key=f_a, value=f_a, need_weights=False)
+        # Cross-Modal Attention: Query=F_base, Key=F_a, Value=F_a with padding mask support
+        cross_pad_mask = None
+        if lengths is not None:
+            cross_pad_mask = (
+                torch.arange(T, device=f_base.device)[None, :]
+                >= lengths.to(f_base.device)[:, None]
+            )
+        attn_out, _ = self.cross_attn(
+            query=f_base, key=f_a, value=f_a,
+            key_padding_mask=cross_pad_mask,
+            need_weights=False
+        )
         attn_out = torch.nan_to_num(attn_out, nan=0.0)
+        if cross_pad_mask is not None:
+            attn_out = attn_out.masked_fill(cross_pad_mask.unsqueeze(-1), 0.0)
         f_v_from_a = self.ln_cross(attn_out)
 
         # Dynamic Noise Suppression Gate G_av: [B, T, D]
@@ -810,6 +822,37 @@ class GradientSafeRUPA(nn.Module):
 # 4. Core Module 4: QuadSafeGate
 # ============================================================================
 
+class GradientProjectionJunction(torch.autograd.Function):
+    """Fast Feature-Level PCGrad Alternative.
+    
+    Junction between Backbone and RUPA branches:
+    Forward: passes feature F_fused to both Main Branch (logits2/detector) and RUPA branch.
+    Backward: receives grad_main from main detection/classification pipeline and grad_rupa from RUPA.
+    If dot_product(grad_rupa, grad_main) < 0:
+        grad_rupa_proj = grad_rupa - (grad_rupa . grad_main) / (||grad_main||^2 + eps) * grad_main
+    Returns (grad_main + grad_rupa_proj) to Backbone.
+    
+    Complexity: O(B * T * D), zero extra backward passes, 100% DataParallel compatible.
+    """
+    @staticmethod
+    def forward(ctx, x):
+        return x, x
+
+    @staticmethod
+    def backward(ctx, grad_main, grad_rupa):
+        if grad_main is None or grad_rupa is None:
+            return (grad_main if grad_main is not None else grad_rupa)
+        
+        dot = (grad_rupa * grad_main).sum()
+        if dot < 0:
+            norm_sq = (grad_main * grad_main).sum().clamp_min(1e-7)
+            grad_rupa_proj = grad_rupa - (dot / norm_sq) * grad_main
+        else:
+            grad_rupa_proj = grad_rupa
+            
+        return grad_main + grad_rupa_proj
+
+
 class QuadSafeGate(nn.Module):
     """Quad-Stream Uncertainty-Aware Dynamic Safe Gate.
     
@@ -1136,14 +1179,20 @@ class MARUPA(nn.Module):
         # Step 3 & 4: RUPA & QuadSafeGate
         dnp_dict = {}
         if DNP_use and not self.no_rupa:
+            # Fast Feature-Level PCGrad Alternative: decouple/project RUPA backward gradient against main branch
+            if self.training:
+                f_main, f_rupa_in = GradientProjectionJunction.apply(f_fused)
+            else:
+                f_main, f_rupa_in = f_fused, f_fused
+
             f_rec, residual, s_rec, s_sem, rupa_dict = self.rupa(
-                f_fused, s_det, text_features_ori, lengths=lengths, visual_raw=visual
+                f_rupa_in, s_det, text_features_ori, lengths=lengths, visual_raw=visual
             )
             p_routing, gate, s_fixed = self.safegate(s_det, s_rec, s_sem, s_aux)
             dnp_dict.update(rupa_dict)
             dnp_dict.update({
                 'routing_scores': p_routing,
-                'routing_logits': torch.logit(p_routing),
+                'routing_logits': torch.logit(p_routing.clamp(1e-6, 1.0 - 1e-6)),
                 'detector_scores': s_det,
                 'detector_logits': logits_det,
                 'aux_scores': s_aux,
@@ -1153,7 +1202,7 @@ class MARUPA(nn.Module):
                 'fixed_scores': s_fixed,
                 'gate': gate,
                 'noise_gate_av': g_av,
-                'original_features': f_fused,
+                'original_features': f_main,
                 'reconstructed_features': f_rec,
                 'residual_features': residual,
             })
@@ -1162,13 +1211,14 @@ class MARUPA(nn.Module):
             background_features = f_rec
         else:
             # Fallback when RUPA is disabled (Ablation mode)
+            f_main = f_fused
             p_routing, gate, s_fixed = self.safegate(s_det, s_det, s_det, s_aux)
             logits1 = logits_det
             event_features = f_fused
             background_features = f_fused
             dnp_dict.update({
                 'routing_scores': p_routing,
-                'routing_logits': torch.logit(p_routing),
+                'routing_logits': torch.logit(p_routing.clamp(1e-6, 1.0 - 1e-6)),
                 'detector_scores': s_det,
                 'detector_logits': logits_det,
                 'aux_scores': s_aux,
@@ -1208,7 +1258,7 @@ class MARUPA(nn.Module):
 
         # Snippet-level and video-level classification logits
         text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)
-        f_norm = F.normalize(f_fused, dim=-1)
+        f_norm = F.normalize(f_main, dim=-1)
         logits2 = f_norm @ text_mat / 0.07
 
         abn_feat_norm = F.normalize(abn_feat, dim=-1)

@@ -361,6 +361,112 @@ def test_topk_ratio_and_label_smoothing():
     print("  Top-K ratio and Label Smoothing tests passed!")
 
 
+def test_vat_k_and_at_bce():
+    print("Testing VAT-K and AT-BCE with OHNM...")
+    from utils.losses import compute_vat_k, compute_at_bce_topk_mil_loss
+
+    B, T = 4, 128
+    scores_flat = torch.sigmoid(torch.randn(B, T))
+    lengths = torch.tensor([128, 96, 64, 110])
+    k_list = compute_vat_k(scores_flat, lengths, ratio_base=10.0)
+    assert len(k_list) == B
+    for i, k in enumerate(k_list):
+        assert 1 <= k <= max(2, int(lengths[i].item() / 4.0))
+
+    binary_labels = torch.tensor([0, 1, 0, 1])
+    loss = compute_at_bce_topk_mil_loss(
+        scores_flat.unsqueeze(-1), binary_labels, lengths,
+        topk_ratio=10, vat_k=True, snippet_dropout=0.15,
+        lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True
+    )
+    assert loss.dim() == 0
+    assert torch.isfinite(loss)
+    assert loss > 0.0
+    print("  VAT-K and AT-BCE with OHNM passed!")
+
+
+def test_confidence_gated_consistency():
+    print("Testing Confidence-Gated Asymmetric Consistency...")
+    from utils.losses import compute_confidence_gated_consistency_loss
+
+    B, T = 2, 64
+    s_det = torch.sigmoid(torch.randn(B, T, 1))
+    s_rupa = torch.sigmoid(torch.randn(B, T, 1))
+    lengths = torch.tensor([64, 48])
+
+    loss = compute_confidence_gated_consistency_loss(s_det, s_rupa, lengths)
+    assert loss.dim() == 0
+    assert torch.isfinite(loss)
+    assert loss >= 0.0
+    print("  Confidence-Gated Asymmetric Consistency passed!")
+
+
+def test_fg_tv_smoothness():
+    print("Testing Feature-Guided Edge-Preserving TV Loss & Compactness...")
+    from utils.losses import compute_fg_tv_smoothness_loss
+
+    B, T, D = 2, 64, 512
+    scores = torch.sigmoid(torch.randn(B, T, 1))
+    visual = torch.randn(B, T, D)
+    lengths = torch.tensor([64, 50])
+    labels = torch.tensor([0, 1])
+
+    loss = compute_fg_tv_smoothness_loss(
+        scores=scores, visual_features=visual, lengths=lengths,
+        gamma_edge=5.0, lambda_compact=0.1, binary_labels=labels
+    )
+    assert loss.dim() == 0
+    assert torch.isfinite(loss)
+    assert loss >= 0.0
+    print("  Feature-Guided Edge-Preserving TV Loss passed!")
+
+
+def test_gradient_projection_junction():
+    print("Testing GradientProjectionJunction (Fast PCGrad)...")
+    from model import GradientProjectionJunction
+
+    x = torch.randn(2, 64, 512, requires_grad=True)
+    x_main, x_rupa = GradientProjectionJunction.apply(x)
+
+    # Force conflicting gradients: main = +1, rupa = -2 (dot product < 0)
+    loss = (x_main * 1.0).sum() + (x_rupa * (-2.0)).sum()
+    loss.backward()
+
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+    # Gradient of main should be preserved or orthogonalized without nan/inf
+    print("  GradientProjectionJunction passed!")
+
+
+def test_single_pass_uccf_and_dodo():
+    print("Testing Single-Pass UCCF and DODO Proposal Refinement...")
+    from utils.tools import compute_single_pass_uccf, apply_dodo_refinement
+
+    T = 100
+    p_routing = torch.sigmoid(torch.randn(T))
+    p_det = torch.sigmoid(torch.randn(T))
+    p_sem = torch.sigmoid(torch.randn(T))
+    p_rupa = torch.sigmoid(torch.randn(T))
+
+    prob_dict = {
+        'routing': p_routing,
+        'det': p_det,
+        'sem_rupa': p_rupa,
+        'sem': p_sem
+    }
+    priors = {'routing': 1.0, 'det': 0.9, 'sem_rupa': 0.9, 'sem': 0.6}
+
+    fused = compute_single_pass_uccf(prob_dict, priors, delta_dis=0.35)
+    assert fused.shape == (T,)
+    assert (fused >= 0.0).all() and (fused <= 1.0).all()
+
+    fused_np = fused.numpy()
+    dodo_np = apply_dodo_refinement(fused_np, sigma=1.5)
+    assert dodo_np.shape == (T,)
+    assert (dodo_np >= 0.0).all() and (dodo_np <= 1.0).all()
+    print("  Single-Pass UCCF and DODO Proposal Refinement passed!")
+
+
 if __name__ == '__main__':
     test_mdt_backbone()
     test_modality_branch()
@@ -372,4 +478,9 @@ if __name__ == '__main__':
     test_padded_sequence_attention_nan_guard()
     test_xd_test_collate_and_split_mismatch()
     test_topk_ratio_and_label_smoothing()
+    test_vat_k_and_at_bce()
+    test_confidence_gated_consistency()
+    test_fg_tv_smoothness()
+    test_gradient_projection_junction()
+    test_single_pass_uccf_and_dodo()
     print("\n[SUCCESS] ALL TESTS PASSED SUCCESSFULLY!")
