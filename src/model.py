@@ -103,9 +103,9 @@ class MDTPBranch(nn.Module):
     
     Captures multi-scale temporal dependencies (rapid anomalies like explosions
     and gradual anomalies like fighting/riots) via parallel depthwise-separable
-    dilations d in {1, 2, 4} with GLU activations.
+    dilations d in {1, 2, 4, 8} with GLU activations.
     """
-    def __init__(self, embed_dim: int = 512, dilations=(1, 2, 4), dropout: float = 0.1):
+    def __init__(self, embed_dim: int = 512, dilations=(1, 2, 4, 8), dropout: float = 0.1):
         super().__init__()
         self.dilations = dilations
         self.branches = nn.ModuleList([
@@ -145,13 +145,56 @@ class MDTPBranch(nn.Module):
         return out
 
 
+class GlobalLinearContextAggregator(nn.Module):
+    """Branch C: Global Linear Context Aggregator with O(T) complexity.
+    
+    Replaces DSANet's dense similarity GCN without graph noise:
+    phi(x) = ELU(x) + 1
+    Q = phi(X W_q), K = phi(X W_k), V = X W_v
+    F_global = (Q (K^T V)) / (Q (sum_t K_t)^T + eps)
+    """
+    def __init__(self, embed_dim: int = 512, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.w_q = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.w_k = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.w_v = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = LayerNormFP32(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, padding_mask: torch.Tensor = None):
+        # x: [B, T, D]
+        q = F.elu(self.w_q(x)) + 1.0  # [B, T, D]
+        k = F.elu(self.w_k(x)) + 1.0  # [B, T, D]
+        v = self.w_v(x)               # [B, T, D]
+
+        if padding_mask is not None:
+            valid_mask = (~padding_mask).unsqueeze(-1).to(x.dtype)
+            k = k * valid_mask
+            v = v * valid_mask
+
+        # KV: [B, D, D] = K^T @ V
+        kv = torch.bmm(k.transpose(1, 2), v)
+        # num: [B, T, D] = Q @ KV
+        num = torch.bmm(q, kv)
+        # den: [B, T, 1] = Q @ sum_t(K)^T
+        k_sum = k.sum(dim=1, keepdim=True)  # [B, 1, D]
+        den = torch.bmm(q, k_sum.transpose(1, 2)).clamp_min(1e-5)
+
+        f_global = num / den
+        out = self.norm(self.dropout(self.out_proj(f_global)))
+        return out
+
+
 class MDTBackbone(nn.Module):
     """Multi-Scale Dilated Temporal & Local Attention Backbone.
     
     Combines:
-    - Branch A: Local Windowed Transformer (window W=8 for UCF, W=64 for XD)
-    - Branch B: Multi-Scale Dilated Temporal Pyramid (dilations 1, 2, 4)
-    - Channel-wise attention gate to fuse Branch A & B into F_base
+    - Branch 1: Local Windowed Transformer (window W=8 for UCF, W=64 for XD)
+    - Branch 2: Multi-Scale Dilated Temporal Pyramid (dilations 1, 2, 4, 8)
+    - Branch 3: Global Linear Context Aggregator (O(T) complexity)
+    - Crucial CLIP Anchor Skip Connection: F_base = LayerNorm(X_clip + alpha * FusedContext)
     - Base anomaly detector classifier S_det
     """
     def __init__(self, visual_length: int = 256, embed_dim: int = 512,
@@ -167,23 +210,32 @@ class MDTBackbone(nn.Module):
         self.frame_pos_embed = nn.Parameter(torch.zeros(1, visual_length, embed_dim))
         trunc_normal_(self.frame_pos_embed, std=0.02)
 
-        # Branch A: Local Windowed Transformer
+        # Branch 1: Local Windowed Transformer
         self.branch_a_layers = nn.ModuleList([
             WindowedAttentionBlock(embed_dim, num_heads=visual_heads, dropout=mlp_dropout)
             for _ in range(visual_layers)
         ])
 
-        # Branch B: Multi-Scale Dilated Temporal Pyramid
+        # Branch 2: Multi-Scale Dilated Temporal Pyramid (dilations 1, 2, 4, 8)
         if not self.no_mdtp:
-            self.branch_b = MDTPBranch(embed_dim=embed_dim, dilations=(1, 2, 4), dropout=mlp_dropout)
-            # Channel-wise attention gate to fuse A and B
-            self.channel_gate = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim // 4),
-                QuickGELU(),
-                nn.Linear(embed_dim // 4, embed_dim),
-                nn.Sigmoid()
-            )
-            self.fuse_norm = LayerNormFP32(embed_dim)
+            self.branch_b = MDTPBranch(embed_dim=embed_dim, dilations=(1, 2, 4, 8), dropout=mlp_dropout)
+
+        # Branch 3: Global Linear Context Aggregator (O(T) complexity)
+        self.branch_c = GlobalLinearContextAggregator(embed_dim=embed_dim, dropout=mlp_dropout)
+
+        # Context Fusion of Branch 1, 2, 3
+        in_channels_fuse = embed_dim * 3 if not self.no_mdtp else embed_dim * 2
+        self.fuse_proj = nn.Sequential(
+            nn.Linear(in_channels_fuse, embed_dim),
+            QuickGELU(),
+            nn.Dropout(mlp_dropout),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        self.fuse_norm = LayerNormFP32(embed_dim)
+
+        # Crucial CLIP Anchor Skip Connection (initialized to 0.1)
+        self.alpha_backbone = nn.Parameter(torch.tensor(0.1))
+        self.out_norm = LayerNormFP32(embed_dim)
 
         # Base Anomaly Classifier Head
         self.mlp_det = nn.Sequential(OrderedDict([
@@ -211,11 +263,11 @@ class MDTBackbone(nn.Module):
                 lengths: torch.Tensor = None):
         """
         Args:
-            visual_features: [B, T, D] CLIP snippet visual features
+            visual_features: [B, T, D] CLIP snippet visual features (X_clip)
             padding_mask: [B, T] bool mask where True is padded/invalid
             lengths: [B] valid snippet counts
         Returns:
-            F_base: [B, T, D] fused base temporal features
+            F_base: [B, T, D] fused base temporal features (anchored to X_clip)
             S_det: [B, T, 1] base anomaly detector probability scores
             logits_det: [B, T, 1] raw classifier logits
         """
@@ -239,26 +291,24 @@ class MDTBackbone(nn.Module):
                 >= lengths.to(visual_features.device)[:, None]
             )
 
-        # Branch A: Windowed Self-Attention
+        # Branch 1: Windowed Self-Attention
         attn_mask = self.build_window_attention_mask(T, self.attn_window, visual_features.device)
         f_a = x
         for layer in self.branch_a_layers:
             f_a = layer(f_a, attn_mask=attn_mask, key_padding_mask=padding_mask)
 
-        # Branch B: Multi-Scale Dilated Temporal Pyramid
+        # Branch 3: Global Linear Context Aggregator
+        f_c = self.branch_c(x, padding_mask=padding_mask)
+
+        # Branch 2: Multi-Scale Dilated Temporal Pyramid
         if not self.no_mdtp:
             f_b = self.branch_b(x)
-            # Channel-wise attention gate
-            # Pool over time: [B, D]
-            if padding_mask is not None:
-                valid_mask = (~padding_mask).unsqueeze(-1).to(f_a.dtype)
-                pooled = (f_a * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1e-5)
-            else:
-                pooled = f_a.mean(dim=1)
-            gate = self.channel_gate(pooled).unsqueeze(1)  # [B, 1, D]
-            f_base = self.fuse_norm(f_a + gate * f_b)
+            fused_context = self.fuse_norm(self.fuse_proj(torch.cat([f_a, f_b, f_c], dim=-1)))
         else:
-            f_base = f_a
+            fused_context = self.fuse_norm(self.fuse_proj(torch.cat([f_a, f_c], dim=-1)))
+
+        # Crucial CLIP Anchor Skip Connection: F_base = LayerNorm(X_clip + alpha * FusedContext)
+        f_base = self.out_norm(visual_features + self.alpha_backbone * fused_context)
 
         # Base Anomaly Classifier
         det_features = f_base + self.mlp_det(f_base)
@@ -333,6 +383,7 @@ class ModalityAdaptiveBranch(nn.Module):
             nn.Linear(embed_dim, embed_dim),
             nn.Sigmoid()
         )
+        self.alpha_mod = nn.Parameter(torch.tensor(0.1))
         self.ln_fused = LayerNormFP32(embed_dim)
 
         # Auxiliary Anomaly Classifier Head
@@ -433,8 +484,8 @@ class ModalityAdaptiveBranch(nn.Module):
         gate_input = torch.cat([f_base, f_a, f_base * f_a], dim=-1)
         g_av = self.noise_gate_mlp(gate_input)
 
-        # Fuse features: F_fused = LayerNorm(F_base + G_av * F_v_from_a)
-        f_fused = self.ln_fused(f_base + g_av * f_v_from_a)
+        # Gated residual injection: F_fused = LayerNorm(F_base + alpha_mod * (G_av * F_v_from_a))
+        f_fused = self.ln_fused(f_base + self.alpha_mod * (g_av * f_v_from_a))
 
         # Auxiliary Anomaly Classifier
         aux_features = f_fused + self.mlp_aux(f_fused)
@@ -498,6 +549,17 @@ class GradientSafeRUPA(nn.Module):
                 qkv_bias=True, norm_layer=partial(LayerNormFP32, eps=1e-6)
             ) for _ in range(decoder_depth)
         ])
+
+        # Residual-amplified feature MLP for domain-adaptive category semantics
+        # F_sem_rupa = LayerNorm(X_clip + F_fused + gamma_rupa * MLP_res(F_fused - F_rec))
+        self.mlp_res = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(feature_dim, feature_dim * 2)),
+            ("gelu", QuickGELU()),
+            ("dropout", nn.Dropout(0.1)),
+            ("c_proj", nn.Linear(feature_dim * 2, feature_dim))
+        ]))
+        self.gamma_rupa = nn.Parameter(torch.tensor(0.2))
+        self.ln_sem_rupa = LayerNormFP32(feature_dim)
 
         # Learnable temperature and feature-variance scaling factor
         self.log_temp = nn.Parameter(torch.tensor(math.log(0.07)))
@@ -629,21 +691,25 @@ class GradientSafeRUPA(nn.Module):
         return loss_orth.mean()
 
     def forward(self, f_fused: torch.Tensor, s_det: torch.Tensor,
-                category_text_features: torch.Tensor, lengths: torch.Tensor = None):
+                category_text_features: torch.Tensor, lengths: torch.Tensor = None,
+                visual_raw: torch.Tensor = None):
         """
         Args:
             f_fused: [B, T, D] multimodal fused features
             s_det: [B, T, 1] detector anomaly scores
             category_text_features: [C, D] text embeddings for categories (class 0 is normal)
             lengths: [B] valid sequence lengths
+            visual_raw: [B, T, D] raw visual features (X_clip) for semantic anchor preservation
         Returns:
             f_rec: [B, T, D] reconstructed counterfactual normal features
             residual: [B, T, D] residual anomaly features
             s_rec: [B, T, 1] reconstruction anomaly scores
             s_sem: [B, T, 1] semantic alignment anomaly scores
-            rupa_dict: detailed tensors for loss supervision
+            rupa_dict: detailed tensors for loss supervision (all [B, ...] shaped, 0 scalar warnings)
         """
         B, N, D = f_fused.shape
+        if visual_raw is None:
+            visual_raw = f_fused
 
         # Detach detector scores so normal selection does not pass discontinuous indexing gradients
         with torch.no_grad():
@@ -665,8 +731,19 @@ class GradientSafeRUPA(nn.Module):
             agg_prototype = blk(agg_prototype, normal_input)
 
         dynamic_normal_patterns = agg_prototype  # [B, M, D]
-        g_loss = self.gather_loss(selected_normal, dynamic_normal_patterns, reliability).view(1)
-        orth_loss = self.prototype_orthogonality_loss(dynamic_normal_patterns).view(1)
+
+        # Per-sample gather loss: [B, 1] (prevents DataParallel scalar gather warnings)
+        dist = 1.0 - F.cosine_similarity(selected_normal.unsqueeze(2), dynamic_normal_patterns.unsqueeze(1), dim=-1)
+        min_dist, _ = torch.min(dist, dim=2)
+        rel_norm = reliability / reliability.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        sample_g_loss = (min_dist * rel_norm).sum(dim=1, keepdim=True)  # [B, 1]
+
+        # Per-sample prototype orthogonality loss: [B, 1]
+        p_norm = F.normalize(dynamic_normal_patterns, dim=-1)
+        sim_matrix = torch.bmm(p_norm, p_norm.transpose(1, 2))
+        identity = torch.eye(self.num_prototypes, device=f_fused.device).unsqueeze(0).expand(B, -1, -1)
+        off_diag = sim_matrix - identity
+        sample_orth_loss = (off_diag ** 2).sum(dim=(1, 2), keepdim=True) / max(1, self.num_prototypes * (self.num_prototypes - 1))  # [B, 1]
 
         # Counterfactual normal reconstruction
         bottleneck_features = f_fused
@@ -683,46 +760,49 @@ class GradientSafeRUPA(nn.Module):
         cos_sim = F.cosine_similarity(f_fused, f_rec, dim=-1).unsqueeze(-1)
         s_rec = ((1.0 - cos_sim) / 2.0).clamp(0.0, 1.0)
 
+        # Fix 3.3: Residual-Amplified CLIP-Anchored Semantic Feature
+        # F_sem_rupa = LayerNorm(X_clip + F_fused + gamma_rupa * MLP_res(F_fused - F_rec))
+        # Normal snippets: F_fused ~ F_rec => residual ~ 0 => F_sem_rupa ~ X_clip + F_fused (preserves clean normal representation)
+        # Abnormal snippets: residual != 0 => amplifies the abnormal direction towards fine-grained category prompts
+        f_sem_rupa = self.ln_sem_rupa(
+            visual_raw + f_fused + self.gamma_rupa * self.mlp_res(residual)
+        )
+
         # Domain-Adaptive Semantic Alignment
         temp = self.log_temp.exp().clamp(min=0.01, max=1.0)
         cat_text_norm = F.normalize(category_text_features, dim=-1)  # [C, D]
         text_matrix = cat_text_norm.t().to(f_fused.dtype)  # [D, C]
 
-        rec_norm = F.normalize(f_rec, dim=-1)
-        res_norm = F.normalize(residual, dim=-1)
-
-        rec_sem_logits = rec_norm @ text_matrix / temp
-        res_sem_logits = res_norm @ text_matrix / temp
-
-        # Category 0 (normal) aligned via F_rec; anomaly categories aligned via residual R
-        semantic_logits = torch.cat(
-            [rec_sem_logits[:, :, :1], res_sem_logits[:, :, 1:]], dim=-1
-        )  # [B, T, C]
+        f_sem_norm = F.normalize(f_sem_rupa, dim=-1)
+        semantic_logits = f_sem_norm @ text_matrix / temp  # [B, T, C]
 
         # Variance scaling factor: damps noisy semantic logits in blurry CCTV videos
         r_var = torch.var(residual, dim=-1, keepdim=True)  # [B, T, 1]
         var_scale = 1.0 + F.softplus(self.var_scale_param) * r_var
         scaled_sem_logits = semantic_logits / var_scale
 
-        # Semantic Anomaly Score: 1 - P(Normal)
+        # Semantic Anomaly Score: 1 - P(Normal) (class 0 is Normal)
         s_sem = (1.0 - F.softmax(scaled_sem_logits, dim=-1)[:, :, :1]).clamp(0.0, 1.0)
 
-        # Prototype Normal Alignment Loss
+        # Prototype Normal Alignment Loss: [B, 1]
         normal_text_vec = cat_text_norm[0].view(1, 1, -1)
         dnp_normal_sim = F.cosine_similarity(dynamic_normal_patterns, normal_text_vec, dim=-1)
-        dnp_normal_loss = (1.0 - dnp_normal_sim).mean()
+        sample_dnp_normal_loss = (1.0 - dnp_normal_sim).mean(dim=1, keepdim=True)  # [B, 1]
 
         rupa_dict = {
             'reconstructed_features': f_rec,
             'residual_features': residual,
             'dynamic_normal_patterns': dynamic_normal_patterns,
+            'selected_normal': selected_normal,
+            'reliability': reliability,
+            'f_sem_rupa': f_sem_rupa,
             'semantic_logits': scaled_sem_logits,
             'raw_semantic_logits': semantic_logits,
-            'residual_semantic_logits': res_sem_logits,
-            'reconstructed_semantic_logits': rec_sem_logits,
-            'g_loss': g_loss,
-            'orth_loss': orth_loss,
-            'dnp_normal_loss': dnp_normal_loss,
+            'residual_semantic_logits': scaled_sem_logits,
+            'reconstructed_semantic_logits': scaled_sem_logits,
+            'g_loss': sample_g_loss,
+            'orth_loss': sample_orth_loss,
+            'dnp_normal_loss': sample_dnp_normal_loss,
         }
 
         return f_rec, residual, s_rec, s_sem, rupa_dict
@@ -1059,7 +1139,7 @@ class MARUPA(nn.Module):
         dnp_dict = {}
         if DNP_use and not self.no_rupa:
             f_rec, residual, s_rec, s_sem, rupa_dict = self.rupa(
-                f_fused, s_det, text_features_ori, lengths=lengths
+                f_fused, s_det, text_features_ori, lengths=lengths, visual_raw=visual
             )
             p_routing, gate, s_fixed = self.safegate(s_det, s_rec, s_sem, s_aux)
             dnp_dict.update(rupa_dict)
@@ -1095,14 +1175,17 @@ class MARUPA(nn.Module):
                 'detector_logits': logits_det,
                 'aux_scores': s_aux,
                 'aux_logits': logits_aux,
+                'reconstruction_scores': torch.zeros_like(s_det),
+                'semantic_scores': torch.zeros_like(s_det),
                 'fixed_scores': s_fixed,
                 'gate': gate,
+                'noise_gate_av': g_av,
                 'original_features': f_fused,
                 'reconstructed_features': f_fused,
                 'residual_features': torch.zeros_like(f_fused),
-                'g_loss': torch.zeros(1, device=visual.device),
-                'orth_loss': torch.zeros(1, device=visual.device),
-                'dnp_normal_loss': torch.zeros(1, device=visual.device),
+                'g_loss': torch.zeros(B, 1, device=visual.device),
+                'orth_loss': torch.zeros(B, 1, device=visual.device),
+                'dnp_normal_loss': torch.zeros(B, 1, device=visual.device),
             })
 
         # Event-centric & Background-centric attention pooling

@@ -1,8 +1,7 @@
 """MA-RUPA End-to-End Training Script for UCF-Crime.
 
-Trains MA-RUPA from scratch in a single stage without pre-trained checkpoints
-or frozen stages. Features curriculum warm-up for RUPA losses to eliminate
-gradient collapse.
+Trains MA-RUPA from scratch in a single stage with interleaved multi-GPU batching,
+smooth cosine curriculum warm-up, dynamic Top-K MIL, and rebalanced prototype losses.
 """
 
 import math
@@ -19,148 +18,20 @@ from model import MARUPA, load_compatible_model_state
 from ucf_test import test
 from utils.dataset import UCFDataset
 from utils.tools import get_batch_label, get_prompt_text, safe_load_checkpoint
+from utils.losses import (
+    get_curriculum_omega,
+    compute_topk_mil_loss,
+    compute_temporal_smoothness_loss,
+    compute_residual_event_loss,
+    compute_clasm_loss,
+    compute_bkg_loss,
+    compute_consistency_loss,
+    compute_event_loss,
+    compute_gather_loss,
+    compute_orthogonality_loss,
+    compute_normal_contrastive_loss
+)
 import ucf_option
-
-
-def compute_topk_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
-                         lengths: torch.Tensor, device: torch.device,
-                         topk_ratio: int = 8, label_smoothing: float = 0.0):
-    """Computes Top-K Multiple Instance Learning (MIL) Binary Cross-Entropy loss with optional label smoothing."""
-    instance_scores = []
-    binary_labels = binary_labels.to(device)
-    scores_flat = scores.squeeze(-1)  # [B, T]
-
-    for i in range(scores.shape[0]):
-        l_i = int(lengths[i].item())
-        k_count = max(1, int(l_i / topk_ratio) + 1)
-        valid_scores = scores_flat[i, :l_i]
-        topk_vals, _ = torch.topk(valid_scores, k=min(k_count, l_i), largest=True)
-        instance_scores.append(topk_vals.mean().view(1))
-
-    instance_scores = torch.cat(instance_scores, dim=0)
-    targets = binary_labels.float()
-    if label_smoothing > 0.0:
-        targets = targets * (1.0 - label_smoothing) + 0.5 * label_smoothing
-
-    loss = F.binary_cross_entropy(instance_scores.clamp(1e-6, 1.0 - 1e-6), targets)
-    return loss
-
-
-def compute_temporal_smoothness_loss(scores: torch.Tensor, lengths: torch.Tensor,
-                                     lambda_sparse: float = 8e-5):
-    """Computes temporal total variation smoothness and snippet sparsity loss."""
-    smooth_loss = 0.0
-    sparse_loss = 0.0
-    B = scores.shape[0]
-    scores_flat = scores.squeeze(-1)
-
-    for i in range(B):
-        l_i = int(lengths[i].item())
-        if l_i > 1:
-            diff = scores_flat[i, 1:l_i] - scores_flat[i, :l_i - 1]
-            smooth_loss += (diff ** 2).mean()
-            sparse_loss += scores_flat[i, :l_i].mean()
-
-    return (smooth_loss / max(1, B)) + lambda_sparse * (sparse_loss / max(1, B))
-
-
-def compute_residual_event_loss(residual_logits: torch.Tensor, labels: torch.Tensor,
-                                lengths: torch.Tensor, device: torch.device):
-    """Aligns anomaly residual features with fine-grained anomaly text prompts."""
-    # labels: [B, C], class 0 is Normal
-    anomaly_mask = labels[:, 1:].sum(dim=1) > 0
-    if not torch.any(anomaly_mask):
-        return torch.tensor(0.0, device=device)
-
-    sub_logits = residual_logits[anomaly_mask]
-    sub_labels = labels[anomaly_mask].to(device)
-    sub_lengths = lengths[anomaly_mask]
-
-    num_classes = sub_logits.shape[-1]
-    labels_norm = sub_labels / sub_labels.sum(dim=1, keepdim=True).clamp_min(1e-6)
-
-    instance_logits = []
-    for i in range(sub_logits.shape[0]):
-        l_i = int(sub_lengths[i].item())
-        k_count = max(1, int(l_i / 16) + 1)
-        topk_vals, _ = torch.topk(sub_logits[i, :l_i], k=min(k_count, l_i), largest=True, dim=0)
-        instance_logits.append(topk_vals.mean(dim=0, keepdim=True))
-
-    instance_logits = torch.cat(instance_logits, dim=0)
-    loss = -torch.mean(torch.sum(labels_norm * F.log_softmax(instance_logits, dim=-1), dim=-1))
-    return loss
-
-
-def compute_clasm_loss(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
-                       device: torch.device, k_ratio: int = 16, epsilon: float = 0.05):
-    """Snippet-level multi-class MIL cross-entropy loss against fine-grained categories (Normal + 13 crimes)."""
-    labels_norm = labels.to(device) / labels.to(device).sum(dim=1, keepdim=True).clamp_min(1e-6)
-    num_classes = logits.shape[-1]
-    labels_sm = (1.0 - epsilon) * labels_norm + (epsilon / num_classes)
-
-    instance_logits = []
-    for i in range(logits.shape[0]):
-        l_i = int(lengths[i].item())
-        k_count = max(1, int(l_i / k_ratio) + 1)
-        topk_vals, _ = torch.topk(logits[i, :l_i], k=min(k_count, l_i), largest=True, dim=0)
-        instance_logits.append(topk_vals.mean(dim=0, keepdim=True))
-
-    instance_logits = torch.cat(instance_logits, dim=0)
-    milloss = -torch.mean(torch.sum(labels_sm * F.log_softmax(instance_logits, dim=1), dim=1), dim=0)
-    return milloss
-
-
-def compute_bkg_loss(logits4: torch.Tensor, device: torch.device, num_classes: int = 14, epsilon: float = 0.05):
-    """Background-centric loss forcing reconstructed prototypes to classify as class 0 (Normal)."""
-    nor_logits = logits4.squeeze(1)  # [B, C]
-    target = torch.full_like(nor_logits, epsilon / num_classes, device=device)
-    target[:, 0] = 1.0 - epsilon + (epsilon / num_classes)
-    loss = -torch.mean(torch.sum(target * F.log_softmax(nor_logits, dim=1), dim=1))
-    return loss
-
-
-def compute_consistency_loss(p_routing: torch.Tensor, original_features: torch.Tensor,
-                             reconstructed_features: torch.Tensor, lengths: torch.Tensor,
-                             device: torch.device):
-    """Enforces consistency between detector routing anomaly score and prototype reconstruction error."""
-    cos_sim = F.cosine_similarity(original_features, reconstructed_features, dim=-1)  # [B, T]
-    recon_error = ((1.0 - cos_sim) / 2.0).clamp(0.0, 1.0)
-    pred_score = p_routing.squeeze(-1)  # [B, T]
-
-    B, T = pred_score.shape
-    mask = torch.arange(T, device=device)[None, :] < lengths.to(device)[:, None]
-
-    if not torch.any(mask):
-        return torch.tensor(0.0, device=device)
-
-    return F.mse_loss(pred_score[mask], recon_error[mask])
-
-
-def compute_event_loss(logits3: torch.Tensor, labels: torch.Tensor, device: torch.device, epsilon: float = 0.05):
-    """Event-centric loss matching pooled anomaly features against true crime class."""
-    anom_mask = labels[:, 1:].sum(dim=1) > 0
-    if not torch.any(anom_mask):
-        return torch.tensor(0.0, device=device)
-
-    sub_logits = logits3[anom_mask].squeeze(1)  # [B_anom, C]
-    sub_labels = labels[anom_mask].to(device)
-    num_classes = sub_logits.shape[-1]
-
-    labels_norm = sub_labels / sub_labels.sum(dim=1, keepdim=True).clamp_min(1e-6)
-    labels_sm = (1.0 - epsilon) * labels_norm + (epsilon / num_classes)
-    loss = -torch.mean(torch.sum(labels_sm * F.log_softmax(sub_logits, dim=1), dim=1))
-    return loss
-
-
-def compute_normal_contrastive_loss(text_features: torch.Tensor, device: torch.device, num_classes: int = None):
-    """Encourages text representations of normal vs. anomalies to remain distinct."""
-    if num_classes is not None and text_features.shape[0] > num_classes:
-        text_features = text_features[:num_classes]
-    norm_text = F.normalize(text_features, dim=-1)
-    normal_vec = norm_text[0]  # [D]
-    anom_vecs = norm_text[1:]  # [C-1, D]
-    sim = torch.abs(anom_vecs @ normal_vec)
-    return sim.mean()
 
 
 def train(args):
@@ -185,12 +56,15 @@ def train(args):
         'Vandalism': 'Vandalism'
     }
 
-    # Data loaders
+    # Data loaders with crop-grouped sampling
+    sample_one_crop = getattr(args, 'sample_one_crop_per_video', True)
     normal_dataset = UCFDataset(
-        args.visual_length, args.train_list, False, label_map, normal=True, data_dir=args.data_dir
+        args.visual_length, args.train_list, False, label_map, normal=True,
+        data_dir=args.data_dir, sample_one_crop_per_video=sample_one_crop
     )
     anomaly_dataset = UCFDataset(
-        args.visual_length, args.train_list, False, label_map, normal=False, data_dir=args.data_dir
+        args.visual_length, args.train_list, False, label_map, normal=False,
+        data_dir=args.data_dir, sample_one_crop_per_video=sample_one_crop
     )
 
     batch_half = max(1, args.batch_size // 2)
@@ -264,13 +138,22 @@ def train(args):
 
     print("\n" + "=" * 70)
     print(f"[START] STARTING END-TO-END TRAINING FOR UCF-CRIME: {args.max_epoch} EPOCHS")
+    print(f"  Batch size: {args.batch_size} ({batch_half} Normal + {batch_half} Abnormal per batch, Interleaved)")
+    print(f"  Iters per epoch: {iters_per_epoch} | Sample 1 crop per video: {sample_one_crop}")
     print("=" * 70, flush=True)
 
     for epoch in range(start_epoch, args.max_epoch):
         model.train()
         epoch_idx = epoch + 1
-        # Curriculum ramp-up factor: omega(e) = min(1.0, e / curriculum_epochs)
-        omega = min(1.0, float(epoch_idx) / float(args.curriculum_epochs))
+
+        # Resample crops per video every epoch to avoid memorization
+        if hasattr(normal_dataset, 'resample_crops'):
+            normal_dataset.resample_crops()
+        if hasattr(anomaly_dataset, 'resample_crops'):
+            anomaly_dataset.resample_crops()
+
+        # Smooth Cosine Curriculum Ramp-up
+        omega = get_curriculum_omega(epoch_idx, getattr(args, 'curriculum_epochs', 5.0))
 
         loss_accum = {
             'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'bkg': 0.0, 'consist': 0.0,
@@ -284,15 +167,25 @@ def train(args):
             norm_feat, norm_labels, norm_lens = next(normal_iter)
             anom_feat, anom_labels, anom_lens = next(anomaly_iter)
 
-            visual_batch = torch.cat([norm_feat, anom_feat], dim=0).to(device)
-            cat_labels = list(norm_labels) + list(anom_labels)
-            lengths_batch = torch.cat([norm_lens, anom_lens], dim=0).to(device)
+            B_half = norm_feat.shape[0]
+            # Interleave Normal and Abnormal along dim=0 (0, 2, ... are Normal; 1, 3, ... are Abnormal)
+            # This completely solves nn.DataParallel batch-split corruption on 2 GPUs!
+            visual_batch = torch.empty((2 * B_half, *norm_feat.shape[1:]), dtype=norm_feat.dtype, device=device)
+            visual_batch[0::2] = norm_feat.to(device)
+            visual_batch[1::2] = anom_feat.to(device)
 
-            # Binary anomaly labels: 0 for normal, 1 for anomaly
-            binary_labels = torch.cat([
-                torch.zeros(len(norm_labels), device=device),
-                torch.ones(len(anom_labels), device=device)
-            ], dim=0)
+            lengths_batch = torch.empty(2 * B_half, dtype=norm_lens.dtype, device=device)
+            lengths_batch[0::2] = norm_lens.to(device)
+            lengths_batch[1::2] = anom_lens.to(device)
+
+            binary_labels = torch.empty(2 * B_half, dtype=torch.float32, device=device)
+            binary_labels[0::2] = 0.0
+            binary_labels[1::2] = 1.0
+
+            cat_labels = [None] * (2 * B_half)
+            for i in range(B_half):
+                cat_labels[2 * i] = norm_labels[i]
+                cat_labels[2 * i + 1] = anom_labels[i]
 
             # Fine-grained categorical one-hot tensor
             one_hot_labels = get_batch_label(cat_labels, prompt_text, label_map).to(device)
@@ -311,38 +204,49 @@ def train(args):
             s_aux = dnp_dict['aux_scores']
             s_det = dnp_dict['detector_scores']
 
-            # 1. Primary & Auxiliary MIL Losses
+            # 1. Primary & Auxiliary MIL Losses (Dynamic Top-K + Snippet Dropout + Non-Saturating BCE)
             topk_r = getattr(args, 'topk_ratio', 8)
-            lbl_sm = getattr(args, 'label_smoothing', 0.02)
-            loss_mil_routing = compute_topk_mil_loss(p_routing, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
-            loss_mil_aux = compute_topk_mil_loss(s_aux, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
-            loss_mil_det = compute_topk_mil_loss(s_det, binary_labels, lengths_batch, device, topk_ratio=topk_r, label_smoothing=lbl_sm).mean()
+            lbl_sm = getattr(args, 'label_smoothing', 0.0)
+            snip_drop = getattr(args, 'snippet_dropout', 0.15)
+
+            loss_mil_routing = compute_topk_mil_loss(
+                p_routing, binary_labels, lengths_batch,
+                topk_ratio=topk_r, label_smoothing=lbl_sm, snippet_dropout=snip_drop, training=True
+            )
+            loss_mil_aux = compute_topk_mil_loss(
+                s_aux, binary_labels, lengths_batch,
+                topk_ratio=topk_r, label_smoothing=lbl_sm, snippet_dropout=snip_drop, training=True
+            )
+            loss_mil_det = compute_topk_mil_loss(
+                s_det, binary_labels, lengths_batch,
+                topk_ratio=topk_r, label_smoothing=lbl_sm, snippet_dropout=snip_drop, training=True
+            )
 
             # 2. Multi-class Semantic Alignment & Consistency Losses
-            loss_clasm = compute_clasm_loss(logits2, one_hot_labels, lengths_batch, device).mean()
-            loss_bkg = compute_bkg_loss(logits4, device, num_classes=len(prompt_text)).mean()
+            loss_clasm = compute_clasm_loss(logits2, one_hot_labels, lengths_batch, k_ratio=topk_r)
+            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
 
             if 'original_features' in dnp_dict and 'reconstructed_features' in dnp_dict:
                 loss_consistency = compute_consistency_loss(
-                    p_routing, dnp_dict['original_features'], dnp_dict['reconstructed_features'], lengths_batch, device
-                ).mean()
+                    p_routing, dnp_dict['original_features'], dnp_dict['reconstructed_features'], lengths_batch
+                )
             else:
                 loss_consistency = torch.tensor(0.0, device=device)
 
-            loss_event = compute_event_loss(logits3, one_hot_labels, device).mean()
+            loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dnp_normal = dnp_dict.get('dnp_normal_loss', torch.tensor(0.0, device=device)).mean()
 
-            # 3. Temporal Smoothness & Sparsity
-            loss_smooth = compute_temporal_smoothness_loss(p_routing, lengths_batch).mean()
+            # 3. Temporal Smoothness (prevents needle-spike collapse and preserves mAP@IoU)
+            loss_smooth = compute_temporal_smoothness_loss(p_routing, lengths_batch)
 
-            # 4. RUPA Prototype Losses (modulated by curriculum ramp-up omega(e))
-            loss_gather = dnp_dict.get('g_loss', torch.tensor(0.0, device=device)).mean()
-            loss_orth = dnp_dict.get('orth_loss', torch.tensor(0.0, device=device)).mean()
+            # 4. RUPA Prototype Losses (Rebalanced weights modulated by smooth curriculum omega(e))
+            loss_gather = compute_gather_loss(dnp_dict)
+            loss_orth = compute_orthogonality_loss(dnp_dict)
 
             if 'residual_semantic_logits' in dnp_dict:
                 loss_residual = compute_residual_event_loss(
-                    dnp_dict['residual_semantic_logits'], one_hot_labels, lengths_batch, device
-                ).mean()
+                    dnp_dict['residual_semantic_logits'], one_hot_labels, lengths_batch, k_ratio=topk_r
+                )
             else:
                 loss_residual = torch.tensor(0.0, device=device)
 
@@ -351,28 +255,28 @@ def train(args):
 
             # Text Orthogonality Regularization
             loss_text_orth = compute_normal_contrastive_loss(
-                text_features, device, num_classes=len(prompt_text)
-            ).mean()
+                text_features, num_classes=len(prompt_text)
+            )
 
-            # Total Loss Computation (guaranteed 0-D scalar for backward())
+            # Total Loss Computation with Rebalanced Auxiliary Weights
             total_loss = (
                 loss_mil_routing
                 + 0.5 * loss_mil_det
-                + args.lambda_aux * loss_mil_aux
+                + getattr(args, 'lambda_aux', 0.1) * loss_mil_aux
                 + getattr(args, 'loss2_weight', 1.0) * loss_clasm
                 + getattr(args, 'lambda_bkg', 0.5) * loss_bkg
-                + getattr(args, 'lambda_consistency', 1.0) * loss_consistency
-                + args.lambda_smooth * loss_smooth
+                + getattr(args, 'lambda_consistency', 0.05) * loss_consistency
+                + getattr(args, 'lambda_smooth', 0.001) * loss_smooth
                 + 0.1 * loss_text_orth
                 + omega * (
-                    args.lambda_gather * loss_gather
-                    + args.lambda_orth * loss_orth
-                    + args.lambda_residual * loss_residual
+                    getattr(args, 'lambda_gather', 0.05) * loss_gather
+                    + getattr(args, 'lambda_orth', 0.02) * loss_orth
+                    + getattr(args, 'lambda_residual', 0.05) * loss_residual
                     + 0.5 * loss_event
                     + 0.2 * loss_dnp_normal
-                    + args.lambda_gate * loss_gate
+                    + getattr(args, 'lambda_gate', 0.005) * loss_gate
                 )
-            ).mean()
+            )
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -396,11 +300,10 @@ def train(args):
             loss_accum['gate'] += loss_gate.item()
             loss_accum['total'] += total_loss.item()
 
-            total_batches = min(len(normal_loader), len(anomaly_loader))
-            if (step_idx + 1) % 20 == 0 or (step_idx + 1) == total_batches:
+            if (step_idx + 1) % 20 == 0 or (step_idx + 1) == iters_per_epoch:
                 current_step = (step_idx + 1) * args.batch_size
-                percent = ((step_idx + 1) / total_batches) * 100
-                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}/{total_batches * args.batch_size} ({percent:.1f}%)] "
+                percent = ((step_idx + 1) / iters_per_epoch) * 100
+                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}/{iters_per_epoch * args.batch_size} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_routing.item():.4f} "
                       f"CLASM: {loss_clasm.item():.4f} | Consist: {loss_consistency.item():.4f} | Aux: {loss_mil_aux.item():.4f} | omega: {omega:.2f}", flush=True)
 
@@ -411,9 +314,12 @@ def train(args):
         avg_consist = loss_accum['consist'] / iters_per_epoch
         avg_aux = loss_accum['aux'] / iters_per_epoch
         avg_gather = loss_accum['gather'] / iters_per_epoch
+        avg_orth = loss_accum['orth'] / iters_per_epoch
+        avg_residual = loss_accum['residual'] / iters_per_epoch
+        avg_smooth = loss_accum['smooth'] / iters_per_epoch
 
         print(f"\n--- Epoch {epoch_idx}/{args.max_epoch} Summary ---")
-        print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Omega: {omega:.2f}")
+        print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Orth: {avg_orth:.4f} | Res: {avg_residual:.4f} | Smooth: {avg_smooth:.4f} | Omega: {omega:.2f}")
 
         # Evaluate on Test Set
         eval_model = model.module if hasattr(model, 'module') else model
@@ -455,5 +361,7 @@ def train(args):
 
 
 if __name__ == '__main__':
-    args = ucf_option.parser.parse_args()
+    args, unknown = ucf_option.parser.parse_known_args()
+    if unknown:
+        print(f"[CLI] Ignored unrecognized arguments: {unknown}", flush=True)
     train(args)

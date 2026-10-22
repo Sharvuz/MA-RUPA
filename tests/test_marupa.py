@@ -142,7 +142,7 @@ def test_marupa_end_to_end():
 
     # Check backward pass
     routing_scores = dnp_dict['routing_scores']
-    loss = routing_scores.mean() + dnp_dict['g_loss'] + dnp_dict['orth_loss']
+    loss = routing_scores.mean() + dnp_dict['g_loss'].mean() + dnp_dict['orth_loss'].mean()
     loss.backward()
 
     # Check that gradients flowed to MDTBackbone, ModalityAdaptiveBranch, and RUPA
@@ -335,28 +335,27 @@ def test_xd_test_collate_and_split_mismatch():
 
 def test_topk_ratio_and_label_smoothing():
     print("Testing Top-K Ratio and Label Smoothing...")
-    from ucf_train import compute_topk_mil_loss
+    from utils.losses import compute_topk_mil_loss
 
     B, T = 4, 128
     scores = torch.sigmoid(torch.randn(B, T, 1))
     binary_labels = torch.tensor([0, 1, 0, 1])
     lengths = torch.tensor([128, 100, 64, 120])
-    device = torch.device("cpu")
 
     # 1. Standard (topk_ratio=16, label_smoothing=0.0)
-    loss_std = compute_topk_mil_loss(scores, binary_labels, lengths, device, topk_ratio=16, label_smoothing=0.0)
+    loss_std = compute_topk_mil_loss(scores, binary_labels, lengths, topk_ratio=16, label_smoothing=0.0)
     assert loss_std > 0.0
 
     # 2. Optimized (topk_ratio=8, label_smoothing=0.02)
-    loss_opt = compute_topk_mil_loss(scores, binary_labels, lengths, device, topk_ratio=8, label_smoothing=0.02)
+    loss_opt = compute_topk_mil_loss(scores, binary_labels, lengths, topk_ratio=8, label_smoothing=0.02)
     assert loss_opt > 0.0
 
     # 3. Label smoothing keeps gradient alive even on saturated predictions
     perfect_scores = torch.zeros(B, T, 1)
     perfect_scores[1] = 1.0
     perfect_scores[3] = 1.0
-    loss_no_smooth = compute_topk_mil_loss(perfect_scores, binary_labels, lengths, device, topk_ratio=8, label_smoothing=0.0)
-    loss_with_smooth = compute_topk_mil_loss(perfect_scores, binary_labels, lengths, device, topk_ratio=8, label_smoothing=0.02)
+    loss_no_smooth = compute_topk_mil_loss(perfect_scores, binary_labels, lengths, topk_ratio=8, label_smoothing=0.0)
+    loss_with_smooth = compute_topk_mil_loss(perfect_scores, binary_labels, lengths, topk_ratio=8, label_smoothing=0.02)
     assert loss_with_smooth > loss_no_smooth
     assert loss_with_smooth > 0.005, "Gradient should stay alive via label smoothing!"
     print("  Top-K ratio and Label Smoothing tests passed!")

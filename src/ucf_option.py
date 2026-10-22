@@ -54,24 +54,26 @@ parser.add_argument('--routing-sem-weight', default=0.20, type=float, help='Prio
 parser.add_argument('--routing-aux-weight', default=0.15, type=float, help='Prior weight for auxiliary motion stream')
 
 # Training & Optimization
-parser.add_argument('--max-epoch', default=15, type=int, help='Total training epochs (default 15)')
+parser.add_argument('--max-epoch', default=25, type=int, help='Total training epochs (default 25)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size (32 normal + 32 anomaly)')
 parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for End-to-End AdamW optimizer (default 1e-4)')
-parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for regularization')
-parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to ramp up RUPA losses: omega(e) = min(1, e/curriculum_epochs)')
+parser.add_argument('--weight-decay', type=float, default=1e-3, help='Weight decay for regularization (default 1e-3)')
+parser.add_argument('--curriculum-epochs', type=float, default=5.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 5.0)')
 parser.add_argument('--topk-ratio', type=int, default=16, help='Divisor for top-k snippet selection: k = max(1, L // topk_ratio) (default 16 -> ~6.25% frames)')
 parser.add_argument('--topk-ratio-clasm', type=int, default=16, help='Top-k divisor for snippet multi-class classification (default 16)')
-parser.add_argument('--label-smoothing', type=float, default=0.02, help='Label smoothing factor for binary MIL loss (default 0.02)')
+parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0 to prevent 0.0560 floor)')
+parser.add_argument('--snippet-dropout', type=float, default=0.15, help='Snippet dropout rate during training to prevent 1-frame spike collapse (default 0.15)')
+parser.add_argument('--sample-one-crop-per-video', default=True, type=str2bool, help='Randomly sample 1 crop per video per epoch to prevent 10-crop memorization (default True)')
 
-# Loss Weighting
+# Loss Weighting (Rebalanced to prevent RUPA loss dominance over MIL/CLASM)
 parser.add_argument('--lambda-aux', type=float, default=0.15, help='Weight for auxiliary branch MIL loss (default 0.15 for UCF-Crime)')
-parser.add_argument('--lambda-smooth', type=float, default=0.3, help='Weight for temporal smoothness & sparsity loss (default 0.3)')
-parser.add_argument('--lambda-orth', type=float, default=0.1, help='Weight for prototype orthogonality loss')
-parser.add_argument('--lambda-gather', type=float, default=1.0, help='Weight for DNP gather loss')
-parser.add_argument('--lambda-residual', type=float, default=1.0, help='Weight for residual fine-grained event alignment loss')
-parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate regularization loss')
+parser.add_argument('--lambda-smooth', type=float, default=0.001, help='Weight for temporal smoothness loss (default 1e-3)')
+parser.add_argument('--lambda-orth', type=float, default=0.02, help='Weight for prototype orthogonality loss (default 0.02)')
+parser.add_argument('--lambda-gather', type=float, default=0.05, help='Weight for DNP gather loss (default 0.05)')
+parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
+parser.add_argument('--lambda-gate', type=float, default=0.005, help='Weight for safe gate regularization loss (default 0.005)')
 parser.add_argument('--loss2_weight', type=float, default=1.5, help='Weight for snippet multi-class classification loss (default 1.5)')
-parser.add_argument('--lambda-consistency', type=float, default=1.0, help='Weight for consistency loss between detector and reconstruction')
+parser.add_argument('--lambda-consistency', type=float, default=0.05, help='Weight for consistency loss between detector and reconstruction (default 0.05)')
 parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss')
 
 # Data & Paths
