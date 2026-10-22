@@ -35,7 +35,8 @@ def get_kaggle_file_maps():
                 if fname.endswith('.npy'):
                     full_p = os.path.join(dirpath, fname)
                     _KAGGLE_FILE_MAP[fname] = full_p
-                    if is_audio_dir:
+                    is_audio = is_audio_dir or fname.endswith('__vggish.npy') or fname.endswith('_vggish.npy')
+                    if is_audio:
                         _KAGGLE_AUDIO_MAP[fname] = full_p
 
                     # Map '#' and '+' equivalents for Kaggle filename safety
@@ -50,8 +51,18 @@ def get_kaggle_file_maps():
                     for v in variants:
                         if v not in _KAGGLE_FILE_MAP:
                             _KAGGLE_FILE_MAP[v] = full_p
-                        if is_audio_dir and v not in _KAGGLE_AUDIO_MAP:
+                        if is_audio and v not in _KAGGLE_AUDIO_MAP:
                             _KAGGLE_AUDIO_MAP[v] = full_p
+
+                    # Also map variants with/without '__vggish' suffix for instant pairing
+                    clean_stem = fname.replace('__vggish.npy', '.npy').replace('_vggish.npy', '.npy')
+                    if clean_stem != fname:
+                        extra_variants = [clean_stem, clean_stem.replace('+', '#'), clean_stem.replace('#', '+')]
+                        for ev in extra_variants:
+                            if ev not in _KAGGLE_FILE_MAP:
+                                _KAGGLE_FILE_MAP[ev] = full_p
+                            if is_audio and ev not in _KAGGLE_AUDIO_MAP:
+                                _KAGGLE_AUDIO_MAP[ev] = full_p
 
     return _KAGGLE_FILE_MAP, _KAGGLE_AUDIO_MAP
 
@@ -127,10 +138,19 @@ def _resolve_feature_path_uncached(path: str, data_dir: str = None) -> str:
     return path
 
 
+def strip_crop_suffix(path_or_name: str) -> str:
+    """Strips __[0-9].npy crop suffix from XD-Violence visual path, preserving segment timestamps."""
+    name = os.path.basename(path_or_name)
+    for crop_idx in range(10):
+        if f"__{crop_idx}.npy" in name:
+            return name.replace(f"__{crop_idx}.npy", ".npy")
+    return name
+
+
 def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
     """Infer the audio feature file path corresponding to a visual snippet feature.
     
-    Handles 5-crop/10-crop suffix stripping and Kaggle '# <-> +' character replacements.
+    Handles 5-crop/10-crop suffix stripping, __vggish suffixes, and Kaggle '# <-> +' character replacements.
     """
     cache_key = (visual_path, audio_dir)
     if cache_key in _INFER_AUDIO_CACHE:
@@ -143,13 +163,15 @@ def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
 
 def _infer_audio_path_uncached(visual_path: str, audio_dir: str = None) -> str:
     base_name = os.path.basename(visual_path)
-    base_no_crop = base_name
-    for crop_idx in range(10):
-        if f"__{crop_idx}.npy" in base_no_crop:
-            base_no_crop = base_no_crop.replace(f"__{crop_idx}.npy", ".npy")
-            break
+    base_no_crop = strip_crop_suffix(base_name)
 
-    target_names = get_path_variants(base_name) + get_path_variants(base_no_crop)
+    raw_names = get_path_variants(base_name) + get_path_variants(base_no_crop)
+    target_names = []
+    for n in raw_names:
+        target_names.append(n)
+        if n.endswith('.npy'):
+            target_names.append(n.replace('.npy', '__vggish.npy'))
+            target_names.append(n.replace('.npy', '_vggish.npy'))
     target_names = list(dict.fromkeys(target_names))
 
     # 1. Check in explicit audio_dir
@@ -158,6 +180,10 @@ def _infer_audio_path_uncached(visual_path: str, audio_dir: str = None) -> str:
             candidate = os.path.join(audio_dir, name)
             if os.path.exists(candidate):
                 return candidate
+            for subdir in ['train', 'test', 'XDTrainAudioFeatures', 'XDTestAudioFeatures']:
+                sub_candidate = os.path.join(audio_dir, subdir, name)
+                if os.path.exists(sub_candidate):
+                    return sub_candidate
 
     # 2. Check Kaggle audio-prioritized file map
     audio_map = get_kaggle_audio_map()
@@ -175,24 +201,29 @@ def _infer_audio_path_uncached(visual_path: str, audio_dir: str = None) -> str:
         ('XDTestClipFeatures', 'XDTestAudioFeatures'),
         ('XDTrainClipFeatures', 'XDTrainVGGishFeatures'),
         ('XDTestClipFeatures', 'XDTestVGGishFeatures'),
+        ('XDTrainClipFeatures', 'train'),
+        ('XDTestClipFeatures', 'test'),
         ('clip', 'audio'),
         ('CLIP', 'AUDIO'),
     ]
     for old_sub, new_sub in substitutions:
         if old_sub in visual_path:
             cand_base = visual_path.replace(old_sub, new_sub)
-            for v in get_path_variants(cand_base):
-                if os.path.exists(v):
-                    return v
-            # Strip crop
-            cand_no_crop = cand_base
-            for crop_idx in range(10):
-                if f"__{crop_idx}.npy" in cand_no_crop:
-                    cand_no_crop = cand_no_crop.replace(f"__{crop_idx}.npy", ".npy")
-                    break
-            for v in get_path_variants(cand_no_crop):
-                if os.path.exists(v):
-                    return v
+            cand_no_crop = strip_crop_suffix(cand_base)
+            cand_dir = os.path.dirname(cand_base)
+
+            candidates_to_check = []
+            for name in target_names:
+                candidates_to_check.append(os.path.join(cand_dir, name))
+            for v in get_path_variants(cand_base) + get_path_variants(cand_no_crop):
+                candidates_to_check.append(v)
+                if v.endswith('.npy'):
+                    candidates_to_check.append(v.replace('.npy', '__vggish.npy'))
+                    candidates_to_check.append(v.replace('.npy', '_vggish.npy'))
+
+            for cand_p in dict.fromkeys(candidates_to_check):
+                if os.path.exists(cand_p):
+                    return cand_p
 
     # 4. Check general Kaggle file map with audio keywords
     k_map = get_kaggle_file_map()
@@ -310,13 +341,13 @@ class XDDataset(data.Dataset):
         self.raw_paths = self.df['path'].tolist()
         self.labels = self.df['label'].tolist()
 
-        # Group crops by base video ID for healthy epoch sampling without bag memorization
+        # Group crops by base video snippet ID for healthy epoch sampling without bag memorization
         self.video_groups = []
         if self.sample_one_crop_per_video and not self.test_mode:
             from collections import defaultdict
             grouped = defaultdict(list)
             for p, l in zip(self.raw_paths, self.labels):
-                base_id = os.path.basename(p).split('__')[0]
+                base_id = strip_crop_suffix(p)
                 grouped[base_id].append((p, l))
             self.video_groups = list(grouped.values())
 
@@ -325,12 +356,13 @@ class XDDataset(data.Dataset):
         if audio_file_path and os.path.exists(audio_file_path):
             audio_df = pd.read_csv(audio_file_path)
             for _, row in audio_df.iterrows():
-                key = os.path.basename(row['path']).split('__')[0]
+                key = strip_crop_suffix(row['path'])
                 self.audio_dict[key] = row['audio_path']
-                if '+' in key:
-                    self.audio_dict[key.replace('+', '#')] = row['audio_path']
-                if '#' in key:
-                    self.audio_dict[key.replace('#', '+')] = row['audio_path']
+                for v in get_path_variants(key):
+                    self.audio_dict[v] = row['audio_path']
+                    if v.endswith('.npy'):
+                        self.audio_dict[v.replace('.npy', '__vggish.npy')] = row['audio_path']
+                        self.audio_dict[v.replace('.npy', '_vggish.npy')] = row['audio_path']
 
         self._audio_path_cache = {}
 
@@ -342,7 +374,7 @@ class XDDataset(data.Dataset):
             print(f"[XDDataset] Audio-Visual synchronization audit: sampled {matched}/{sample_n} ({pct:.1f}%) videos successfully paired with audio features.", flush=True)
 
     def get_audio_path_quick(self, visual_path: str):
-        base_key = os.path.basename(visual_path).split('__')[0]
+        base_key = strip_crop_suffix(visual_path)
         if base_key in self._audio_path_cache:
             return self._audio_path_cache[base_key]
         audio_path = None

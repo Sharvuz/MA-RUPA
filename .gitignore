@@ -28,3 +28,7 @@ rupa_artifacts/
 *.log
 runtime_hours.txt
 run_config.json
+
+vggish-features/
+*AudioFeatures/
+*VGGishFeatures/
