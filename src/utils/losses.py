@@ -18,16 +18,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def get_curriculum_omega(epoch_idx: int, curriculum_epochs: float = 5.0) -> float:
-    """Computes smooth S-curve Cosine Ramp-up factor omega(e) in [0.0, 1.0].
+def get_curriculum_omega(epoch_idx: int, curriculum_epochs: float = 5.0, max_omega: float = 1.0) -> float:
+    """Computes smooth S-curve Cosine Ramp-up factor omega(e) in [0.0, max_omega].
     
     Prevents sudden prototype shock at early epochs by gradually introducing
     prototype reconstruction and alignment pressure over the first curriculum_epochs.
     
-    omega(e) = 0.5 * (1.0 - cos(pi * min(1.0, e / curriculum_epochs)))
+    omega(e) = 0.5 * max_omega * (1.0 - cos(pi * min(1.0, e / curriculum_epochs)))
     """
     progress = min(1.0, max(0.0, float(epoch_idx) / float(curriculum_epochs)))
-    omega = 0.5 * (1.0 - math.cos(math.pi * progress))
+    omega = 0.5 * float(max_omega) * (1.0 - math.cos(math.pi * progress))
     return float(omega)
 
 

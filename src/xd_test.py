@@ -50,12 +50,16 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     element_logits2_stack = []
     ap_routing_list = []
     ap_det_list = []
+    ap_aux_list = []
     ap_sem_list = []
     ap_sem_rupa_list = []
     ap_ens_sem_list = []
     ap_ens_rupa_list = []
     ap_ens_det_list = []
+    ap_ens_aux_list = []
+    ap_ens_audio_det_list = []
     ap_ens_tri_list = []
+    ap_ens_quad_list = []
     ap_weighted_list = []
     ap_geom_list = []
     ap_hier_list = []
@@ -153,21 +157,31 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             # Stream 7: Dual Ensemble (Routing + Detector)
             prob_ens_det = 0.5 * prob_routing + 0.5 * prob_det
 
-            # Stream 8: Tri-Stream Ensemble
-            prob_ens_tri = (prob_routing + prob_det + prob_sem_rupa) / 3.0
-
-            # Stream 9: Weighted Ensemble (60% Routing + 40% RUPA Semantics)
-            prob_weighted = 0.6 * prob_routing + 0.4 * prob_sem_rupa
-
-            # Stream 10: Geometric Mean
-            prob_geom = torch.sqrt(prob_routing * prob_sem_rupa.clamp(min=1e-5))
-
-            # Stream 11: Single-Pass Uncertainty-Calibrated Fusion (UCCF)
+            # Auxiliary Audio-Visual Score
             if 'aux_scores' in dnp_dict:
                 prob_aux = dnp_dict['aux_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
             else:
                 prob_aux = prob_det
 
+            # Stream 8: Multimodal Audio Ensemble (Routing + Audio Aux)
+            prob_ens_aux = 0.5 * prob_routing + 0.5 * prob_aux
+
+            # Stream 9: Audio-Detector Ensemble (Detector + Audio Aux)
+            prob_ens_audio_det = 0.5 * prob_det + 0.5 * prob_aux
+
+            # Stream 10: Tri-Stream Ensemble
+            prob_ens_tri = (prob_routing + prob_det + prob_sem_rupa) / 3.0
+
+            # Stream 11: Quad-Stream SOTA Ensemble (Routing + Detector + Audio Aux + RUPA)
+            prob_ens_quad = (prob_routing + prob_det + prob_aux + prob_sem_rupa) / 4.0
+
+            # Stream 12: Weighted Ensemble (60% Routing + 40% RUPA Semantics)
+            prob_weighted = 0.6 * prob_routing + 0.4 * prob_sem_rupa
+
+            # Stream 13: Geometric Mean
+            prob_geom = torch.sqrt(prob_routing * prob_sem_rupa.clamp(min=1e-5))
+
+            # Stream 14: Single-Pass Uncertainty-Calibrated Fusion (UCCF)
             prob_dict = {
                 'routing': prob_routing,
                 'det': prob_det,
@@ -179,7 +193,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
                 'routing': 1.0,
                 'det': 0.9,
                 'sem_rupa': 0.9,
-                'aux': 0.8,
+                'aux': 0.9,
                 'sem': 0.6
             }
             prob_uccf = compute_single_pass_uccf(prob_dict, priors, delta_dis=0.35)
@@ -187,42 +201,56 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             # Detach to numpy
             p_routing_np = prob_routing.cpu().numpy()
             p_det_np = prob_det.cpu().numpy()
+            p_aux_np = prob_aux.cpu().numpy()
             p_sem_np = prob_sem.cpu().numpy()
             p_sem_rupa_np = prob_sem_rupa.cpu().numpy()
             p_ens_sem_np = prob_ens_sem.cpu().numpy()
             p_ens_rupa_np = prob_ens_rupa.cpu().numpy()
             p_ens_det_np = prob_ens_det.cpu().numpy()
+            p_ens_aux_np = prob_ens_aux.cpu().numpy()
+            p_ens_audio_det_np = prob_ens_audio_det.cpu().numpy()
             p_ens_tri_np = prob_ens_tri.cpu().numpy()
+            p_ens_quad_np = prob_ens_quad.cpu().numpy()
             p_weighted_np = prob_weighted.cpu().numpy()
             p_geom_np = prob_geom.cpu().numpy()
             p_hier_np = prob_hier.cpu().numpy()
             p_uccf_np = prob_uccf.cpu().numpy()
 
-            # Stream 12: Peak-Preserving Proposal Refinement (DODO)
+            # Stream 15: Peak-Preserving Proposal Refinement (DODO)
             p_dodo_np = apply_dodo_refinement(p_uccf_np, sigma=smooth_sigma)
 
             # Optional temporal smoothing
             if smooth_eval:
                 p_routing_np = smooth_scores(p_routing_np, method=smooth_method, sigma=smooth_sigma)
                 p_det_np = smooth_scores(p_det_np, method=smooth_method, sigma=smooth_sigma)
+                p_aux_np = smooth_scores(p_aux_np, method=smooth_method, sigma=smooth_sigma)
                 p_sem_np = smooth_scores(p_sem_np, method=smooth_method, sigma=smooth_sigma)
                 p_sem_rupa_np = smooth_scores(p_sem_rupa_np, method=smooth_method, sigma=smooth_sigma)
                 p_ens_sem_np = smooth_scores(p_ens_sem_np, method=smooth_method, sigma=smooth_sigma)
                 p_ens_rupa_np = smooth_scores(p_ens_rupa_np, method=smooth_method, sigma=smooth_sigma)
                 p_ens_det_np = smooth_scores(p_ens_det_np, method=smooth_method, sigma=smooth_sigma)
+                p_ens_aux_np = smooth_scores(p_ens_aux_np, method=smooth_method, sigma=smooth_sigma)
+                p_ens_audio_det_np = smooth_scores(p_ens_audio_det_np, method=smooth_method, sigma=smooth_sigma)
                 p_ens_tri_np = smooth_scores(p_ens_tri_np, method=smooth_method, sigma=smooth_sigma)
+                p_ens_quad_np = smooth_scores(p_ens_quad_np, method=smooth_method, sigma=smooth_sigma)
                 p_weighted_np = smooth_scores(p_weighted_np, method=smooth_method, sigma=smooth_sigma)
                 p_geom_np = smooth_scores(p_geom_np, method=smooth_method, sigma=smooth_sigma)
                 p_hier_np = smooth_scores(p_hier_np, method=smooth_method, sigma=smooth_sigma)
+                p_uccf_np = smooth_scores(p_uccf_np, method=smooth_method, sigma=smooth_sigma)
+                p_dodo_np = smooth_scores(p_dodo_np, method=smooth_method, sigma=smooth_sigma)
 
             ap_routing_list.append(p_routing_np)
             ap_det_list.append(p_det_np)
+            ap_aux_list.append(p_aux_np)
             ap_sem_list.append(p_sem_np)
             ap_sem_rupa_list.append(p_sem_rupa_np)
             ap_ens_sem_list.append(p_ens_sem_np)
             ap_ens_rupa_list.append(p_ens_rupa_np)
             ap_ens_det_list.append(p_ens_det_np)
+            ap_ens_aux_list.append(p_ens_aux_np)
+            ap_ens_audio_det_list.append(p_ens_audio_det_np)
             ap_ens_tri_list.append(p_ens_tri_np)
+            ap_ens_quad_list.append(p_ens_quad_np)
             ap_weighted_list.append(p_weighted_np)
             ap_geom_list.append(p_geom_np)
             ap_hier_list.append(p_hier_np)
@@ -235,12 +263,16 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     all_scores_routing = np.concatenate(ap_routing_list, axis=0)
     all_scores_det = np.concatenate(ap_det_list, axis=0)
+    all_scores_aux = np.concatenate(ap_aux_list, axis=0)
     all_scores_sem = np.concatenate(ap_sem_list, axis=0)
     all_scores_sem_rupa = np.concatenate(ap_sem_rupa_list, axis=0)
     all_scores_ens_sem = np.concatenate(ap_ens_sem_list, axis=0)
     all_scores_ens_rupa = np.concatenate(ap_ens_rupa_list, axis=0)
     all_scores_ens_det = np.concatenate(ap_ens_det_list, axis=0)
+    all_scores_ens_aux = np.concatenate(ap_ens_aux_list, axis=0)
+    all_scores_ens_audio_det = np.concatenate(ap_ens_audio_det_list, axis=0)
     all_scores_ens_tri = np.concatenate(ap_ens_tri_list, axis=0)
+    all_scores_ens_quad = np.concatenate(ap_ens_quad_list, axis=0)
     all_scores_weighted = np.concatenate(ap_weighted_list, axis=0)
     all_scores_geom = np.concatenate(ap_geom_list, axis=0)
     all_scores_hier = np.concatenate(ap_hier_list, axis=0)
@@ -250,12 +282,16 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     # Repeat 16x for frame-level evaluation & sanitize non-finites
     frame_scores_routing = np.nan_to_num(np.repeat(all_scores_routing, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_det = np.nan_to_num(np.repeat(all_scores_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_aux = np.nan_to_num(np.repeat(all_scores_aux, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_sem = np.nan_to_num(np.repeat(all_scores_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_sem_rupa = np.nan_to_num(np.repeat(all_scores_sem_rupa, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_sem = np.nan_to_num(np.repeat(all_scores_ens_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_rupa = np.nan_to_num(np.repeat(all_scores_ens_rupa, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_det = np.nan_to_num(np.repeat(all_scores_ens_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_ens_aux = np.nan_to_num(np.repeat(all_scores_ens_aux, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_ens_audio_det = np.nan_to_num(np.repeat(all_scores_ens_audio_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_tri = np.nan_to_num(np.repeat(all_scores_ens_tri, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_ens_quad = np.nan_to_num(np.repeat(all_scores_ens_quad, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_weighted = np.nan_to_num(np.repeat(all_scores_weighted, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_geom = np.nan_to_num(np.repeat(all_scores_geom, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_hier = np.nan_to_num(np.repeat(all_scores_hier, 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -272,6 +308,9 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_det = roc_auc_score(gt_eval, frame_scores_det[:min_len])
     ap_det = average_precision_score(gt_eval, frame_scores_det[:min_len])
 
+    roc_aux = roc_auc_score(gt_eval, frame_scores_aux[:min_len])
+    ap_aux = average_precision_score(gt_eval, frame_scores_aux[:min_len])
+
     roc_sem = roc_auc_score(gt_eval, frame_scores_sem[:min_len])
     ap_sem = average_precision_score(gt_eval, frame_scores_sem[:min_len])
 
@@ -287,8 +326,17 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_ens_det = roc_auc_score(gt_eval, frame_scores_ens_det[:min_len])
     ap_ens_det = average_precision_score(gt_eval, frame_scores_ens_det[:min_len])
 
+    roc_ens_aux = roc_auc_score(gt_eval, frame_scores_ens_aux[:min_len])
+    ap_ens_aux = average_precision_score(gt_eval, frame_scores_ens_aux[:min_len])
+
+    roc_ens_audio_det = roc_auc_score(gt_eval, frame_scores_ens_audio_det[:min_len])
+    ap_ens_audio_det = average_precision_score(gt_eval, frame_scores_ens_audio_det[:min_len])
+
     roc_ens_tri = roc_auc_score(gt_eval, frame_scores_ens_tri[:min_len])
     ap_ens_tri = average_precision_score(gt_eval, frame_scores_ens_tri[:min_len])
+
+    roc_ens_quad = roc_auc_score(gt_eval, frame_scores_ens_quad[:min_len])
+    ap_ens_quad = average_precision_score(gt_eval, frame_scores_ens_quad[:min_len])
 
     roc_weighted = roc_auc_score(gt_eval, frame_scores_weighted[:min_len])
     ap_weighted = average_precision_score(gt_eval, frame_scores_weighted[:min_len])
@@ -307,14 +355,18 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     print(f"[Evaluation] Frame-level AP (Routing): {ap_routing * 100:.2f}% | AUC: {roc_routing * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Detector): {ap_det * 100:.2f}% | AUC: {roc_det * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Audio-Visual Aux): {ap_aux * 100:.2f}% | AUC: {roc_aux * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Semantics Backbone): {ap_sem * 100:.2f}% | AUC: {roc_sem * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Semantics RUPA): {ap_sem_rupa * 100:.2f}% | AUC: {roc_sem_rupa * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Ensemble Routing+Detector): {ap_ens_det * 100:.2f}% | AUC: {roc_ens_det * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Ensemble Routing+Audio Aux - SOTA): {ap_ens_aux * 100:.2f}% | AUC: {roc_ens_aux * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Ensemble Detector+Audio Aux): {ap_ens_audio_det * 100:.2f}% | AUC: {roc_ens_audio_det * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Ensemble Routing+Semantics Backbone): {ap_ens_sem * 100:.2f}% | AUC: {roc_ens_sem * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Ensemble Routing+Semantics RUPA): {ap_ens_rupa * 100:.2f}% | AUC: {roc_ens_rupa * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Weighted 60/40 Ensemble): {ap_weighted * 100:.2f}% | AUC: {roc_weighted * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Geometric Mean Filtered): {ap_geom * 100:.2f}% | AUC: {roc_geom * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Tri-Stream Ensemble): {ap_ens_tri * 100:.2f}% | AUC: {roc_ens_tri * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Quad-Stream SOTA Ensemble): {ap_ens_quad * 100:.2f}% | AUC: {roc_ens_quad * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Hierarchical Refined): {ap_hier * 100:.2f}% | AUC: {roc_hier * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Single-Pass UCCF - SOTA): {ap_uccf * 100:.2f}% | AUC: {roc_uccf * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (UCCF + DODO - SOTA): {ap_dodo * 100:.2f}% | AUC: {roc_dodo * 100:.2f}%", flush=True)
@@ -332,14 +384,14 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     sys.stdout.flush()
 
     best_ap = max(
-        ap_routing, ap_det, ap_sem, ap_sem_rupa,
-        ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_tri,
-        ap_weighted, ap_geom, ap_hier, ap_uccf, ap_dodo
+        ap_routing, ap_det, ap_aux, ap_sem, ap_sem_rupa,
+        ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_aux, ap_ens_audio_det,
+        ap_ens_tri, ap_ens_quad, ap_weighted, ap_geom, ap_hier, ap_uccf, ap_dodo
     )
     best_auc = max(
-        roc_routing, roc_det, roc_sem, roc_sem_rupa,
-        roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_tri,
-        roc_weighted, roc_geom, roc_hier, roc_uccf, roc_dodo
+        roc_routing, roc_det, roc_aux, roc_sem, roc_sem_rupa,
+        roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_aux, roc_ens_audio_det,
+        roc_ens_tri, roc_ens_quad, roc_weighted, roc_geom, roc_hier, roc_uccf, roc_dodo
     )
     print(f"  ==> [BEST METRIC] Frame-level AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}%", flush=True)
     return best_auc, best_ap, avg_map

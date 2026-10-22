@@ -174,8 +174,12 @@ def train(args):
         if hasattr(anomaly_dataset, 'resample_crops'):
             anomaly_dataset.resample_crops()
 
-        # Smooth Cosine Curriculum Ramp-up
-        omega = get_curriculum_omega(epoch_idx, getattr(args, 'curriculum_epochs', 5.0))
+        # Smooth Cosine Curriculum Ramp-up with max_omega ceiling
+        omega = get_curriculum_omega(
+            epoch_idx,
+            curriculum_epochs=getattr(args, 'curriculum_epochs', 5.0),
+            max_omega=getattr(args, 'max_omega', 0.35)
+        )
 
         loss_accum = {
             'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'bkg': 0.0, 'consist': 0.0,
@@ -313,7 +317,7 @@ def train(args):
                 loss_mil_routing
                 + 0.8 * loss_mil_det
                 + getattr(args, 'lambda_aux', 0.5) * loss_mil_aux
-                + getattr(args, 'loss2_weight', 1.0) * loss_clasm_bb
+                + getattr(args, 'loss2_weight', 0.8) * loss_clasm_bb
                 + 0.8 * loss_clasm_rupa
                 + getattr(args, 'lambda_bkg', 0.5) * loss_bkg
                 + getattr(args, 'lambda_consistency', 0.25) * loss_consistency
@@ -323,7 +327,7 @@ def train(args):
                     getattr(args, 'lambda_gather', 0.05) * loss_gather
                     + getattr(args, 'lambda_orth', 0.02) * loss_orth
                     + getattr(args, 'lambda_residual', 0.05) * loss_residual
-                    + 0.5 * loss_event
+                    + 0.15 * loss_event
                     + 0.2 * loss_dnp_normal
                     + getattr(args, 'lambda_gate', 0.005) * loss_gate
                 )

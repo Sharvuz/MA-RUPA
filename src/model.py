@@ -383,7 +383,7 @@ class ModalityAdaptiveBranch(nn.Module):
             nn.Linear(embed_dim, embed_dim),
             nn.Sigmoid()
         )
-        self.alpha_mod = nn.Parameter(torch.tensor(0.1))
+        self.alpha_mod = nn.Parameter(torch.tensor(0.25))
         self.ln_fused = LayerNormFP32(embed_dim)
 
         # Auxiliary Anomaly Classifier Head
