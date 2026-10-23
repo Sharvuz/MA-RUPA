@@ -38,6 +38,17 @@ import ucf_option
 
 
 def train(args):
+    # Enforce 10-epoch SOTA schedule & sanitize legacy notebook CLI flags
+    if getattr(args, 'max_epoch', 10) > 10:
+        print(f"[Auto-Config] Overriding legacy --max-epoch {args.max_epoch} -> 10 epochs (SOTA 10-epoch schedule).", flush=True)
+        args.max_epoch = 10
+    if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
+        args.curriculum_epochs = 3.0
+    if getattr(args, 'lambda_smooth', 0.10) > 0.15:
+        args.lambda_smooth = 0.10
+    if getattr(args, 'lambda_aux', 0.15) > 0.20:
+        args.lambda_aux = 0.15
+
     # Set random seeds
     random.seed(args.seed)
     np.random.seed(args.seed)

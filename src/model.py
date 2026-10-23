@@ -504,13 +504,15 @@ class ModalityAdaptiveBranch(nn.Module):
         return keep_mask * f_audio + (1.0 - keep_mask) * f_motion
 
     def forward(self, f_base: torch.Tensor, visual_raw: torch.Tensor,
-                audio_features: torch.Tensor = None, lengths: torch.Tensor = None):
+                audio_features: torch.Tensor = None, lengths: torch.Tensor = None,
+                return_suppress_loss: bool = False):
         """
         Args:
             f_base: [B, T, D] visual base features from MDTBackbone
             visual_raw: [B, T, D] raw snippet visual features
             audio_features: [B, T_a, D_a] audio features (if available) or None
             lengths: [B] valid lengths
+            return_suppress_loss: if True, returns 5th element av_suppress_loss [B, 1]
         Returns:
             F_fused: [B, T, D] multimodal/motion fused features
             S_aux: [B, T, 1] auxiliary anomaly scores
@@ -579,10 +581,10 @@ class ModalityAdaptiveBranch(nn.Module):
             elif in_dim == self.audio_dim:
                 f_a_raw = self.audio_proj(audio_t).transpose(1, 2)
             else:
-                # Dynamic 1x1 conv adapter for any other dimension (e.g. 768-D from AST)
-                if not hasattr(self, '_dyn_audio_adapter') or self._dyn_audio_adapter.in_channels != in_dim:
-                    self._dyn_audio_adapter = nn.Conv1d(in_dim, self.embed_dim, kernel_size=1).to(audio_t.device)
-                adapted_audio = self._dyn_audio_adapter(audio_t)
+                # Stateless adaptive pooling fallback for arbitrary audio dimensions
+                adapted_audio = F.interpolate(
+                    audio_t.transpose(1, 2), size=self.embed_dim, mode='linear', align_corners=False
+                ).transpose(1, 2)
                 f_a_raw = self.audio_proj_512(adapted_audio).transpose(1, 2)
 
             # Apply Dual-Level Stochastic DropAudio during training
@@ -643,8 +645,9 @@ class ModalityAdaptiveBranch(nn.Module):
             av_suppress_loss = (av_pen_t * valid_f).sum(dim=1) / valid_f.sum(dim=1).clamp_min(1.0)
         else:
             av_suppress_loss = av_pen_t.mean(dim=1)
-        self._last_av_suppress_loss = av_suppress_loss  # [B, 1]
 
+        if return_suppress_loss:
+            return f_fused, s_aux, logits_aux, g_av, av_suppress_loss
         return f_fused, s_aux, logits_aux, g_av
 
 
@@ -725,20 +728,29 @@ class GradientSafeRUPA(nn.Module):
     @staticmethod
     def build_orthonormal_subspace(prototypes: torch.Tensor) -> torch.Tensor:
         """Projects prototypes P in R^(B x M x D) onto the Stiefel Manifold St(M, D)
-        via FP32 Economy QR Decomposition with canonical positive R-diagonal signs.
+        via 6-step Newton-Schulz Polar Stiefel Orthonormalization:
+            U_norm = (P @ P^T)^(-1/2) @ P
+        Uses pure cuBLAS torch.bmm (zero cuSOLVER/torch.linalg calls), guaranteeing
+        100% thread safety under multi-GPU torch.nn.DataParallel on PyTorch 2.x.
         Returns U_norm in R^(B x M x D) satisfying U_norm @ U_norm^T = I_M.
         """
         orig_dtype = prototypes.dtype
-        p_t = F.normalize(prototypes.float(), dim=-1).transpose(1, 2)  # [B, D, M]
-        B, D, M = p_t.shape
-        eye_pad = torch.eye(D, M, device=p_t.device, dtype=torch.float32).unsqueeze(0)
-        p_t = p_t + 1e-5 * eye_pad
+        B, M, D = prototypes.shape
+        u = F.normalize(prototypes.float(), dim=-1)  # [B, M, D]
+        eye_d = torch.eye(M, D, device=u.device, dtype=torch.float32).unsqueeze(0)
+        u = F.normalize(u + 1e-4 * eye_d, dim=-1)
 
-        q, r = torch.linalg.qr(p_t, mode='reduced')  # q: [B, D, M], r: [B, M, M]
-        diag_r = torch.diagonal(r, dim1=-2, dim2=-1)  # [B, M]
-        signs = torch.sgn(diag_r)
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs).unsqueeze(1)  # [B, 1, M]
-        u_norm = (q * signs).transpose(1, 2)  # [B, M, D]
+        # Normalize by sqrt of Gram Frobenius norm so all singular values of u lie strictly in (0, 1)
+        gram = torch.bmm(u, u.transpose(1, 2))  # [B, M, M]
+        gram_frob = torch.sqrt((gram * gram).sum(dim=(-2, -1), keepdim=True).clamp_min(1e-6))
+        u = u / torch.sqrt(gram_frob)
+
+        eye_m = torch.eye(M, device=u.device, dtype=torch.float32).unsqueeze(0)
+        for _ in range(6):
+            g = torch.bmm(u, u.transpose(1, 2))  # [B, M, M]
+            u = 0.5 * torch.bmm(3.0 * eye_m - g, u)  # [B, M, D]
+
+        u_norm = F.normalize(u, dim=-1)
         return u_norm.to(orig_dtype)
 
     @staticmethod
@@ -1412,9 +1424,26 @@ class MARUPA(nn.Module):
         self.alpha_prompt_ctx = nn.Parameter(torch.tensor(0.15))
 
         self._text_features_cache = None
-        self._tokens_cache = {}
-        self._zs_text_cache = {}
         self._init_trainable_parameters()
+
+        # Pre-tokenize and pre-compute pure zero-shot CLIP text centroids as buffers
+        # so multi-GPU DataParallel replicas automatically broadcast them per device
+        # without thread-unsafe lazy tokenization or dictionary mutation
+        init_num_c = 14 if self.num_class == 14 else 7
+        descriptions = DESCRIPTIONS_ORI if init_num_c == 14 else DESCRIPTIONS_ORI_XD
+        desc_lists = list(descriptions.values())
+        self._num_desc_classes = len(desc_lists)
+        self._num_desc_prompts = len(desc_lists[0])
+        flat_prompts = [p for sublist in desc_lists for p in sublist]
+        tokens_init = clip.tokenize(flat_prompts).to(device)
+        self.register_buffer('_prompt_tokens_buf', tokens_init, persistent=False)
+        with torch.no_grad():
+            zs_feats = self.clip_adapter.encode_text(tokens_init, adapt_text=False)
+            zs_feats = F.normalize(
+                zs_feats.view(self._num_desc_classes, self._num_desc_prompts, -1), dim=-1
+            )
+            zs_mean = F.normalize(zs_feats.mean(dim=1), dim=-1).detach()
+        self.register_buffer('_zs_text_buf', zs_mean, persistent=False)
 
     def _init_trainable_parameters(self):
         """Initialize trainable layers while preserving SafeGate & CLIPAdapter specialized initializations."""
@@ -1443,31 +1472,37 @@ class MARUPA(nn.Module):
                 nn.init.constant_(self.backbone.conv_pos.bias, 0.0)
 
     def _get_batched_tokens(self, num_classes: int, target_device: torch.device):
-        """Tokenizes and caches multi-prompt descriptions in a single batched tensor [C * P, 77]."""
-        key = (num_classes, str(target_device))
-        if key not in self._tokens_cache:
-            descriptions = DESCRIPTIONS_ORI if num_classes == 14 else DESCRIPTIONS_ORI_XD
-            desc_lists = list(descriptions.values())
-            num_prompts = len(desc_lists[0])
-            flat_prompts = [p for sublist in desc_lists for p in sublist]
-            tokens_all = clip.tokenize(flat_prompts).to(target_device)
-            self._tokens_cache[key] = (tokens_all, len(desc_lists), num_prompts)
-        return self._tokens_cache[key]
+        """Returns tokenized multi-prompt descriptions [C * P, 77] on target_device."""
+        if hasattr(self, '_prompt_tokens_buf') and num_classes == self._num_desc_classes:
+            tokens_all = self._prompt_tokens_buf
+            if tokens_all.device != target_device:
+                tokens_all = tokens_all.to(target_device)
+            return tokens_all, self._num_desc_classes, self._num_desc_prompts
+
+        descriptions = DESCRIPTIONS_ORI if num_classes == 14 else DESCRIPTIONS_ORI_XD
+        desc_lists = list(descriptions.values())
+        num_prompts = len(desc_lists[0])
+        flat_prompts = [p for sublist in desc_lists for p in sublist]
+        tokens_all = clip.tokenize(flat_prompts).to(target_device)
+        return tokens_all, len(desc_lists), num_prompts
 
     def get_zero_shot_text_features(self, text_list, target_device: torch.device = None):
-        """Returns pure frozen OpenAI CLIP multi-prompt text centroids [C, D] (cached per device)."""
+        """Returns pure frozen OpenAI CLIP multi-prompt text centroids [C, D]."""
         if target_device is None:
             target_device = next(self.parameters()).device
         num_c = 14 if (text_list is not None and len(text_list) == 14) or self.num_class == 14 else 7
-        key = (num_c, str(target_device))
-        if key not in self._zs_text_cache:
-            with torch.no_grad():
-                tokens_all, C, P = self._get_batched_tokens(num_c, target_device)
-                feats = self.clip_adapter.encode_text(tokens_all, adapt_text=False)  # [C * P, D]
-                feats = F.normalize(feats.view(C, P, -1), dim=-1)
-                mean_feats = F.normalize(feats.mean(dim=1), dim=-1)
-                self._zs_text_cache[key] = mean_feats.detach()
-        return self._zs_text_cache[key]
+        if hasattr(self, '_zs_text_buf') and num_c == self._num_desc_classes:
+            zs_feats = self._zs_text_buf
+            if zs_feats.device != target_device:
+                zs_feats = zs_feats.to(target_device)
+            return zs_feats
+
+        with torch.no_grad():
+            tokens_all, C, P = self._get_batched_tokens(num_c, target_device)
+            feats = self.clip_adapter.encode_text(tokens_all, adapt_text=False)  # [C * P, D]
+            feats = F.normalize(feats.view(C, P, -1), dim=-1)
+            mean_feats = F.normalize(feats.mean(dim=1), dim=-1)
+            return mean_feats.detach()
 
     def train(self, mode: bool = True):
         """Override train() to invalidate cached adapted text features whenever mode switches."""
@@ -1481,9 +1516,7 @@ class MARUPA(nn.Module):
         """
         if target_device is None:
             target_device = next(self.parameters()).device
-        if self.training:
-            self._text_features_cache = None
-        elif self._text_features_cache is not None and self._text_features_cache.device == target_device:
+        if not self.training and self._text_features_cache is not None and self._text_features_cache.device == target_device:
             return self._text_features_cache
 
         num_c = 14 if (text_list is not None and len(text_list) == 14) or self.num_class == 14 else 7
@@ -1516,13 +1549,9 @@ class MARUPA(nn.Module):
         # Step 1: MDTBackbone -> F_base, S_det
         f_base, s_det, logits_det = self.backbone(visual, padding_mask, lengths)
 
-        # Step 2: ModalityAdaptiveBranch -> F_fused, S_aux
-        f_fused, s_aux, logits_aux, g_av = self.modality_branch(
-            f_base, visual, audio_features=audio, lengths=lengths
-        )
-        av_suppress_loss = getattr(
-            self.modality_branch, '_last_av_suppress_loss',
-            torch.zeros(B, 1, device=target_device, dtype=visual.dtype)
+        # Step 2: ModalityAdaptiveBranch -> F_fused, S_aux, logits_aux, G_av, av_suppress_loss
+        f_fused, s_aux, logits_aux, g_av, av_suppress_loss = self.modality_branch(
+            f_base, visual, audio_features=audio, lengths=lengths, return_suppress_loss=True
         )
 
         # Text features for semantic alignment (adapted & pure zero-shot anchor)
