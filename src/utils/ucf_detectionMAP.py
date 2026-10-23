@@ -86,13 +86,16 @@ def getLocMAP(predictions, th, gtsegments, gtlabels, excludeNormal):
 
       # Sort the list of predictions for class c based on score
       if len(segment_predict) == 0:
-         return 0
+         ap.append(0.0)
+         continue
       segment_predict = segment_predict[np.argsort(-segment_predict[:,3])]
 
       # Create gt list
       segment_gt = [[i, gtsegments[i][j][0], gtsegments[i][j][1]] for i in range(len(gtsegments))
                     for j in range(len(gtsegments[i])) if str2ind(gtlabels[i][j], classlist) == c]
       gtpos = len(segment_gt)
+      if gtpos == 0:
+         continue
 
       # Compare predictions and gt
       tp, fp = [], []

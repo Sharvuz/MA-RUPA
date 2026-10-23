@@ -1036,23 +1036,29 @@ class GradientSafeRUPA(nn.Module):
         repulsion_loss = (F.relu(abn_proj_energy - self.repulsion_margin) * abn_gate).mean(dim=1, keepdim=True)
         sample_orth_loss = raw_orth_loss + 0.5 * repulsion_loss  # [B, 1]
 
-        # 7. Residual-Amplified CLIP-Anchored Semantic Feature
-        f_sem_rupa = self.ln_sem_rupa(
-            visual_raw + f_fused + self.gamma_rupa * self.mlp_res(residual)
-        )
-
-        # Domain-Adaptive Semantic Alignment
+        # 7. Counterfactual Subspace-Split Semantic Alignment
+        # Normal Class 0 is matched against the normal subspace reconstruction F_rec;
+        # Anomaly Classes 1..C-1 are matched against the residual-amplified orthogonal complement R.
         temp = self.log_temp.exp().clamp(min=0.02, max=0.5)
-        f_sem_norm = F.normalize(f_sem_rupa, dim=-1)
-        semantic_logits = f_sem_norm @ text_matrix / temp  # [B, T, C]
+        rec_norm = F.normalize(f_rec + 0.25 * visual_raw, dim=-1)
+        f_sem_rupa = self.ln_sem_rupa(residual + self.gamma_rupa * self.mlp_res(residual))
+        res_norm = F.normalize(f_sem_rupa, dim=-1)
+
+        rec_sem_logits = rec_norm @ text_matrix / temp
+        res_sem_logits = res_norm @ text_matrix / temp
+        semantic_logits = torch.cat(
+            [rec_sem_logits[:, :, :1], res_sem_logits[:, :, 1:]], dim=-1
+        )  # [B, T, C]
 
         # Variance scaling factor: damps noisy semantic logits in blurry CCTV videos
         r_var = torch.var(residual, dim=-1, keepdim=True)  # [B, T, 1]
         var_scale = 1.0 + F.softplus(self.var_scale_param) * r_var
         scaled_sem_logits = semantic_logits / var_scale
 
-        # Semantic Anomaly Score: 1 - P(Normal) (class 0 is Normal)
-        s_sem = (1.0 - F.softmax(scaled_sem_logits, dim=-1)[:, :, :1]).clamp(0.0, 1.0)
+        # Prior-Balanced Semantic Anomaly Score: calibrates out the (C-1):1 class-count prior offset
+        p0_rupa = F.softmax(scaled_sem_logits, dim=-1)[:, :, :1]
+        num_c = max(2, scaled_sem_logits.shape[-1])
+        s_sem = ((1.0 - p0_rupa) / (1.0 + (num_c - 2.0) * p0_rupa)).clamp(0.0, 1.0)
 
         # Prototype Normal Alignment Loss: [B, 1]
         normal_text_vec = cat_text_norm[0].view(1, 1, -1)
@@ -1066,8 +1072,8 @@ class GradientSafeRUPA(nn.Module):
             'f_sem_rupa': f_sem_rupa,
             'semantic_logits': scaled_sem_logits,
             'raw_semantic_logits': semantic_logits,
-            'residual_semantic_logits': scaled_sem_logits,
-            'reconstructed_semantic_logits': scaled_sem_logits,
+            'residual_semantic_logits': res_sem_logits,
+            'reconstructed_semantic_logits': rec_sem_logits,
             'g_loss': sample_g_loss,
             'orth_loss': sample_orth_loss,
             'dnp_normal_loss': sample_dnp_normal_loss,
@@ -1637,33 +1643,21 @@ class MARUPA(nn.Module):
         nor_weights = ((scale * (1.0 - prob_abn)).exp() - 1.0) * valid_mask
         nor_weights = F.normalize(nor_weights, p=1, dim=1)
 
-        # Video-level event & background representations
+        # Video-level event & background representations with Event MLP calibration
         abn_feat = torch.matmul(abn_weights.permute(0, 2, 1), event_features)  # [B, 1, D]
+        alpha_ctx = self.alpha_prompt_ctx.clamp(0.01, 0.25)
+        abn_feat = abn_feat + alpha_ctx * self.mlp_event(abn_feat)
         nor_feat = torch.matmul(nor_weights.permute(0, 2, 1), background_features)  # [B, 1, D]
 
-        # Video-Conditioned Dynamic Prompt Calibration (using self.mlp_event anchored to text_features_ori)
-        v_ctx = torch.matmul(abn_weights.permute(0, 2, 1), f_main)  # [B, 1, D]
-        if not self.training and B > 1:
-            # Pool context across all splits of the same test video
-            v_ctx = v_ctx.mean(dim=0, keepdim=True).expand(B, -1, -1)
-        v_ctx_norm = F.normalize(v_ctx, dim=-1)  # [B, 1, D]
-
-        text_ori_norm = F.normalize(text_features_ori, dim=-1).unsqueeze(0).expand(B, -1, -1)  # [B, C, D]
-        prompt_cond = text_ori_norm + v_ctx_norm
-        prompt_delta = v_ctx_norm + self.mlp_event(prompt_cond)
-        alpha_ctx = self.alpha_prompt_ctx.clamp(0.01, 0.25)
-        text_dynamic = F.normalize(
-            text_ori_norm + alpha_ctx * F.normalize(prompt_delta, dim=-1), dim=-1
-        ).to(visual.dtype)  # [B, C, D]
-
-        # Snippet-level and video-level classification logits
+        # Snippet-level and video-level classification logits anchored to pure category prompts
+        text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
         f_norm = F.normalize(f_main, dim=-1)
-        logits2 = torch.bmm(f_norm, text_dynamic.transpose(1, 2)) / 0.07  # [B, T, C]
+        logits2 = (f_norm @ text_mat) / 0.07  # [B, T, C]
 
         abn_feat_norm = F.normalize(abn_feat, dim=-1)
         nor_feat_norm = F.normalize(nor_feat, dim=-1)
-        logits3 = torch.bmm(abn_feat_norm, text_dynamic.transpose(1, 2)) / 0.07
-        logits4 = torch.bmm(nor_feat_norm, text_dynamic.transpose(1, 2)) / 0.07
+        logits3 = (abn_feat_norm @ text_mat) / 0.07
+        logits4 = (nor_feat_norm @ text_mat) / 0.07
 
         if DNP_use:
             return text_features_ori, logits1, logits2, logits3, logits4, dnp_dict

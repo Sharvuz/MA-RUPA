@@ -122,6 +122,7 @@ def train(args):
         model = torch.nn.DataParallel(model)
 
     # Single-stage End-to-End AdamW optimizer with Differential Parameter Groups
+    base_model = model.module if hasattr(model, 'module') else model
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     backbone_params, rupa_adapter_params, aux_gate_params = [], [], []
     for name, p in model.named_parameters():

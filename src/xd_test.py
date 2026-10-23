@@ -39,14 +39,17 @@ def refine_scores_hierarchical(logits_det: torch.Tensor,
 
     final_abnormal_probs = total_abnormal_prob * abnormal_dist
 
-    # Video-level top-k class sparsity gating so getLocMAP (ind = c_s > 0.0) only proposes
-    # segments for the dominant anomaly classes actually present in the video
+    # Video-level top-k class sparsity weighting for temporal localization (dmAP)
     L = final_abnormal_probs.shape[0]
     k_vid = max(1, L // 16)
     top_c = torch.topk(final_abnormal_probs, k=k_vid, dim=0).values.mean(dim=0)
-    top2_thresh = torch.topk(top_c, k=min(2, top_c.numel())).values[-1]
-    class_mask = ((top_c >= top2_thresh) & (top_c >= 0.06)).to(final_abnormal_probs.dtype).unsqueeze(0)
-    final_abnormal_probs = final_abnormal_probs * class_mask
+    top3_thresh = torch.topk(top_c, k=min(3, top_c.numel())).values[-1]
+    class_weight = torch.where(
+        top_c >= top3_thresh,
+        torch.ones_like(top_c),
+        torch.full_like(top_c, 0.15)
+    ).unsqueeze(0)
+    final_abnormal_probs = final_abnormal_probs * class_weight
 
     final_probs = torch.cat([total_normal_prob, final_abnormal_probs], dim=1)
     return final_probs
@@ -151,13 +154,16 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             else:
                 prob_det = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
 
-            # Stream 3: Zero-shot / Dynamic-Prompt semantic alignment prediction (Backbone F_fused)
+            # Stream 3: Prior-Calibrated Zero-Shot / Adapted Semantic Alignment (Backbone F_fused)
             p_align = F.softmax(logits2[0:len_cur] / eff_temp, dim=-1)
-            prob_sem = 1.0 - p_align[:, 0]
+            p0_bb = p_align[:, 0]
+            num_c = max(2, logits2.shape[-1])
+            prob_sem = ((1.0 - p0_bb) / (1.0 + (num_c - 2.0) * p0_bb)).clamp(0.0, 1.0)
 
-            # Stream 4: RUPA Semantic Logits (combined with variance-calibrated semantic_scores)
+            # Stream 4: Prior-Calibrated RUPA Counterfactual Semantic Logits
             p_align_rupa = F.softmax(semantic_logits[0:len_cur] / eff_temp, dim=-1)
-            prob_sem_rupa_raw = 1.0 - p_align_rupa[:, 0]
+            p0_rupa = p_align_rupa[:, 0]
+            prob_sem_rupa_raw = ((1.0 - p0_rupa) / (1.0 + (num_c - 2.0) * p0_rupa)).clamp(0.0, 1.0)
             if 'semantic_scores' in dnp_dict:
                 s_sem_direct = dnp_dict['semantic_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
                 prob_sem_rupa = 0.5 * prob_sem_rupa_raw + 0.5 * s_sem_direct
