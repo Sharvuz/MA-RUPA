@@ -2,11 +2,11 @@ import numpy as np
 from scipy.signal import savgol_filter
 
 def smooth(v):
-   return v
-   # l = min(5, len(v)); l = l - (1-l%2)
-   # if len(v) <= 3:
-   #   return v
-   # return savgol_filter(v, l, 1) #savgol_filter(v, l, 1) #0.5*(np.concatenate([v[1:],v[-1:]],axis=0) + v)
+   l = min(5, len(v))
+   l = l - (1 - l % 2)
+   if len(v) <= 3 or l <= 1:
+       return v
+   return savgol_filter(v, l, 1)
 
 def str2ind(categoryname,classlist):
    return [i for i in range(len(classlist)) if categoryname == classlist[i]][0]
@@ -63,8 +63,10 @@ def getLocMAP(predictions, th, gtsegments, gtlabels, excludeNormal):
       # Get list of all predictions for class c
       for i in range(len(predictions)):
          tmp = smooth(predictions[i][:, c])
+         if np.max(tmp) <= 0.0:
+            continue
          segment_predict_multithr = []
-         thr_set = np.arange(0.6, 0.7, 0.1)
+         thr_set = np.arange(0.3, 0.8, 0.1)
          for thr in thr_set:
             threshold = np.max(tmp) - (np.max(tmp) - np.min(tmp))*thr  ###  0.8 is the best?
             vid_pred = np.concatenate([np.zeros(1), (tmp>threshold).astype('float32'), np.zeros(1)], axis=0)

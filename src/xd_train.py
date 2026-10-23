@@ -129,24 +129,42 @@ def train(args):
         print(f"[Multi-GPU] Detected {torch.cuda.device_count()} GPUs ({', '.join(gpu_names)}). Activating DataParallel for T4x2!", flush=True)
         model = torch.nn.DataParallel(model)
 
-    # Single-stage End-to-End AdamW optimizer
+    # Single-stage End-to-End AdamW optimizer with Differential Parameter Groups
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999)
-    )
+    backbone_params, rupa_adapter_params, aux_gate_params = [], [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if 'modality_branch' in name or 'safegate' in name:
+            aux_gate_params.append(p)
+        elif 'rupa' in name or 'clip_adapter' in name:
+            rupa_adapter_params.append(p)
+        else:
+            backbone_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {'params': backbone_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+        {'params': rupa_adapter_params, 'lr': args.lr * 0.75, 'weight_decay': args.weight_decay},
+        {'params': aux_gate_params, 'lr': args.lr * 0.45, 'weight_decay': args.weight_decay * 2.0},
+    ], betas=(0.9, 0.999))
 
     iters_per_epoch = min(len(normal_loader), len(anomaly_loader))
     total_iters = max(1, args.max_epoch * iters_per_epoch)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_iters, eta_min=args.lr * 0.01
-    )
+    warmup_iters = max(1, int(0.10 * total_iters))
+
+    def lr_lambda(current_step: int):
+        if current_step < warmup_iters:
+            return float(current_step + 1) / float(warmup_iters)
+        progress = float(current_step - warmup_iters) / float(max(1, total_iters - warmup_iters))
+        return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     best_ap = 0.0
     best_auc = 0.0
     start_epoch = 0
+    ema_shadow = None
+    ema_decay = 0.992
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         print(f"Resuming from checkpoint: {args.checkpoint_path}", flush=True)
@@ -306,22 +324,26 @@ def train(args):
             gate_val = dnp_dict.get('gate', torch.tensor(0.0, device=device))
             loss_gate = (gate_val ** 2).mean()
 
-            # Text Orthogonality Regularization
+            # Text Orthogonality Regularization & Audio-Visual Loud-Normal Suppression
             loss_text_orth = compute_normal_contrastive_loss(
                 text_features, num_classes=len(prompt_text)
             )
+            loss_av_sup = dnp_dict.get('av_suppress_loss', torch.tensor(0.0, device=device)).mean()
 
-            # Total Loss Computation with Pareto Optimal Weighting
+            # Total Loss Computation with Pareto Optimal Weighting & Cosine Aux Annealing
             loss_clasm = loss_clasm_bb + 0.8 * loss_clasm_rupa
+            lambda_aux_base = getattr(args, 'lambda_aux', 0.30)
+            lambda_aux_eff = lambda_aux_base * (0.45 + 0.55 * math.cos(0.5 * math.pi * min(1.0, epoch / max(1, args.max_epoch))))
             total_loss = (
                 loss_mil_routing
                 + 0.8 * loss_mil_det
-                + getattr(args, 'lambda_aux', 0.5) * loss_mil_aux
+                + lambda_aux_eff * loss_mil_aux
+                + 0.15 * loss_av_sup
                 + getattr(args, 'loss2_weight', 0.8) * loss_clasm_bb
                 + 0.8 * loss_clasm_rupa
                 + getattr(args, 'lambda_bkg', 0.5) * loss_bkg
-                + getattr(args, 'lambda_consistency', 0.25) * loss_consistency
-                + getattr(args, 'lambda_smooth', 0.05) * loss_smooth
+                + getattr(args, 'lambda_consistency', 0.35) * loss_consistency
+                + getattr(args, 'lambda_smooth', 0.08) * loss_smooth
                 + 0.1 * loss_text_orth
                 + omega * (
                     getattr(args, 'lambda_gather', 0.05) * loss_gather
@@ -329,7 +351,7 @@ def train(args):
                     + getattr(args, 'lambda_residual', 0.05) * loss_residual
                     + 0.15 * loss_event
                     + 0.2 * loss_dnp_normal
-                    + getattr(args, 'lambda_gate', 0.005) * loss_gate
+                    + getattr(args, 'lambda_gate', 0.01) * loss_gate
                 )
             )
 
@@ -341,6 +363,19 @@ def train(args):
 
             optimizer.step()
             scheduler.step()
+
+            # Update Polyak-EMA shadow weights after Epoch 1 warmup
+            if epoch >= 1:
+                with torch.no_grad():
+                    if ema_shadow is None:
+                        ema_shadow = {
+                            n: p.detach().clone()
+                            for n, p in base_model.named_parameters() if p.requires_grad
+                        }
+                    else:
+                        for n, p in base_model.named_parameters():
+                            if p.requires_grad and n in ema_shadow:
+                                ema_shadow[n].mul_(ema_decay).add_(p.detach(), alpha=1.0 - ema_decay)
 
             # Accumulate logs
             loss_accum['mil'] += loss_mil_routing.item()
@@ -376,8 +411,16 @@ def train(args):
         print(f"\n--- Epoch {epoch_idx}/{args.max_epoch} Summary ---")
         print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Orth: {avg_orth:.4f} | Res: {avg_residual:.4f} | Smooth: {avg_smooth:.4f} | Omega: {omega:.2f}")
 
+        # Lookahead Polyak-EMA stabilization before evaluation
+        if ema_shadow is not None:
+            with torch.no_grad():
+                for n, p in base_model.named_parameters():
+                    if p.requires_grad and n in ema_shadow:
+                        p.data.mul_(0.80).add_(ema_shadow[n], alpha=0.20)
+
         # Evaluate on Test Set
         eval_model = model.module if hasattr(model, 'module') else model
+        eval_model._text_features_cache = None
         auc_val, ap_val, map_val = test(
             eval_model, test_loader, args.visual_length, prompt_text, gt, gtsegments,
             gtlabels, args.DNP_use, args, device

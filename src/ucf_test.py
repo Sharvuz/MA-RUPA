@@ -17,22 +17,37 @@ import ucf_option
 
 def refine_scores_hierarchical(logits_det: torch.Tensor,
                                logits_align: torch.Tensor,
-                               temp: float = 5.0,
+                               temp: float = 1.0,
                                routing_prob: torch.Tensor = None) -> torch.Tensor:
-    """Hierarchically combines anomaly probabilities with fine-grained semantic alignments."""
+    """Hierarchically combines anomaly probabilities with fine-grained semantic alignments
+    and video-level class sparsity filtering for temporal localization (dmAP).
+    """
     epsilon = 1e-12
+    eff_temp = (temp / 0.07) if temp < 0.25 else temp
     if routing_prob is None:
-        total_abnormal_prob = torch.sigmoid(logits_det / temp)
+        total_abnormal_prob = torch.sigmoid(logits_det / eff_temp)
     else:
         total_abnormal_prob = routing_prob
+    if total_abnormal_prob.dim() == 1:
+        total_abnormal_prob = total_abnormal_prob.unsqueeze(-1)
     total_normal_prob = (1.0 - total_abnormal_prob).clamp(min=0.0, max=1.0)
 
-    p_align = F.softmax(logits_align / temp, dim=1)
+    p_align = F.softmax(logits_align / eff_temp, dim=1)
     p_align_abnormal_only = p_align[:, 1:]
     sum_p_align = p_align_abnormal_only.sum(dim=1, keepdim=True).clamp_min(epsilon)
     abnormal_dist = p_align_abnormal_only / sum_p_align
 
     final_abnormal_probs = total_abnormal_prob * abnormal_dist
+
+    # Video-level top-k class sparsity gating so getLocMAP (ind = c_s > 0.0) only proposes
+    # segments for the dominant anomaly classes actually present in the video
+    L = final_abnormal_probs.shape[0]
+    k_vid = max(1, L // 16)
+    top_c = torch.topk(final_abnormal_probs, k=k_vid, dim=0).values.mean(dim=0)
+    top2_thresh = torch.topk(top_c, k=min(2, top_c.numel())).values[-1]
+    class_mask = ((top_c >= top2_thresh) & (top_c >= 0.05)).to(final_abnormal_probs.dtype).unsqueeze(0)
+    final_abnormal_probs = final_abnormal_probs * class_mask
+
     final_probs = torch.cat([total_normal_prob, final_abnormal_probs], dim=1)
     return final_probs
 
@@ -110,12 +125,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             if semantic_logits is not None:
                 semantic_logits = semantic_logits.reshape(-1, semantic_logits.shape[-1])
 
-            optimized_probs = refine_scores_hierarchical(
-                logits1[0:len_cur], logits2[0:len_cur], args.temp,
-                None if routing_scores is None else routing_scores[0:len_cur],
-            )
-            prob_hier = (1.0 - optimized_probs[:, 0]).clamp(0.0, 1.0)
-            
+            eff_temp = (args.temp / 0.07) if args.temp < 0.25 else args.temp
+
             # Stream 1: Routing prediction
             if routing_scores is None:
                 prob_routing = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
@@ -128,13 +139,29 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             else:
                 prob_det = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
 
-            # Stream 3: Zero-shot semantic alignment prediction (Backbone F_fused)
-            p_align = F.softmax(logits2[0:len_cur] / args.temp, dim=-1)
+            # Stream 3: Zero-shot / Dynamic-Prompt semantic alignment prediction (Backbone F_fused)
+            p_align = F.softmax(logits2[0:len_cur] / eff_temp, dim=-1)
             prob_sem = 1.0 - p_align[:, 0]
 
-            # Stream 4: RUPA Semantic Logits
-            p_align_rupa = F.softmax(semantic_logits[0:len_cur] / args.temp, dim=-1)
-            prob_sem_rupa = 1.0 - p_align_rupa[:, 0]
+            # Stream 4: RUPA Semantic Logits (combined with variance-calibrated semantic_scores)
+            p_align_rupa = F.softmax(semantic_logits[0:len_cur] / eff_temp, dim=-1)
+            prob_sem_rupa_raw = 1.0 - p_align_rupa[:, 0]
+            if 'semantic_scores' in dnp_dict:
+                s_sem_direct = dnp_dict['semantic_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
+                prob_sem_rupa = 0.5 * prob_sem_rupa_raw + 0.5 * s_sem_direct
+            else:
+                prob_sem_rupa = prob_sem_rupa_raw
+
+            # Auxiliary Motion Residual & Subspace Reconstruction Streams
+            if 'aux_scores' in dnp_dict:
+                prob_aux = dnp_dict['aux_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
+            else:
+                prob_aux = prob_det
+
+            if 'reconstruction_scores' in dnp_dict:
+                prob_rec = dnp_dict['reconstruction_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
+            else:
+                prob_rec = prob_sem_rupa
 
             # Stream 5: SOTA Multi-modal Ensemble (Routing + Semantics Backbone)
             prob_ens_sem = 0.5 * prob_routing + 0.5 * prob_sem
@@ -159,15 +186,27 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
                 'routing': prob_routing,
                 'det': prob_det,
                 'sem_rupa': prob_sem_rupa,
-                'sem': prob_sem
+                'sem': prob_sem,
+                'aux': prob_aux,
+                'rec': prob_rec
             }
             priors = {
                 'routing': 1.0,
                 'det': 0.9,
-                'sem_rupa': 0.9,
-                'sem': 0.6
+                'sem_rupa': 0.95,
+                'sem': 0.85,
+                'aux': 0.65,
+                'rec': 0.65
             }
             prob_uccf = compute_single_pass_uccf(prob_dict, priors, delta_dis=0.35)
+
+            # Hierarchical class-aligned probabilities for temporal localization (dmAP)
+            fused_sem_logits = 0.5 * logits2[0:len_cur] + 0.5 * semantic_logits[0:len_cur]
+            consensus_abn_prob = (0.45 * prob_routing + 0.35 * prob_sem_rupa + 0.20 * prob_det).unsqueeze(-1)
+            optimized_probs = refine_scores_hierarchical(
+                logits1[0:len_cur], fused_sem_logits, eff_temp, consensus_abn_prob
+            )
+            prob_hier = (1.0 - optimized_probs[:, 0]).clamp(0.0, 1.0)
 
             # Detach to numpy
             p_routing_np = prob_routing.cpu().numpy()
@@ -199,6 +238,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
                 p_weighted_np = smooth_scores(p_weighted_np, method=smooth_method, sigma=smooth_sigma)
                 p_geom_np = smooth_scores(p_geom_np, method=smooth_method, sigma=smooth_sigma)
                 p_hier_np = smooth_scores(p_hier_np, method=smooth_method, sigma=smooth_sigma)
+                p_uccf_np = smooth_scores(p_uccf_np, method=smooth_method, sigma=smooth_sigma)
 
             ap_routing_list.append(p_routing_np)
             ap_det_list.append(p_det_np)
@@ -215,6 +255,10 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             ap_dodo_list.append(p_dodo_np)
 
             elem_l2 = optimized_probs.detach().cpu().numpy()
+            if smooth_eval and elem_l2.shape[0] >= 3:
+                for c_idx in range(elem_l2.shape[1]):
+                    if np.max(elem_l2[:, c_idx]) > 0.0:
+                        elem_l2[:, c_idx] = smooth_scores(elem_l2[:, c_idx], method=smooth_method, sigma=smooth_sigma)
             elem_l2 = np.repeat(elem_l2, 16, axis=0)
             element_logits2_stack.append(elem_l2)
 

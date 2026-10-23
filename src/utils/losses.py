@@ -138,15 +138,14 @@ def compute_at_bce_topk_mil_loss(scores: torch.Tensor,
 
     bag_scores = torch.cat(instance_scores, dim=0).clamp(1e-6, 1.0 - 1e-6)
 
-    # Detached Adaptive Temperature Scaling: tau in [1.0, 3.0]
+    # Soft Target-Loss Margin Damping: when current_bce < target_loss, smoothly damp gradient
+    # to prevent memorization & logit runaway while preserving sharp calibration
     with torch.no_grad():
         current_bce = F.binary_cross_entropy(bag_scores, binary_labels, reduction='mean')
-        tau = torch.clamp(1.0 + 0.5 * (target_loss / (current_bce + 1e-6)), min=1.0, max=3.0)
+        grad_damping = torch.clamp(current_bce / max(target_loss, 1e-4), min=0.25, max=1.0)
 
-    # Scale logits via detached tau
-    logits_bag = torch.logit(bag_scores)
-    scaled_bag_scores = torch.sigmoid(logits_bag / tau)
-    loss_bce = F.binary_cross_entropy(scaled_bag_scores, binary_labels)
+    smooth_targets = binary_labels * (1.0 - 0.02) + 0.5 * 0.02
+    loss_bce = grad_damping * F.binary_cross_entropy(bag_scores, smooth_targets)
 
     # Soft Maximum Entropy Regularization: -lambda_ent * H(p)
     entropy = -(bag_scores * torch.log(bag_scores + 1e-6) + (1.0 - bag_scores) * torch.log(1.0 - bag_scores + 1e-6))
