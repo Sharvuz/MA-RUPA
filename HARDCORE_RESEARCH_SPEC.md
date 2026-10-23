@@ -1,223 +1,253 @@
-# HARDCORE RESEARCH SPECIFICATION & ARCHITECTURAL BLUEPRINT: MA-RUPA SOTA BREAKTHROUGH
+# MA-RUPA: Hardcore Architectural Specification & SOTA Blueprint
 
-> **TARGET PLATFORM & HARDWARE:** Kaggle Dual Tesla T4 ($2 \times 16\text{ GB} = 32\text{ GB}$ Combined VRAM), PyTorch 2.x CUDA, DataParallel / DDP, Automatic Mixed Precision (AMP FP16).  
-> **BENCHMARK GOALS:**
-> - **UCF-Crime:** Frame-level ROC-AUC $\ge \mathbf{89.5\% - 90.0\%}$ (Current Best: **87.11% AUC**, Frame-AP: 33.57%).
-> - **XD-Violence:** Frame-level Average Precision (AP) $\ge \mathbf{87.0\% - 88.0\%}$ (Current Best: **79.02% AP**, Frame-AUC: 92.4%).
-> - **Temporal Localization:** Average mAP@IoU $\ge \mathbf{12.0\% - 18.0\%}$ (Current Baseline: 4.77%).
->
-> **REPOSITORY REFS:**
-> - GitHub: `https://github.com/Sharvuz/MA-RUPA.git`
-> - `main` branch (Commit `8cac05b`): Latest multimodal updates, audio pairing, updated Kaggle notebooks.
-> - `ucf-sota-87.11` branch (Tag `v-ucf-87.11`, Commit `ae41430`): Exact verifiable state achieving 87.11% ROC-AUC.
+**Platform & Hardware:**
+- Kaggle Dual Tesla T4 (2x 16 GB = 32 GB VRAM combined)
+- PyTorch 2.x CUDA, DataParallel / DDP, Automatic Mixed Precision (AMP FP16)
+- Memory Envelope: 32 GB VRAM allows large temporal receptive fields (T=512), batch size 64-96, multi-scale cross-attention, latent projection, and PCGrad gradient hooks without OOM.
 
----
+**Benchmark Targets:**
+- **UCF-Crime:** Target Frame-level ROC-AUC >= 89.5% - 90.0% (Current Milestone: 87.11% AUC, AP: 33.57%)
+- **XD-Violence:** Target Frame-level AP >= 87.0% - 88.0% (Current Milestone: 79.02% AP, AUC: 92.41%)
+- **Temporal Localization:** Average mAP@IoU >= 12.0% - 15.0% (Current Baseline: 4.77%)
 
-## 1. System Prompt & Research Persona
-
-> **INSTRUCTION FOR THE REASONING AI (Argon 4 / Claude 3.7 / Opus / O3):**
-> You are acting as a **Principal Deep Learning Research Scientist and Chief Vision-Language Architect** specializing in Weakly-Supervised Video Anomaly Detection (WS-VAD), Temporal Video Modeling, and Multimodal Foundation Models (CLIP, VGGish, CLAP).
->
-> You are provided with the complete architectural mathematical formulation, empirical failure modes, source code structure, and hardware envelope of **MA-RUPA (Modality-Adaptive Multiscale Prototype Alignment Network)**.
->
-> **Key Operational Directive:**
-> 1. You have **32 GB VRAM on Dual Tesla T4**. Do NOT restrict yourself to toy models, naive MLPs, or micro-batches. You have ample capacity for deep temporal cross-attention, multi-scale memory banks, latent counterfactual projection, and gradient projection hooks.
-> 2. Avoid generic, hand-waving suggestions (e.g. "tune learning rate" or "add more data"). Provide **hardcore mathematical formulations**, **concrete architectural diagrams**, and **drop-in PyTorch code modules**.
-> 3. Your goal is to dissect the exact bottlenecks holding UCF-Crime at $87.11\%$ and XD-Violence at $79.02\%$ and engineer architectural upgrades to push them into definitive world-class SOTA ($90.0\%$ AUC and $87.5\%+$ AP).
+**Repository Reference:**
+- GitHub: https://github.com/Sharvuz/MA-RUPA.git
+- Branch `main`: Latest multimodal updates, audio pairing, rewritten notebook.
+- Branch `ucf-sota-87.11` (Tag `v-ucf-87.11`): Exact commit ae41430 achieving 87.11% ROC-AUC on UCF-Crime.
 
 ---
 
-## 2. Theoretical Foundations of Current Architecture (MA-RUPA)
+## 1. System Prompt for Reasoning AI (Argon 4 / Claude 3.7 / Opus / O3)
 
-### 2.1. Input Space & Feature Representations
-For any untrimmed video sequence $i$:
-- **Visual Features:** Extracted via CLIP ViT-B/16 (or I3D) at 16-frame snippet intervals:
-  $$\mathbf{V}_i \in \mathbb{R}^{T_i \times D_v}, \quad D_v = 512, \quad T_i \le 256 \text{ (or } 512\text{)}$$
-- **Audio Features (XD-Violence):** Pre-extracted VGGish embeddings (or CLAP/AST):
-  $$\mathbf{A}_i \in \mathbb{R}^{T_i \times D_a}, \quad D_a = 128 \text{ (or } 512\text{)}$$
-- **Motion Residuals (UCF-Crime silent mode):** First-order temporal velocity:
-  $$\Delta \mathbf{V}_t = \mathbf{V}_t - \mathbf{V}_{t-1}, \quad \Delta \mathbf{V}_0 = \mathbf{0}$$
+Copy the prompt block below when initiating your research session:
 
-### 2.2. Mathematical Breakdown of Core Submodules
+```text
+========================= MASTER SYSTEM PROMPT =========================
+You are acting as a Principal AI Research Scientist and Chief Vision-Language Architect specializing in Weakly-Supervised Video Anomaly Detection (WS-VAD), Temporal Video Modeling, and Multimodal Foundation Models (CLIP, VGGish, CLAP).
 
+You are tasked with reviewing the architecture of MA-RUPA (Modality-Adaptive Multiscale Prototype Alignment Network) detailed below.
+
+Operational Directives:
+1. HARDWARE ENVELOPE: We have 32 GB VRAM on Dual Tesla T4 on Kaggle. Do NOT constrain yourself to lightweight toy models. We have full headroom for deep temporal cross-attention, orthogonal latent subspace projection, multi-scale normal memory banks, and multi-objective gradient surgery (PCGrad).
+2. HARDCORE RIGOR: Avoid superficial advice (e.g. "tune learning rate" or "increase epochs"). Provide exact mathematical derivations, concrete architectural mechanisms, and drop-in PyTorch code blocks matching the existing codebase.
+3. PRIMARY MISSION: Overcome the 5 identified bottlenecks in MA-RUPA to push UCF-Crime from 87.11% to >= 90.0% ROC-AUC, and XD-Violence from 79.02% to >= 87.5% AP.
+========================================================================
 ```
-Input Visual V (B, T, 512) ──┬──> [MDTBackbone (Dilations 1,2,4 + WindowAttn)] ──> F_backbone (B, T, 512)
-                             │                                                          │
-Input Audio A (B, T, 128) ───┼──> [ModalityAdaptiveBranch (Cross-Attn / Residuals)] ───┼──> F_aux / S_aux
-                             │                                                          │
-                             ├──> [GradientSafeRUPA (Dynamic Normal Prototypes)] ───────┼──> S_rec (Recon Error)
-                             │                                                          │
-Text Prompts W_text ─────────┼──> [CLASM Semantic Adapter (14/7 Classes)] ──────────────┼──> S_sem (Category Scores)
-                             │                                                          │
-                             └──> [QuadSafeGate (Uncertainty-Aware Routing)] ───────────┴──> S_routing (Final Score)
+
+---
+
+## 2. MA-RUPA Architecture Pipeline
+
+```mermaid
+flowchart TD
+    V["Visual Features V (B, T, 512)"] --> MDT["MDTBackbone (Dilations 1,2,4 + WindowAttn)"]
+    A["Audio Features A (B, T, 128)"] --> MAB["ModalityAdaptiveBranch (Cross-Attn / Motion)"]
+    V --> RUPA["GradientSafeRUPA (Dynamic Normal Prototypes)"]
+    TXT["Text Prompts W_text (14 or 7 Classes)"] --> CLASM["CLASM Adapter (CLIP Prompts)"]
+    
+    MDT --> S_det["Detector Score S_det"]
+    MAB --> S_aux["Auxiliary Score S_aux"]
+    RUPA --> S_rec["Reconstruction Error S_rec"]
+    CLASM --> S_sem["Semantic Scores S_sem"]
+    
+    S_det --> SafeGate["QuadSafeGate (Uncertainty Routing)"]
+    S_aux --> SafeGate
+    S_rec --> SafeGate
+    S_sem --> SafeGate
+    
+    SafeGate --> S_routing["Final Score S_routing"]
 ```
+
+### 2.1. Feature Representation
+- **Visual Features:** Extracted via CLIP ViT-B/16 at 16-frame snippet intervals:
+  `V in R^(B x T x 512)`, where `T <= 256` (or `512` with 32 GB VRAM).
+- **Audio Features (XD-Violence):** Pre-extracted VGGish embeddings:
+  `A in R^(B x T x 128)`.
+- **Motion Residuals (UCF-Crime silent CCTV):** First-order temporal velocity:
+  `Delta_V_t = V_t - V_(t-1)`, with `Delta_V_0 = 0`.
+
+### 2.2. Core Submodules
 
 #### A. Multi-Scale Dilated Temporal Backbone (`MDTBackbone`)
-Processes input features through parallel dilated temporal convolutions ($r \in \{1, 2, 4\}$) with local windowed self-attention:
-$$\mathbf{H}^{(r)} = \text{GLU}(\text{Conv1D}_r(\mathbf{V})), \quad r \in \{1, 2, 4\}$$
-$$\mathbf{F}_{\text{mdtp}} = \text{LayerNorm}\left(\mathbf{V} + \sum_{r \in \{1, 2, 4\}} \mathbf{H}^{(r)}\right)$$
-$$\mathbf{F}_{\text{backbone}} = \text{WindowedAttention}(\mathbf{F}_{\text{mdtp}}, W_{\text{size}} = 8) \quad \text{with NaN Guard for padded snippets}$$
+- Captures multi-scale temporal context using dilated 1D depthwise-separable convolutions:
+  - Dilations: `r in {1, 2, 4}` with kernel size 3 and GLU activation.
+  - Multi-scale aggregation: `F_mdtp = LayerNorm(V + sum(H^(r)))`.
+- Local Windowed Attention:
+  - Window size: `W = 8` (O(T * W) linear complexity).
+  - Padded sequence NaN Guard: replaces `softmax([-inf, ...]) = NaN` with 0.0 to prevent attention matrix corruption.
 
 #### B. Modality-Adaptive Auxiliary Branch (`ModalityAdaptiveBranch`)
-- On **XD-Violence**: Computes asymmetric bidirectional cross-attention:
-  $$\mathbf{Q}_v = \mathbf{F} \mathbf{W}_q, \quad \mathbf{K}_a = \mathbf{A} \mathbf{W}_k, \quad \mathbf{V}_a = \mathbf{A} \mathbf{W}_v$$
-  $$\mathbf{M}_{va} = \text{Softmax}\left(\frac{\mathbf{Q}_v \mathbf{K}_a^\top}{\sqrt{d}}\right) \mathbf{V}_a$$
-  $$\mathbf{F}_{\text{aux}} = \text{GLU}\left([\mathbf{F} \,\|\, \mathbf{M}_{va}] \mathbf{W}_{\text{fusion}}\right) \odot \sigma(\mathbf{W}_{\text{gate}} [\mathbf{F} \,\|\, \mathbf{M}_{va}])$$
-- On **UCF-Crime**: Computes velocity-aware temporal convolutions:
-  $$\mathbf{F}_{\text{aux}} = \text{Conv1D}(\Delta \mathbf{V}_t)$$
+- **On XD-Violence (Audio-Visual Fusion):**
+  - Bidirectional Cross-Attention: Visual queries `Q_v = F * W_q` attend to Audio keys/values `K_a = A * W_k`, `V_a = A * W_v`.
+  - Attention matrix: `M_va = Softmax(Q_v * K_a^T / sqrt(d)) * V_a`.
+  - Gated Fusion: `F_aux = GLU([F || M_va] * W_fusion) * sigmoid(W_gate * [F || M_va])`.
+  - Detection head produces auxiliary anomaly scores: `S_aux`.
+- **On UCF-Crime (Motion Residual Mode):**
+  - When no audio exists, automatically switches to processing motion velocity `Delta_V_t` via 1D convolutions to detect sudden violent motions.
 
 #### C. Gradient-Safe Dynamic Normal Prototypes (`GradientSafeRUPA`)
-Maintains an online memory bank of $M=16$ normal prototypes $\mathbf{P} = \{\mathbf{p}_1, \dots, \mathbf{p}_M\} \subset \mathbb{R}^D$:
-1. **Pseudo-Normal Snippet Selection:** At epoch $e$, select the bottom $(1 - \gamma)$ fraction of snippets based on detector anomaly scores:
-   $$\mathcal{S}_{\text{norm}} = \{t \mid S_{\text{det}}(t) < \tau_{\text{otsu}} \text{ or } t \in \text{Bottom-}K(S_{\text{det}})\}$$
-2. **Reconstruction & Stop-Gradient:**
-   $$\alpha_{t, m} = \frac{\exp(\mathbf{f}_t^\top \mathbf{p}_m / \tau)}{\sum_{j=1}^M \exp(\mathbf{f}_t^\top \mathbf{p}_j / \tau)}$$
-   $$\mathbf{f}_{\text{recon}}(t) = \sum_{m=1}^M \alpha_{t, m} \mathbf{p}_m$$
-   $$S_{\text{rec}}(t) = 1 - \frac{\mathbf{f}_t^\top \mathbf{f}_{\text{recon}}(t)}{\|\mathbf{f}_t\|_2 \|\mathbf{f}_{\text{recon}}(t)\|_2}$$
-   To avoid gradient contamination of prototype vectors by abnormal frames, gradients are detached:
-   $$\mathcal{L}_{\text{gather}} = \frac{1}{|\mathcal{S}_{\text{norm}}|} \sum_{t \in \mathcal{S}_{\text{norm}}} \min_{m} \|\text{sg}[\mathbf{f}_t] - \mathbf{p}_m\|_2^2$$
+- Maintains an online memory bank of `M = 16` normal prototypes: `P = {p_1, ..., p_M} in R^512`.
+- **Pseudo-Normal Selection:** Selects bottom `(1 - gamma)` fraction of snippets based on detector anomaly scores:
+  `S_norm = {t | S_det(t) < tau_otsu or t in Bottom-K(S_det)}`.
+- **Counterfactual Normal Reconstruction:**
+  - Prototype attention weights: `alpha_(t,m) = exp(f_t . p_m / tau) / sum_j exp(f_t . p_j / tau)`.
+  - Reconstructed feature: `f_recon(t) = sum_m alpha_(t,m) * p_m`.
+  - Reconstruction error (Anomaly Score): `S_rec(t) = 1 - cosine_similarity(f_t, f_recon(t))`.
+- **Gradient Detachment:** Prototype updates use `stop_gradient[f_t]` to prevent abnormal frames from pulling prototypes toward anomaly distributions.
 
 #### D. Uncertainty-Aware Dynamic Gate (`QuadSafeGate`)
-Instead of heuristic static averaging, an MLP estimates epistemic variance/uncertainty $\mathbf{u}_t \in \mathbb{R}^4$:
-$$\mathbf{w}_t = \text{Softmax}\left(\text{MLP}([\mathbf{f}_t \,\|\, S_{\text{det}} \,\|\, S_{\text{rec}} \,\|\, S_{\text{sem}} \,\|\, S_{\text{aux}}]) + \mathbf{b}_{\text{safe}}\right)$$
-$$S_{\text{routing}}(t) = w_{\text{det}}(t) S_{\text{det}}(t) + w_{\text{rec}}(t) S_{\text{rec}}(t) + w_{\text{sem}}(t) S_{\text{sem}}(t) + w_{\text{aux}}(t) S_{\text{aux}}(t)$$
-Where $\mathbf{b}_{\text{safe}} = [0.0, -1.0, -1.0, -0.5]$ suppresses noisy auxiliary streams during early epochs.
+- MLP estimates epistemic uncertainty `u_t in R^4` across streams:
+  `w_t = Softmax(MLP([f_t || S_det || S_rec || S_sem || S_aux]) + b_safe)`.
+- Fused routing score:
+  `S_routing(t) = w_det * S_det + w_rec * S_rec + w_sem * S_sem + w_aux * S_aux`.
+- Safe bias initialization `b_safe = [0.0, -1.0, -1.0, -0.5]` prevents noisy auxiliary streams from destabilizing early training.
 
 #### E. Class-Aware Semantic Alignment (`CLASM`)
-Text prompts for each class $c \in \{1, \dots, C\}$ (e.g., *"a security camera video showing an explosion"*, *"a surveillance video of shoplifting"*):
-$$\mathbf{t}_c = \text{CLIP-TextEncoder}(\text{Prompt}_c) \in \mathbb{R}^{512}$$
-$$S_{\text{sem}}(t, c) = \frac{\mathbf{f}_t^\top \mathbf{t}_c}{\|\mathbf{f}_t\|_2 \|\mathbf{t}_c\|_2} \cdot \frac{1}{\tau_{\text{temp}}}$$
-$$S_{\text{sem}}(t) = \max_{c \ne \text{Normal}} \sigma(S_{\text{sem}}(t, c))$$
+- Encodes class prompt texts using CLIP ViT-B/16 text encoder:
+  - UCF-Crime: 14 classes (Abuse, Arrest, Arson, Assault, Burglary, Explosion, Fighting, RoadAccidents, Robbery, Shooting, Shoplifting, Stealing, Vandalism, Normal).
+  - XD-Violence: 7 classes (Abuse, CarAccident, Explosion, Fighting, Riot, Shooting, Normal).
+- Computes cosine similarity between snippet feature `f_t` and text embeddings `t_c`:
+  `S_sem(t, c) = (f_t . t_c) / (||f_t|| * ||t_c|| * tau_temp)`.
+  `S_sem(t) = max_(c != Normal) sigmoid(S_sem(t, c))`.
 
 ---
 
-## 3. Loss Landscape & Multi-Objective Optimization
+## 3. Loss Landscape & Optimization
 
-The scalar loss optimized across Dual T4 GPUs is:
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{mil}}^{\text{routing}} + 0.5 \mathcal{L}_{\text{mil}}^{\text{det}} + \lambda_{\text{aux}} \mathcal{L}_{\text{mil}}^{\text{aux}} + \lambda_{\text{clasm}} \mathcal{L}_{\text{clasm}} + \lambda_{\text{consist}} \mathcal{L}_{\text{consist}} + \lambda_{\text{bkg}} \mathcal{L}_{\text{bkg}} + \lambda_{\text{smooth}} \mathcal{L}_{\text{fgtv}} + \omega(e) \cdot \mathcal{L}_{\text{rupa}}$$
+The total scalar loss optimized across Dual T4 GPUs is:
 
-### Loss Component Formulations:
-1. **Variance-Adaptive Top-K MIL Loss ($\mathcal{L}_{\text{mil}}$):**
-   $$k = \max\left(1, \left\lfloor \frac{T}{R_{\text{topk}}} \cdot \left(1 + \frac{\text{Var}(\mathbf{S})}{\mu(\mathbf{S}) + \epsilon}\right) \right\rfloor\right)$$
-   $$\mathcal{L}_{\text{mil}} = -\frac{1}{B} \sum_{i=1}^B \left[ y_i \log \left(\frac{1}{k_i} \sum_{t \in \text{Top-}k_i} S_i(t)\right) + (1 - y_i) \log \left(1 - \frac{1}{k_i} \sum_{t \in \text{Top-}k_i} S_i(t)\right) \right]$$
-2. **Foreground-Guided Total Variation ($\mathcal{L}_{\text{fgtv}}$):**
-   $$\mathcal{L}_{\text{fgtv}} = \frac{1}{T-1} \sum_{t=1}^{T-1} \left(1 + \gamma_{\text{edge}} |S_{t+1} - S_t|\right)^{-1} (S_{t+1} - S_t)^2$$
-3. **Consistency Loss ($\mathcal{L}_{\text{consist}}$):**
-   $$\mathcal{L}_{\text{consist}} = \frac{1}{T} \sum_{t=1}^T \text{MSE}\left(S_{\text{det}}(t), \text{sg}[S_{\text{rec}}(t)]\right)$$
-4. **Normality Constraint ($\mathcal{L}_{\text{bkg}}$):**
-   $$\mathcal{L}_{\text{bkg}} = \frac{1}{M} \sum_{m=1}^M \text{CrossEntropy}\left(\text{Classifier}(\mathbf{p}_m), y_{\text{Normal}}\right)$$
-5. **Curriculum Ramp-Up ($\omega(e)$):**
-   $$\omega(e) = \Omega_{\max} \cdot \frac{1}{2} \left[1 - \cos\left(\pi \cdot \min\left(1.0, \frac{e}{E_{\text{curric}}}\right)\right)\right], \quad \Omega_{\max} = 0.35 \text{ (or } 1.0\text{)}$$
+`L_total = L_mil_routing + 0.5 * L_mil_det + lambda_aux * L_mil_aux + lambda_clasm * L_clasm + lambda_consist * L_consist + lambda_bkg * L_bkg + lambda_smooth * L_fgtv + omega(e) * L_rupa`
 
----
-
-## 4. Empirical Performance Milestones & Diagnostic Audit
-
-### 4.1. UCF-Crime ($87.11\%$ AUC Milestone at Epoch 4/15)
-- **Routing ROC-AUC:** $87.02\%$ | **AP:** $33.53\%$
-- **Detector ROC-AUC:** $86.33\%$ | **AP:** $30.48\%$
-- **Semantics RUPA ROC-AUC:** $84.85\%$ | **AP:** $32.51\%$
-- **Dual Ensemble (Routing + Detector):** $\mathbf{87.11\%}$ | **AP:** $\mathbf{33.57\%}$
-- **mAP@IoU Breakdown:**
-  $$\text{mAP@0.1}=9.10\%, \quad \text{mAP@0.2}=6.37\%, \quad \text{mAP@0.3}=3.74\%, \quad \text{mAP@0.4}=2.68\%, \quad \text{mAP@0.5}=1.99\%$$
-  $$\text{Average mAP} = \mathbf{4.77\%}$$
-
-### 4.2. XD-Violence ($79.02\%$ AP Milestone at Epoch 2/20)
-- **Visual-only AP:** $73.12\%$ | **ROC-AUC:** $89.84\%$
-- **Multimodal (Visual + VGGish Audio 128-D) AP:** $\mathbf{79.02\%}$ | **ROC-AUC:** $\mathbf{92.41\%}$
-- **False Alarm Profile:** High false alarm rate during loud non-violent scenes (screaming in crowds, sports cheers, loud background music in clubs).
+### Loss Definitions:
+1. **Variance-Adaptive Top-K MIL Loss (`L_mil`):**
+   - Dynamic k: `k = max(1, floor( (T / R_topk) * (1 + Var(S) / (Mean(S) + eps)) ))`.
+   - Non-saturating BCE loss with Label Smoothing (0.02) to prevent vanishing gradients:
+     `L_mil = - (1/B) * sum [ y * log(mean_TopK(S)) + (1 - y) * log(1 - mean_TopK(S)) ]`.
+2. **Foreground-Guided Total Variation (`L_fgtv`):**
+   - Preserves sharp anomaly boundaries while penalizing 1-frame spikes:
+     `L_fgtv = (1/(T-1)) * sum [ (1 / (1 + gamma_edge * |S_(t+1) - S_t|)) * (S_(t+1) - S_t)^2 ]`.
+3. **Consistency Loss (`L_consist`):**
+   - Enforces agreement between detector and prototype reconstruction:
+     `L_consist = MSE(S_det(t), stop_gradient[S_rec(t)])`.
+4. **Normality Constraint (`L_bkg`):**
+   - Constrains normal prototypes to classify strictly into the Normal class:
+     `L_bkg = CrossEntropy(Classifier(p_m), y_Normal)`.
+5. **Curriculum Ramp-Up (`omega(e)`):**
+   - Cosine S-curve ramp-up: `omega(e) = Omega_max * 0.5 * [1 - cos(pi * min(1.0, e / E_curric))]`.
+   - Protects early backbone convergence before RUPA prototype constraints tighten.
 
 ---
 
-## 5. The Five Core Bottlenecks Holding MA-RUPA Back
+## 4. Empirical Performance Milestones
 
-### Bottleneck 1: MIL Top-K Coarse Granularity & Bag Noise Dilemma
-- **The Issue:** A video with a momentary gunshot (lasting 2 seconds out of 120 seconds) has only $\approx 3$ true abnormal snippets. With $R_{\text{topk}}=8$ or $16$, Top-K selects $16$ to $32$ snippets. Thus, $80\%+$ of the snippets in the abnormal bag gradient are actually normal, forcing the model to lower its detection threshold on normal frames.
-- **Conversely:** In a 3-minute sustained riot/fighting video, $80\%$ of snippets are violent, but Top-K selects only $16$ snippets, starving the model of gradient supervision on valid anomalies.
+### 4.1. UCF-Crime (Milestone at Epoch 4/15)
+- **Routing ROC-AUC:** 87.02% | **AP:** 33.53%
+- **Detector ROC-AUC:** 86.33% | **AP:** 30.48%
+- **Semantics RUPA ROC-AUC:** 84.85% | **AP:** 32.51%
+- **Ensemble (Routing + Detector):** **87.11% AUC** | **33.57% AP**
+- **Temporal Localization (mAP@IoU):**
+  - mAP@0.1 = 9.10%
+  - mAP@0.2 = 6.37%
+  - mAP@0.3 = 3.74%
+  - mAP@0.4 = 2.68%
+  - mAP@0.5 = 1.99%
+  - **Average mAP = 4.77%**
 
-### Bottleneck 2: Prototype Normal Drift (The Manifold Over-Smoothing Trap)
-- **The Issue:** The Dynamic Normal Prototypes (DNP) learn via MSE reconstruction. In video backgrounds with heavy camera panning, abrupt illumination changes, or complex motion clutter, the reconstruction error $S_{\text{rec}}$ spikes on *normal* frames.
-- As $\omega(e)$ increases, the prototypes expand their coverage to minimize this error, inadvertently absorbing anomalous features. Consequently, the contrast ratio $\frac{S_{\text{rec}}(\text{anomalous})}{S_{\text{rec}}(\text{normal})}$ decays from $4.2 \times$ down to $1.3 \times$ after epoch 6.
+### 4.2. XD-Violence (Milestone at Epoch 2/20)
+- **Visual-only AP:** 73.12% | **ROC-AUC:** 89.84%
+- **Multimodal (Visual + VGGish Audio 128-D):** **79.02% AP** | **92.41% ROC-AUC**
+- **False Alarm Profile:** Intense false alarms on loud non-violent scenes (crowd cheering, party music, sports commentary).
 
-### Bottleneck 3: Audio-Visual Asynchrony & Modality Dominance
-- **The Issue:** Sound waves travel slower than light, and movie editing often offsets audio by $0.5$ to $2.0$ seconds. Standard point-wise Cross-Attention assumes snippet-aligned audio-visual pairing ($A_t$ aligns with $V_t$). When a gunshot sound occurs at $t+2$ while the visual flash is at $t$, standard attention fails to bind them.
-- Furthermore, Visual features ($512$-D) often dominate gradient flow over Audio features ($128$-D), causing the audio projection to degenerate into a passive bias term.
+---
+
+## 5. The Five Core Theoretical Bottlenecks
+
+### Bottleneck 1: MIL Top-K Coarse Granularity & Bag Noise Leakage
+- **Symptom:** In short burst anomalies (e.g. 2-second gunshot in a 2-minute video), `k = T / 16 = 16` snippets. The Top-K bag includes ~3 true positive snippets and ~13 normal snippets. The MIL loss penalizes these 13 normal snippets for having low scores, forcing the model to over-predict anomalies on normal backgrounds.
+- **Conversely:** In sustained 3-minute riots, `k = 16` leaves out over 80% of violent frames from backpropagation.
+
+### Bottleneck 2: Prototype Normal Drift (Manifold Over-Smoothing)
+- **Symptom:** After Epoch 4, normal prototypes begin minimizing reconstruction error on complex background motions (camera pans, lighting transitions). Consequently, the prototypes expand their convex hull and begin reconstructing *abnormal* snippets accurately as well!
+- Contrast ratio `Contrast = S_rec(abnormal) / S_rec(normal)` drops from `4.2x` at Epoch 4 down to `1.3x` at Epoch 8, causing validation AUC to degrade.
+
+### Bottleneck 3: Audio-Visual Temporal Asynchrony & Modality Dominance
+- **Symptom:** Sound waves lag visual explosions by 0.5 - 2.0 seconds. Frame-synchronous point-wise cross-attention cannot bind visual flashes with delayed audio booms.
+- Moreover, 512-D visual gradients dwarf 128-D audio gradients, causing the network to ignore subtle audio cues in visual-heavy scenes.
 
 ### Bottleneck 4: Multi-Objective Gradient Interference (The Angle Conflict)
-- Let $\mathbf{g}_{\text{mil}} = \nabla_{\theta} \mathcal{L}_{\text{mil}}$, $\mathbf{g}_{\text{clasm}} = \nabla_{\theta} \mathcal{L}_{\text{clasm}}$, and $\mathbf{g}_{\text{rupa}} = \nabla_{\theta} \mathcal{L}_{\text{rupa}}$.
-- **Empirical observation:** During epochs 3-8, the cosine similarity between $\mathbf{g}_{\text{clasm}}$ and $\mathbf{g}_{\text{rupa}}$ frequently turns negative:
-  $$\cos(\mathbf{g}_{\text{clasm}}, \mathbf{g}_{\text{rupa}}) \in [-0.45, -0.12]$$
-- $\mathcal{L}_{\text{clasm}}$ attempts to scatter features into category-specific directional rays in CLIP space, whereas $\mathcal{L}_{\text{rupa}}$ attempts to collapse normal snippets into a tight convex hull around prototypes. Without gradient projection (PCGrad), they cancel each other out.
+- **Symptom:** Cosine similarity between `grad(L_clasm)` and `grad(L_rupa)` frequently becomes negative:
+  `cos(grad_clasm, grad_rupa) in [-0.45, -0.12]`.
+- `L_clasm` forces snippets along class-specific directional rays in CLIP space, while `L_rupa` pulls normal snippets into a compact prototype cluster. Without gradient projection (PCGrad), they cancel each other's updates.
 
-### Bottleneck 5: Temporal Boundary Dissolution & Abysmal mAP@IoU ($4.77\%$)
-- Post-processing Gaussian smoothing ($\sigma = 1.0 - 1.5$) lifts ROC-AUC because AUC is a ranking metric that rewards smooth transitions.
-- However, it severely degrades frame-level localization precision: sharp square-wave anomalies become bell curves, bleeding probability mass into normal boundary frames. This causes Intersection-over-Union (IoU) with ground-truth temporal segments to drop below $0.5$, crushing mAP@0.5 down to $1.99\%$.
+### Bottleneck 5: Temporal Boundary Dissolution & Abysmal mAP@IoU (4.77%)
+- **Symptom:** Post-processing Gaussian smoothing (`sigma = 1.0 - 1.5`) boosts ROC-AUC because AUC is rank-based.
+- However, smoothing turns sharp rectangular anomaly events into diffuse bell curves. Normal boundary snippets receive high scores, causing predicted segments to fail IoU thresholds (`mAP@0.5 = 1.99%`).
 
 ---
 
-## 6. High-Leverage Architectural Directions (Leveraging 32 GB VRAM)
+## 6. Five Hardcore Research Directions (Leveraging 32 GB VRAM)
 
-Since Kaggle Dual T4 gives us **32 GB VRAM**, we do not need to settle for basic linear layers. Here are 5 high-impact research proposals for the reasoning model to explore:
+With 32 GB VRAM on Dual Tesla T4, the reasoning AI should consider these concrete directions:
 
-### Direction A: Latent Manifold Counterfactual Projection (LMCP)
-Instead of linear dictionary combination $\mathbf{f}_{\text{recon}} = \sum \alpha_m \mathbf{p}_m$, formulate counterfactual normal reconstruction as an orthogonal subspace projector or a lightweight residual latent flow:
-$$\mathbf{P}_{\text{sub}} = \text{OrthogonalBasis}(\{\mathbf{p}_1, \dots, \mathbf{p}_M\}) \in \mathbb{R}^{D \times M}$$
-$$\mathbf{f}_{\text{normal\_proj}} = \mathbf{P}_{\text{sub}} \mathbf{P}_{\text{sub}}^\top \mathbf{f}_t$$
-$$\mathbf{f}_{\text{anomaly\_residual}} = \mathbf{f}_t - \mathbf{f}_{\text{normal\_proj}}$$
-The anomaly score is the exact $L_2$ norm of the orthogonal complement:
-$$S_{\text{rec}}(t) = \tanh\left(\frac{\|\mathbf{f}_{\text{anomaly\_residual}}\|_2^2}{\tau \cdot \|\mathbf{f}_{\text{normal\_proj}}\|_2^2 + \epsilon}\right)$$
+### Direction A: Latent Manifold Orthogonal Subspace Projection (LM-OSP)
+Replace heuristic linear combination `f_recon = sum(alpha_m * p_m)` with an orthogonal projection onto the normal prototype subspace:
+- Form an orthonormal basis matrix `U_norm = GramSchmidt({p_1, ..., p_M}) in R^(512 x M)`.
+- Project snippet feature onto the normal manifold: `f_norm_proj = U_norm * U_norm^T * f_t`.
+- Orthogonal anomaly residual: `f_anomaly = f_t - f_norm_proj`.
+- Score: `S_rec(t) = ||f_anomaly||^2 / (||f_norm_proj||^2 + eps)`.
+- *Theoretical Advantage:* Guaranteed zero reconstruction for any snippet strictly within the span of normal prototypes, with maximal residual energy for out-of-distribution anomalies.
 
 ### Direction B: Temporal Delay-Aware Audio-Visual Cross-Attention (TD-AVCA)
-Expand cross-attention over a sliding temporal offset window $\delta \in [-\Delta, +\Delta]$ (e.g. $\Delta = 4$ snippets $\approx 3.2$ seconds):
-$$\mathbf{M}_{va}(t) = \sum_{\delta = -\Delta}^{+\Delta} \text{Softmax}\left(\frac{\mathbf{q}_v(t)^\top \mathbf{k}_a(t + \delta)}{\sqrt{d}} + \psi(\delta)\right) \mathbf{v}_a(t + \delta)$$
-Where $\psi(\delta)$ is a learnable relative temporal position bias penalizing large temporal distances while allowing flexible audio lead/lag binding.
+Expand cross-attention over a learnable temporal offset window `delta in [-Delta, +Delta]` (e.g. `Delta = 4` snippets = 3.2 seconds):
+- Attention formulation:
+  `M_va(t) = sum_(delta = -Delta)^(+Delta) Softmax( (q_v(t) . k_a(t + delta)) / sqrt(d) + psi(delta) ) * v_a(t + delta)`.
+- `psi(delta)` is a learnable relative temporal position bias that allows the network to learn modal delays (e.g. audio trailing video by 1.6s).
 
-### Direction C: Optimal Transport Sinkhorn Prototype Allocation
-Replace greedy Top-K / Otsu pseudo-normal selection with an Optimal Transport formulation (Sinkhorn-Knopp algorithm).
-- Transport matrix $\mathbf{T}^* = \arg\min_{\mathbf{T} \in \mathcal{U}(r, c)} \langle \mathbf{T}, \mathbf{C} \rangle + \epsilon H(\mathbf{T})$.
-- Guarantees that each normal prototype receives an equal assignment quota across the batch, completely eliminating prototype collapse (where 2 prototypes monopolize all samples while 14 remain dead).
+### Direction C: Optimal Transport Sinkhorn Prototype Assignment
+Replace greedy Top-K / Otsu selection with entropy-regularized Optimal Transport (Sinkhorn-Knopp algorithm):
+- Assign snippets to prototypes under marginal constraints: every prototype must receive an equal allocation budget across the mini-batch.
+- *Theoretical Advantage:* 100% immune to prototype collapse where 1-2 prototypes dominate while 14 remain dead.
 
 ### Direction D: Conflict-Free Projected Gradient Surgery (PCGrad Hook)
-Implement a gradient backward hook on the shared backbone parameters $\theta_{\text{backbone}}$:
-$$\text{If } \mathbf{g}_i \cdot \mathbf{g}_j < 0: \quad \mathbf{g}_i \leftarrow \mathbf{g}_i - \frac{\mathbf{g}_i \cdot \mathbf{g}_j}{\|\mathbf{g}_j\|^2} \mathbf{g}_j$$
-Ensuring that $\mathcal{L}_{\text{mil}}$, $\mathcal{L}_{\text{clasm}}$, and $\mathcal{L}_{\text{rupa}}$ never update the shared temporal representations in conflicting directions.
+Apply gradient projection directly to the shared backbone parameters:
+- For any two loss gradients `g_i` and `g_j`:
+  `if g_i . g_j < 0: g_i = g_i - ( (g_i . g_j) / ||g_j||^2 ) * g_j`.
+- Ensures that classification, reconstruction, and temporal smoothness never destructively interfere.
 
-### Direction E: Boundary-Sharpening Contrastive Loss (BS-CL)
-To recover mAP@IoU without sacrificing ROC-AUC:
-- Compute first-order finite differences $\nabla S_t = S_{t+1} - S_t$.
-- Define transition candidate frames where $|\nabla S_t| > \delta_{\text{thresh}}$.
-- Apply a margin-ranking temporal contrastive loss that forces transition slopes to be steep step-functions rather than diffused Gaussian curves.
+### Direction E: Boundary-Sharpening Temporal Contrastive Loss (BS-TCL)
+Train a boundary-sensitive head to recover segment localization:
+- Compute first-order finite differences: `nabla S_t = |S_(t+1) - S_t|`.
+- Contrastive boundary loss enforces high derivative at transition points and near-zero derivative inside continuous anomaly segments, lifting mAP@IoU to > 15%.
 
 ---
 
-## 7. Codebase Layout & Critical File References
+## 7. Codebase File Structure & Quick Reference
 
 ```
 MA-RUPA/
 ├── src/
-│   ├── model.py                # Core Architecture: MDTBackbone, ModalityAdaptiveBranch, GradientSafeRUPA, QuadSafeGate, MARUPA
-│   ├── ucf_train.py            # UCF-Crime End-to-End Trainer (DataParallel, Cosine LR, Top-K MIL)
-│   ├── ucf_test.py             # Standard multi-stream frame-level ROC-AUC & AP evaluator
-│   ├── ucf_eval_advanced.py    # Multi-stream Grid Search optimizer & post-processing evaluator
-│   ├── ucf_option.py           # Hyperparameter registry for UCF-Crime
-│   ├── xd_train.py             # XD-Violence Audio-Visual End-to-End Trainer
+│   ├── model.py                # Main models: MDTBackbone, ModalityAdaptiveBranch, GradientSafeRUPA, QuadSafeGate, MARUPA
+│   ├── ucf_train.py            # UCF-Crime Trainer (DataParallel, Cosine LR, Top-K MIL)
+│   ├── ucf_test.py             # Multi-stream frame-level ROC-AUC & AP evaluator
+│   ├── ucf_eval_advanced.py    # Multi-stream Grid Search post-processing optimizer
+│   ├── ucf_option.py           # Hyperparameters for UCF-Crime
+│   ├── xd_train.py             # XD-Violence Audio-Visual Trainer
 │   ├── xd_test.py              # XD-Violence Frame-level AP & ROC-AUC evaluator
-│   ├── xd_option.py            # Hyperparameter registry for XD-Violence
-│   ├── clip/                   # OpenAI CLIP backbone adapters & tokenizers
+│   ├── xd_option.py            # Hyperparameters for XD-Violence
 │   └── utils/
 │       ├── dataset.py          # UCFDataset & XDDataset (hash-to-plus matching, audio pairing)
 │       ├── losses.py           # topk_mil, clasm, consistency, bkg, fgtv_smooth, gather, residual
 │       ├── tools.py            # Gaussian filter, safe_load_checkpoint, batch masks
-│       └── ucf_detectionMAP.py # Temporal segment localization mAP@IoU calculation
+│       └── ucf_detectionMAP.py # Temporal segment mAP@IoU evaluation
 ├── MA-RUPA.ipynb               # Master Kaggle Notebook for execution on Dual Tesla T4
-└── HARDCORE_RESEARCH_SPEC.md   # THIS SPECIFICATION FILE
+└── HARDCORE_RESEARCH_SPEC.md   # THIS SPECIFICATION
 ```
 
 ---
 
 ## 8. Exact Kaggle Execution Commands
 
-### UCF-Crime SOTA Baseline Command (87.11% AUC):
+### UCF-Crime Baseline (87.11% AUC):
 ```bash
 python -u src/ucf_train.py \
   --train-list /kaggle/working/rupa_artifacts/ucf_train.csv \
@@ -243,7 +273,7 @@ python -u src/ucf_train.py \
   --smooth-sigma 1.0
 ```
 
-### XD-Violence Peak Multimodal Command (79.02% AP):
+### XD-Violence Multimodal Peak (79.02% AP):
 ```bash
 python -u src/xd_train.py \
   --train-list /kaggle/working/rupa_artifacts/xd_train.csv \
@@ -275,25 +305,4 @@ python -u src/xd_train.py \
   --temp 2.0 \
   --smooth-eval True \
   --smooth-sigma 1.5
-```
-
----
-
-## 9. The Core Prompt to Pass to Argon 4
-
-```text
-=== SYSTEM PROMPT FOR ADVANCED REASONING AI ===
-You are the Lead Deep Learning Architect reviewing the MA-RUPA project specification above.
-We have access to Kaggle GPU Dual Tesla T4 (32 GB combined VRAM), running PyTorch 2.x CUDA.
-Current status:
-- UCF-Crime has reached 87.11% ROC-AUC (AP 33.57%). Goal: >= 89.5% - 90.0% ROC-AUC.
-- XD-Violence has reached 79.02% AP (AUC 92.4%). Goal: >= 87.0% - 88.0% AP.
-- Temporal localization mAP@IoU is currently low (4.77%). Goal: >= 12% - 15%.
-
-Given the 5 core bottlenecks detailed in Section 5 and the 32 GB VRAM capacity:
-1. Conduct a rigorous theoretical critique of the current architecture. Which specific module or loss is the primary bottleneck preventing UCF-Crime from crossing 89% and XD-Violence from crossing 85%?
-2. Propose concrete mathematical equations and PyTorch code for the top 2 highest-leverage architectural upgrades (e.g. Latent Counterfactual Projection, Delay-Aware Temporal Audio Cross-Attention, or PCGrad Gradient Surgery).
-3. Specify exact hyperparameter schedules, loss weights, and validation checkpoints to guarantee monotonic convergence without prototype collapse or label saturation.
-Provide production-ready, drop-in PyTorch code blocks matching the existing codebase conventions in src/model.py and src/utils/losses.py.
-================================================
 ```
