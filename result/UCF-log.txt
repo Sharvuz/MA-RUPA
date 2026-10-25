@@ -1,0 +1,379 @@
+🚀 Bắt đầu huấn luyện End-to-End MA-RUPA trên UCF-Crime (SOTA_87_PROVEN) với GPU T4x2...
+
+[MA-RUPA] Training on device: cuda
+[Multi-GPU] Detected 2 GPUs (Tesla T4, Tesla T4). Activating DataParallel for T4x2!
+
+======================================================================
+[START] STARTING END-TO-END TRAINING FOR UCF-CRIME: 10 EPOCHS
+  Batch size: 64 (32 Normal + 32 Abnormal per batch, Interleaved)
+  Iters per epoch: 250 | Sample 1 crop per video: False
+======================================================================
+  [Epoch 1/10 Step 1280/16000 (8.0%)] Total: 8.3120 | MIL: 0.7620 CLASM: 4.1119 | Consist: 0.0099 | Aux: 0.8599 | omega: 0.25
+  [Epoch 1/10 Step 2560/16000 (16.0%)] Total: 6.7702 | MIL: 0.6249 CLASM: 3.4879 | Consist: 0.0059 | Aux: 0.8212 | omega: 0.25
+  [Epoch 1/10 Step 3840/16000 (24.0%)] Total: 5.5352 | MIL: 0.4187 CLASM: 3.0450 | Consist: 0.0303 | Aux: 0.7773 | omega: 0.25
+  [Epoch 1/10 Step 5120/16000 (32.0%)] Total: 4.4648 | MIL: 0.2069 CLASM: 2.6155 | Consist: 0.0466 | Aux: 0.6602 | omega: 0.25
+  [Epoch 1/10 Step 6400/16000 (40.0%)] Total: 4.1114 | MIL: 0.2122 CLASM: 2.4294 | Consist: 0.0489 | Aux: 0.5428 | omega: 0.25
+  [Epoch 1/10 Step 7680/16000 (48.0%)] Total: 4.2058 | MIL: 0.2521 CLASM: 2.4041 | Consist: 0.0368 | Aux: 0.4339 | omega: 0.25
+  [Epoch 1/10 Step 8960/16000 (56.0%)] Total: 3.6763 | MIL: 0.2326 CLASM: 2.1409 | Consist: 0.0376 | Aux: 0.3051 | omega: 0.25
+  [Epoch 1/10 Step 10240/16000 (64.0%)] Total: 3.3308 | MIL: 0.2297 CLASM: 1.8839 | Consist: 0.0310 | Aux: 0.3452 | omega: 0.25
+  [Epoch 1/10 Step 11520/16000 (72.0%)] Total: 2.7825 | MIL: 0.1933 CLASM: 1.5880 | Consist: 0.0354 | Aux: 0.2510 | omega: 0.25
+  [Epoch 1/10 Step 12800/16000 (80.0%)] Total: 2.8898 | MIL: 0.1637 CLASM: 1.6330 | Consist: 0.0464 | Aux: 0.1616 | omega: 0.25
+  [Epoch 1/10 Step 14080/16000 (88.0%)] Total: 2.6633 | MIL: 0.1172 CLASM: 1.5635 | Consist: 0.0317 | Aux: 0.2229 | omega: 0.25
+  [Epoch 1/10 Step 15360/16000 (96.0%)] Total: 3.1344 | MIL: 0.2611 CLASM: 1.7419 | Consist: 0.0320 | Aux: 0.2610 | omega: 0.25
+  [Epoch 1/10 Step 16000/16000 (100.0%)] Total: 2.8280 | MIL: 0.1952 CLASM: 1.6017 | Consist: 0.0321 | Aux: 0.2579 | omega: 0.25
+
+--- Epoch 1/10 Summary ---
+Loss Total: 4.5979 | MIL: 0.3419 | CLASM: 2.5266 | Consist: 0.0317 | Aux: 0.4805 | Gather: 0.6624 | Orth: 0.9670 | Res: 1.8572 | Smooth: 0.0214 | Omega: 0.25
+[Evaluation] Frame-level AUC (Routing): 85.84% | AP: 26.31%
+[Evaluation] Frame-level AUC (Detector): 85.49% | AP: 23.80%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.33% | AP: 28.01%
+[Evaluation] Frame-level AUC (Semantics RUPA): 85.66% | AP: 27.44%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 85.76% | AP: 25.60%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.78% | AP: 29.50%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 85.90% | AP: 27.21%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.89% | AP: 27.10%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.87% | AP: 27.21%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 85.87% | AP: 26.88%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.88% | AP: 26.97%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 85.38% | AP: 23.66%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 85.39% | AP: 23.71%
+  mAP@0.1 = 9.79%
+  mAP@0.2 = 7.56%
+  mAP@0.3 = 4.87%
+  mAP@0.4 = 4.10%
+  mAP@0.5 = 3.23%
+  Average mAP: 5.91%
+  ==> [BEST METRIC] Frame-level AUC: 85.90% | AP: 29.50%
+[BEST MODEL] Best AUC: 85.90% | AP: 29.50% saved to /kaggle/working/rupa_artifacts/model_ucf_best.pth
+  [Epoch 2/10 Step 1280/16000 (8.0%)] Total: 2.7078 | MIL: 0.1136 CLASM: 1.3179 | Consist: 0.0286 | Aux: 0.2206 | omega: 0.75
+  [Epoch 2/10 Step 2560/16000 (16.0%)] Total: 2.3322 | MIL: 0.0840 CLASM: 1.1210 | Consist: 0.0343 | Aux: 0.1024 | omega: 0.75
+  [Epoch 2/10 Step 3840/16000 (24.0%)] Total: 3.0825 | MIL: 0.0771 CLASM: 1.5300 | Consist: 0.0327 | Aux: 0.0819 | omega: 0.75
+  [Epoch 2/10 Step 5120/16000 (32.0%)] Total: 2.4744 | MIL: 0.1307 CLASM: 1.2166 | Consist: 0.0214 | Aux: 0.2116 | omega: 0.75
+  [Epoch 2/10 Step 6400/16000 (40.0%)] Total: 2.1230 | MIL: 0.0310 CLASM: 1.0851 | Consist: 0.0378 | Aux: 0.0685 | omega: 0.75
+  [Epoch 2/10 Step 7680/16000 (48.0%)] Total: 2.0319 | MIL: 0.0372 CLASM: 1.0278 | Consist: 0.0310 | Aux: 0.0969 | omega: 0.75
+  [Epoch 2/10 Step 8960/16000 (56.0%)] Total: 1.7001 | MIL: 0.0515 CLASM: 0.8353 | Consist: 0.0268 | Aux: 0.0640 | omega: 0.75
+  [Epoch 2/10 Step 10240/16000 (64.0%)] Total: 1.5998 | MIL: 0.0543 CLASM: 0.8120 | Consist: 0.0356 | Aux: 0.0557 | omega: 0.75
+  [Epoch 2/10 Step 11520/16000 (72.0%)] Total: 1.3813 | MIL: 0.0184 CLASM: 0.7029 | Consist: 0.0279 | Aux: 0.0342 | omega: 0.75
+  [Epoch 2/10 Step 12800/16000 (80.0%)] Total: 1.6498 | MIL: 0.0407 CLASM: 0.8269 | Consist: 0.0298 | Aux: 0.0753 | omega: 0.75
+  [Epoch 2/10 Step 14080/16000 (88.0%)] Total: 1.5330 | MIL: 0.0190 CLASM: 0.7841 | Consist: 0.0427 | Aux: 0.0285 | omega: 0.75
+  [Epoch 2/10 Step 15360/16000 (96.0%)] Total: 1.5028 | MIL: 0.0536 CLASM: 0.7331 | Consist: 0.0300 | Aux: 0.0786 | omega: 0.75
+  [Epoch 2/10 Step 16000/16000 (100.0%)] Total: 1.4874 | MIL: 0.0445 CLASM: 0.7050 | Consist: 0.0250 | Aux: 0.1146 | omega: 0.75
+
+--- Epoch 2/10 Summary ---
+Loss Total: 2.1102 | MIL: 0.0822 | CLASM: 1.0378 | Consist: 0.0302 | Aux: 0.1272 | Gather: 0.3058 | Orth: 0.9691 | Res: 0.6664 | Smooth: 0.0306 | Omega: 0.75
+[Evaluation] Frame-level AUC (Routing): 85.83% | AP: 29.97%
+[Evaluation] Frame-level AUC (Detector): 85.49% | AP: 25.67%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.25% | AP: 28.86%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.75% | AP: 30.46%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 85.77% | AP: 28.98%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.68% | AP: 29.55%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 85.65% | AP: 30.65%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.71% | AP: 30.59%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.41% | AP: 30.61%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 85.73% | AP: 30.31%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.73% | AP: 30.44%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 85.70% | AP: 25.90%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 85.71% | AP: 25.89%
+  mAP@0.1 = 7.08%
+  mAP@0.2 = 5.95%
+  mAP@0.3 = 4.49%
+  mAP@0.4 = 2.99%
+  mAP@0.5 = 2.60%
+  Average mAP: 4.62%
+  ==> [BEST METRIC] Frame-level AUC: 85.83% | AP: 30.65%
+  [Epoch 3/10 Step 1280/16000 (8.0%)] Total: 1.5123 | MIL: 0.0606 CLASM: 0.6715 | Consist: 0.0270 | Aux: 0.0625 | omega: 1.00
+  [Epoch 3/10 Step 2560/16000 (16.0%)] Total: 1.3686 | MIL: 0.0250 CLASM: 0.6292 | Consist: 0.0288 | Aux: 0.0482 | omega: 1.00
+  [Epoch 3/10 Step 3840/16000 (24.0%)] Total: 1.4552 | MIL: 0.0499 CLASM: 0.6951 | Consist: 0.0202 | Aux: 0.0311 | omega: 1.00
+  [Epoch 3/10 Step 5120/16000 (32.0%)] Total: 1.1817 | MIL: 0.0213 CLASM: 0.5373 | Consist: 0.0240 | Aux: 0.0324 | omega: 1.00
+  [Epoch 3/10 Step 6400/16000 (40.0%)] Total: 1.2634 | MIL: 0.0277 CLASM: 0.5825 | Consist: 0.0233 | Aux: 0.0700 | omega: 1.00
+  [Epoch 3/10 Step 7680/16000 (48.0%)] Total: 1.0098 | MIL: 0.0407 CLASM: 0.4533 | Consist: 0.0232 | Aux: 0.0921 | omega: 1.00
+  [Epoch 3/10 Step 8960/16000 (56.0%)] Total: 0.8606 | MIL: 0.0162 CLASM: 0.3690 | Consist: 0.0305 | Aux: 0.0171 | omega: 1.00
+  [Epoch 3/10 Step 10240/16000 (64.0%)] Total: 0.9213 | MIL: 0.0237 CLASM: 0.4047 | Consist: 0.0175 | Aux: 0.1884 | omega: 1.00
+  [Epoch 3/10 Step 11520/16000 (72.0%)] Total: 0.7997 | MIL: 0.0181 CLASM: 0.3435 | Consist: 0.0213 | Aux: 0.0888 | omega: 1.00
+  [Epoch 3/10 Step 12800/16000 (80.0%)] Total: 0.8400 | MIL: 0.0166 CLASM: 0.3682 | Consist: 0.0163 | Aux: 0.0562 | omega: 1.00
+  [Epoch 3/10 Step 14080/16000 (88.0%)] Total: 0.9920 | MIL: 0.0187 CLASM: 0.4380 | Consist: 0.0179 | Aux: 0.0551 | omega: 1.00
+  [Epoch 3/10 Step 15360/16000 (96.0%)] Total: 0.9165 | MIL: 0.0183 CLASM: 0.4055 | Consist: 0.0127 | Aux: 0.0466 | omega: 1.00
+  [Epoch 3/10 Step 16000/16000 (100.0%)] Total: 0.7332 | MIL: 0.0181 CLASM: 0.3114 | Consist: 0.0167 | Aux: 0.0458 | omega: 1.00
+
+--- Epoch 3/10 Summary ---
+Loss Total: 1.0888 | MIL: 0.0285 | CLASM: 0.4894 | Consist: 0.0226 | Aux: 0.0579 | Gather: 0.1390 | Orth: 1.0010 | Res: 0.1317 | Smooth: 0.0441 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.23% | AP: 30.83%
+[Evaluation] Frame-level AUC (Detector): 86.35% | AP: 30.62%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.63% | AP: 29.62%
+[Evaluation] Frame-level AUC (Semantics RUPA): 85.04% | AP: 28.71%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.35% | AP: 30.93%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 86.11% | AP: 30.14%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 86.07% | AP: 30.42%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 86.12% | AP: 30.53%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.83% | AP: 30.29%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.26% | AP: 30.74%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.22% | AP: 30.67%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 85.46% | AP: 30.08%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 85.44% | AP: 30.03%
+  mAP@0.1 = 7.46%
+  mAP@0.2 = 4.60%
+  mAP@0.3 = 2.81%
+  mAP@0.4 = 2.50%
+  mAP@0.5 = 2.44%
+  Average mAP: 3.96%
+  ==> [BEST METRIC] Frame-level AUC: 86.35% | AP: 30.93%
+[BEST MODEL] Best AUC: 86.35% | AP: 30.93% saved to /kaggle/working/rupa_artifacts/model_ucf_best.pth
+  [Epoch 4/10 Step 1280/16000 (8.0%)] Total: 0.7484 | MIL: 0.0167 CLASM: 0.3301 | Consist: 0.0291 | Aux: 0.0174 | omega: 1.00
+  [Epoch 4/10 Step 2560/16000 (16.0%)] Total: 0.7074 | MIL: 0.0172 CLASM: 0.3076 | Consist: 0.0186 | Aux: 0.0175 | omega: 1.00
+  [Epoch 4/10 Step 3840/16000 (24.0%)] Total: 0.6804 | MIL: 0.0175 CLASM: 0.2992 | Consist: 0.0192 | Aux: 0.0321 | omega: 1.00
+  [Epoch 4/10 Step 5120/16000 (32.0%)] Total: 0.8305 | MIL: 0.0224 CLASM: 0.3826 | Consist: 0.0207 | Aux: 0.0190 | omega: 1.00
+  [Epoch 4/10 Step 6400/16000 (40.0%)] Total: 0.8786 | MIL: 0.0161 CLASM: 0.4267 | Consist: 0.0166 | Aux: 0.0508 | omega: 1.00
+  [Epoch 4/10 Step 7680/16000 (48.0%)] Total: 0.6462 | MIL: 0.0153 CLASM: 0.2865 | Consist: 0.0145 | Aux: 0.0168 | omega: 1.00
+  [Epoch 4/10 Step 8960/16000 (56.0%)] Total: 0.7316 | MIL: 0.0157 CLASM: 0.3296 | Consist: 0.0137 | Aux: 0.0173 | omega: 1.00
+  [Epoch 4/10 Step 10240/16000 (64.0%)] Total: 0.6325 | MIL: 0.0159 CLASM: 0.2849 | Consist: 0.0120 | Aux: 0.0388 | omega: 1.00
+  [Epoch 4/10 Step 11520/16000 (72.0%)] Total: 0.6340 | MIL: 0.0146 CLASM: 0.2815 | Consist: 0.0156 | Aux: 0.0154 | omega: 1.00
+  [Epoch 4/10 Step 12800/16000 (80.0%)] Total: 0.6449 | MIL: 0.0155 CLASM: 0.2931 | Consist: 0.0109 | Aux: 0.0189 | omega: 1.00
+  [Epoch 4/10 Step 14080/16000 (88.0%)] Total: 0.6227 | MIL: 0.0166 CLASM: 0.2771 | Consist: 0.0157 | Aux: 0.0158 | omega: 1.00
+  [Epoch 4/10 Step 15360/16000 (96.0%)] Total: 0.6175 | MIL: 0.0152 CLASM: 0.2829 | Consist: 0.0139 | Aux: 0.0283 | omega: 1.00
+  [Epoch 4/10 Step 16000/16000 (100.0%)] Total: 0.6436 | MIL: 0.0166 CLASM: 0.2980 | Consist: 0.0125 | Aux: 0.0320 | omega: 1.00
+
+--- Epoch 4/10 Summary ---
+Loss Total: 0.7112 | MIL: 0.0182 | CLASM: 0.3214 | Consist: 0.0164 | Aux: 0.0424 | Gather: 0.0616 | Orth: 1.0099 | Res: 0.0326 | Smooth: 0.0507 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.88% | AP: 33.11%
+[Evaluation] Frame-level AUC (Detector): 86.01% | AP: 34.99%
+[Evaluation] Frame-level AUC (Semantics Backbone): 84.95% | AP: 29.40%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.66% | AP: 29.39%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.11% | AP: 33.77%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.65% | AP: 31.24%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 85.46% | AP: 31.86%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.56% | AP: 32.14%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.32% | AP: 31.72%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 85.86% | AP: 32.77%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.76% | AP: 32.56%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 84.41% | AP: 32.67%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 84.40% | AP: 32.53%
+  mAP@0.1 = 6.41%
+  mAP@0.2 = 4.39%
+  mAP@0.3 = 3.14%
+  mAP@0.4 = 2.79%
+  mAP@0.5 = 2.62%
+  Average mAP: 3.87%
+  ==> [BEST METRIC] Frame-level AUC: 86.11% | AP: 34.99%
+  [Epoch 5/10 Step 1280/16000 (8.0%)] Total: 0.6250 | MIL: 0.0145 CLASM: 0.2812 | Consist: 0.0203 | Aux: 0.0976 | omega: 1.00
+  [Epoch 5/10 Step 2560/16000 (16.0%)] Total: 0.6122 | MIL: 0.0163 CLASM: 0.2823 | Consist: 0.0130 | Aux: 0.0183 | omega: 1.00
+  [Epoch 5/10 Step 3840/16000 (24.0%)] Total: 0.6092 | MIL: 0.0163 CLASM: 0.2804 | Consist: 0.0118 | Aux: 0.0225 | omega: 1.00
+  [Epoch 5/10 Step 5120/16000 (32.0%)] Total: 0.6047 | MIL: 0.0153 CLASM: 0.2768 | Consist: 0.0138 | Aux: 0.0388 | omega: 1.00
+  [Epoch 5/10 Step 6400/16000 (40.0%)] Total: 0.6063 | MIL: 0.0167 CLASM: 0.2808 | Consist: 0.0163 | Aux: 0.0360 | omega: 1.00
+  [Epoch 5/10 Step 7680/16000 (48.0%)] Total: 0.5993 | MIL: 0.0147 CLASM: 0.2779 | Consist: 0.0155 | Aux: 0.0206 | omega: 1.00
+  [Epoch 5/10 Step 8960/16000 (56.0%)] Total: 0.5815 | MIL: 0.0154 CLASM: 0.2629 | Consist: 0.0162 | Aux: 0.0221 | omega: 1.00
+  [Epoch 5/10 Step 10240/16000 (64.0%)] Total: 0.5981 | MIL: 0.0172 CLASM: 0.2739 | Consist: 0.0132 | Aux: 0.0484 | omega: 1.00
+  [Epoch 5/10 Step 11520/16000 (72.0%)] Total: 0.5735 | MIL: 0.0166 CLASM: 0.2660 | Consist: 0.0129 | Aux: 0.0303 | omega: 1.00
+  [Epoch 5/10 Step 12800/16000 (80.0%)] Total: 0.5718 | MIL: 0.0160 CLASM: 0.2647 | Consist: 0.0118 | Aux: 0.0401 | omega: 1.00
+  [Epoch 5/10 Step 14080/16000 (88.0%)] Total: 0.5668 | MIL: 0.0146 CLASM: 0.2634 | Consist: 0.0125 | Aux: 0.0230 | omega: 1.00
+  [Epoch 5/10 Step 15360/16000 (96.0%)] Total: 0.5671 | MIL: 0.0153 CLASM: 0.2632 | Consist: 0.0157 | Aux: 0.0253 | omega: 1.00
+  [Epoch 5/10 Step 16000/16000 (100.0%)] Total: 0.5673 | MIL: 0.0151 CLASM: 0.2615 | Consist: 0.0137 | Aux: 0.0169 | omega: 1.00
+
+--- Epoch 5/10 Summary ---
+Loss Total: 0.5997 | MIL: 0.0156 | CLASM: 0.2755 | Consist: 0.0143 | Aux: 0.0328 | Gather: 0.0464 | Orth: 1.0092 | Res: 0.0112 | Smooth: 0.0508 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.13% | AP: 32.08%
+[Evaluation] Frame-level AUC (Detector): 86.18% | AP: 33.50%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.25% | AP: 28.49%
+[Evaluation] Frame-level AUC (Semantics RUPA): 83.85% | AP: 28.50%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.21% | AP: 32.65%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.84% | AP: 29.85%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 85.60% | AP: 30.93%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.75% | AP: 31.18%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.03% | AP: 30.76%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.03% | AP: 31.76%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.96% | AP: 31.55%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 84.48% | AP: 30.76%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 84.45% | AP: 30.66%
+  mAP@0.1 = 5.61%
+  mAP@0.2 = 4.46%
+  mAP@0.3 = 3.55%
+  mAP@0.4 = 3.02%
+  mAP@0.5 = 2.42%
+  Average mAP: 3.81%
+  ==> [BEST METRIC] Frame-level AUC: 86.21% | AP: 33.50%
+  [Epoch 6/10 Step 1280/16000 (8.0%)] Total: 0.5605 | MIL: 0.0143 CLASM: 0.2607 | Consist: 0.0135 | Aux: 0.0185 | omega: 1.00
+  [Epoch 6/10 Step 2560/16000 (16.0%)] Total: 0.5560 | MIL: 0.0147 CLASM: 0.2587 | Consist: 0.0125 | Aux: 0.0311 | omega: 1.00
+  [Epoch 6/10 Step 3840/16000 (24.0%)] Total: 0.5599 | MIL: 0.0157 CLASM: 0.2604 | Consist: 0.0124 | Aux: 0.0185 | omega: 1.00
+  [Epoch 6/10 Step 5120/16000 (32.0%)] Total: 0.5612 | MIL: 0.0148 CLASM: 0.2600 | Consist: 0.0127 | Aux: 0.0175 | omega: 1.00
+  [Epoch 6/10 Step 6400/16000 (40.0%)] Total: 0.5665 | MIL: 0.0153 CLASM: 0.2646 | Consist: 0.0145 | Aux: 0.0185 | omega: 1.00
+  [Epoch 6/10 Step 7680/16000 (48.0%)] Total: 0.5569 | MIL: 0.0143 CLASM: 0.2607 | Consist: 0.0158 | Aux: 0.0184 | omega: 1.00
+  [Epoch 6/10 Step 8960/16000 (56.0%)] Total: 0.5558 | MIL: 0.0144 CLASM: 0.2589 | Consist: 0.0122 | Aux: 0.0262 | omega: 1.00
+  [Epoch 6/10 Step 10240/16000 (64.0%)] Total: 0.5592 | MIL: 0.0146 CLASM: 0.2611 | Consist: 0.0124 | Aux: 0.0162 | omega: 1.00
+  [Epoch 6/10 Step 11520/16000 (72.0%)] Total: 0.5614 | MIL: 0.0155 CLASM: 0.2587 | Consist: 0.0142 | Aux: 0.0293 | omega: 1.00
+  [Epoch 6/10 Step 12800/16000 (80.0%)] Total: 0.5546 | MIL: 0.0146 CLASM: 0.2569 | Consist: 0.0143 | Aux: 0.0240 | omega: 1.00
+  [Epoch 6/10 Step 14080/16000 (88.0%)] Total: 0.5568 | MIL: 0.0147 CLASM: 0.2593 | Consist: 0.0114 | Aux: 0.0277 | omega: 1.00
+  [Epoch 6/10 Step 15360/16000 (96.0%)] Total: 0.5620 | MIL: 0.0145 CLASM: 0.2603 | Consist: 0.0163 | Aux: 0.0168 | omega: 1.00
+  [Epoch 6/10 Step 16000/16000 (100.0%)] Total: 0.5545 | MIL: 0.0150 CLASM: 0.2575 | Consist: 0.0123 | Aux: 0.0462 | omega: 1.00
+
+--- Epoch 6/10 Summary ---
+Loss Total: 0.5646 | MIL: 0.0147 | CLASM: 0.2627 | Consist: 0.0135 | Aux: 0.0268 | Gather: 0.0461 | Orth: 1.0085 | Res: 0.0060 | Smooth: 0.0479 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.11% | AP: 32.31%
+[Evaluation] Frame-level AUC (Detector): 86.15% | AP: 33.30%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.44% | AP: 27.44%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.67% | AP: 30.00%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.15% | AP: 32.85%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.93% | AP: 29.82%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 85.85% | AP: 31.72%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.92% | AP: 31.86%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.56% | AP: 31.67%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.04% | AP: 32.46%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.01% | AP: 32.25%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 82.79% | AP: 30.61%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 82.80% | AP: 30.54%
+  mAP@0.1 = 5.78%
+  mAP@0.2 = 4.64%
+  mAP@0.3 = 3.86%
+  mAP@0.4 = 3.41%
+  mAP@0.5 = 2.88%
+  Average mAP: 4.12%
+  ==> [BEST METRIC] Frame-level AUC: 86.15% | AP: 33.30%
+  [Epoch 7/10 Step 1280/16000 (8.0%)] Total: 0.5533 | MIL: 0.0148 CLASM: 0.2572 | Consist: 0.0117 | Aux: 0.0371 | omega: 1.00
+  [Epoch 7/10 Step 2560/16000 (16.0%)] Total: 0.5511 | MIL: 0.0145 CLASM: 0.2585 | Consist: 0.0120 | Aux: 0.0304 | omega: 1.00
+  [Epoch 7/10 Step 3840/16000 (24.0%)] Total: 0.5489 | MIL: 0.0143 CLASM: 0.2563 | Consist: 0.0138 | Aux: 0.0190 | omega: 1.00
+  [Epoch 7/10 Step 5120/16000 (32.0%)] Total: 0.5515 | MIL: 0.0147 CLASM: 0.2590 | Consist: 0.0135 | Aux: 0.0193 | omega: 1.00
+  [Epoch 7/10 Step 6400/16000 (40.0%)] Total: 0.5478 | MIL: 0.0142 CLASM: 0.2566 | Consist: 0.0135 | Aux: 0.0176 | omega: 1.00
+  [Epoch 7/10 Step 7680/16000 (48.0%)] Total: 0.5504 | MIL: 0.0144 CLASM: 0.2569 | Consist: 0.0115 | Aux: 0.0178 | omega: 1.00
+  [Epoch 7/10 Step 8960/16000 (56.0%)] Total: 0.5507 | MIL: 0.0151 CLASM: 0.2575 | Consist: 0.0125 | Aux: 0.0258 | omega: 1.00
+  [Epoch 7/10 Step 10240/16000 (64.0%)] Total: 0.5486 | MIL: 0.0144 CLASM: 0.2568 | Consist: 0.0115 | Aux: 0.0261 | omega: 1.00
+  [Epoch 7/10 Step 11520/16000 (72.0%)] Total: 0.5461 | MIL: 0.0141 CLASM: 0.2566 | Consist: 0.0129 | Aux: 0.0164 | omega: 1.00
+  [Epoch 7/10 Step 12800/16000 (80.0%)] Total: 0.5588 | MIL: 0.0147 CLASM: 0.2559 | Consist: 0.0122 | Aux: 0.1193 | omega: 1.00
+  [Epoch 7/10 Step 14080/16000 (88.0%)] Total: 0.5470 | MIL: 0.0145 CLASM: 0.2576 | Consist: 0.0113 | Aux: 0.0333 | omega: 1.00
+  [Epoch 7/10 Step 15360/16000 (96.0%)] Total: 0.5467 | MIL: 0.0141 CLASM: 0.2574 | Consist: 0.0133 | Aux: 0.0166 | omega: 1.00
+  [Epoch 7/10 Step 16000/16000 (100.0%)] Total: 0.5476 | MIL: 0.0143 CLASM: 0.2564 | Consist: 0.0141 | Aux: 0.0185 | omega: 1.00
+
+--- Epoch 7/10 Summary ---
+Loss Total: 0.5545 | MIL: 0.0145 | CLASM: 0.2595 | Consist: 0.0129 | Aux: 0.0242 | Gather: 0.0491 | Orth: 1.0067 | Res: 0.0048 | Smooth: 0.0448 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.05% | AP: 32.20%
+[Evaluation] Frame-level AUC (Detector): 86.04% | AP: 33.18%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.47% | AP: 28.41%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.40% | AP: 29.30%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.04% | AP: 32.68%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.94% | AP: 30.22%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 85.90% | AP: 31.65%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.96% | AP: 31.78%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.46% | AP: 31.56%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 85.99% | AP: 32.22%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.99% | AP: 32.06%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 80.12% | AP: 29.40%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 80.17% | AP: 29.26%
+  mAP@0.1 = 6.45%
+  mAP@0.2 = 4.55%
+  mAP@0.3 = 3.40%
+  mAP@0.4 = 2.56%
+  mAP@0.5 = 1.89%
+  Average mAP: 3.77%
+  ==> [BEST METRIC] Frame-level AUC: 86.05% | AP: 33.18%
+  [Epoch 8/10 Step 1280/16000 (8.0%)] Total: 0.5489 | MIL: 0.0146 CLASM: 0.2578 | Consist: 0.0130 | Aux: 0.0172 | omega: 1.00
+  [Epoch 8/10 Step 2560/16000 (16.0%)] Total: 0.5446 | MIL: 0.0144 CLASM: 0.2564 | Consist: 0.0114 | Aux: 0.0175 | omega: 1.00
+  [Epoch 8/10 Step 3840/16000 (24.0%)] Total: 0.5440 | MIL: 0.0140 CLASM: 0.2559 | Consist: 0.0128 | Aux: 0.0161 | omega: 1.00
+  [Epoch 8/10 Step 5120/16000 (32.0%)] Total: 0.5465 | MIL: 0.0143 CLASM: 0.2561 | Consist: 0.0115 | Aux: 0.0293 | omega: 1.00
+  [Epoch 8/10 Step 6400/16000 (40.0%)] Total: 0.5462 | MIL: 0.0142 CLASM: 0.2564 | Consist: 0.0124 | Aux: 0.0505 | omega: 1.00
+  [Epoch 8/10 Step 7680/16000 (48.0%)] Total: 0.5458 | MIL: 0.0143 CLASM: 0.2566 | Consist: 0.0125 | Aux: 0.0184 | omega: 1.00
+  [Epoch 8/10 Step 8960/16000 (56.0%)] Total: 0.5459 | MIL: 0.0143 CLASM: 0.2565 | Consist: 0.0115 | Aux: 0.0183 | omega: 1.00
+  [Epoch 8/10 Step 10240/16000 (64.0%)] Total: 0.5407 | MIL: 0.0143 CLASM: 0.2560 | Consist: 0.0124 | Aux: 0.0187 | omega: 1.00
+  [Epoch 8/10 Step 11520/16000 (72.0%)] Total: 0.5450 | MIL: 0.0142 CLASM: 0.2560 | Consist: 0.0130 | Aux: 0.0200 | omega: 1.00
+  [Epoch 8/10 Step 12800/16000 (80.0%)] Total: 0.5416 | MIL: 0.0141 CLASM: 0.2554 | Consist: 0.0117 | Aux: 0.0166 | omega: 1.00
+  [Epoch 8/10 Step 14080/16000 (88.0%)] Total: 0.5421 | MIL: 0.0140 CLASM: 0.2555 | Consist: 0.0133 | Aux: 0.0166 | omega: 1.00
+  [Epoch 8/10 Step 15360/16000 (96.0%)] Total: 0.5476 | MIL: 0.0147 CLASM: 0.2558 | Consist: 0.0119 | Aux: 0.0371 | omega: 1.00
+  [Epoch 8/10 Step 16000/16000 (100.0%)] Total: 0.5625 | MIL: 0.0144 CLASM: 0.2654 | Consist: 0.0124 | Aux: 0.0274 | omega: 1.00
+
+--- Epoch 8/10 Summary ---
+Loss Total: 0.5501 | MIL: 0.0143 | CLASM: 0.2585 | Consist: 0.0126 | Aux: 0.0236 | Gather: 0.0487 | Orth: 1.0061 | Res: 0.0042 | Smooth: 0.0431 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.24% | AP: 31.43%
+[Evaluation] Frame-level AUC (Detector): 86.15% | AP: 32.40%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.63% | AP: 27.94%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.56% | AP: 29.04%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.22% | AP: 31.93%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 86.06% | AP: 29.54%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 85.98% | AP: 30.84%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 86.07% | AP: 30.98%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.49% | AP: 30.73%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.19% | AP: 31.45%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.17% | AP: 31.28%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 77.86% | AP: 28.05%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 77.82% | AP: 27.95%
+  mAP@0.1 = 6.09%
+  mAP@0.2 = 4.67%
+  mAP@0.3 = 3.77%
+  mAP@0.4 = 3.21%
+  mAP@0.5 = 2.50%
+  Average mAP: 4.05%
+  ==> [BEST METRIC] Frame-level AUC: 86.24% | AP: 32.40%
+  [Epoch 9/10 Step 1280/16000 (8.0%)] Total: 0.5435 | MIL: 0.0142 CLASM: 0.2564 | Consist: 0.0122 | Aux: 0.0172 | omega: 1.00
+  [Epoch 9/10 Step 2560/16000 (16.0%)] Total: 0.5430 | MIL: 0.0143 CLASM: 0.2554 | Consist: 0.0110 | Aux: 0.0175 | omega: 1.00
+  [Epoch 9/10 Step 3840/16000 (24.0%)] Total: 0.5454 | MIL: 0.0142 CLASM: 0.2562 | Consist: 0.0136 | Aux: 0.0208 | omega: 1.00
+  [Epoch 9/10 Step 5120/16000 (32.0%)] Total: 0.5417 | MIL: 0.0141 CLASM: 0.2560 | Consist: 0.0125 | Aux: 0.0167 | omega: 1.00
+  [Epoch 9/10 Step 6400/16000 (40.0%)] Total: 0.5444 | MIL: 0.0141 CLASM: 0.2554 | Consist: 0.0124 | Aux: 0.0264 | omega: 1.00
+  [Epoch 9/10 Step 7680/16000 (48.0%)] Total: 0.5423 | MIL: 0.0141 CLASM: 0.2555 | Consist: 0.0112 | Aux: 0.0237 | omega: 1.00
+  [Epoch 9/10 Step 8960/16000 (56.0%)] Total: 0.5441 | MIL: 0.0142 CLASM: 0.2556 | Consist: 0.0119 | Aux: 0.0270 | omega: 1.00
+  [Epoch 9/10 Step 10240/16000 (64.0%)] Total: 0.5426 | MIL: 0.0142 CLASM: 0.2558 | Consist: 0.0114 | Aux: 0.0208 | omega: 1.00
+  [Epoch 9/10 Step 11520/16000 (72.0%)] Total: 0.5423 | MIL: 0.0143 CLASM: 0.2564 | Consist: 0.0113 | Aux: 0.0181 | omega: 1.00
+  [Epoch 9/10 Step 12800/16000 (80.0%)] Total: 0.5439 | MIL: 0.0142 CLASM: 0.2556 | Consist: 0.0126 | Aux: 0.0301 | omega: 1.00
+  [Epoch 9/10 Step 14080/16000 (88.0%)] Total: 0.5435 | MIL: 0.0146 CLASM: 0.2553 | Consist: 0.0130 | Aux: 0.0240 | omega: 1.00
+  [Epoch 9/10 Step 15360/16000 (96.0%)] Total: 0.5450 | MIL: 0.0143 CLASM: 0.2561 | Consist: 0.0142 | Aux: 0.0216 | omega: 1.00
+  [Epoch 9/10 Step 16000/16000 (100.0%)] Total: 0.5424 | MIL: 0.0141 CLASM: 0.2554 | Consist: 0.0138 | Aux: 0.0177 | omega: 1.00
+
+--- Epoch 9/10 Summary ---
+Loss Total: 0.5464 | MIL: 0.0143 | CLASM: 0.2574 | Consist: 0.0125 | Aux: 0.0245 | Gather: 0.0482 | Orth: 1.0058 | Res: 0.0029 | Smooth: 0.0420 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.24% | AP: 32.47%
+[Evaluation] Frame-level AUC (Detector): 86.16% | AP: 33.45%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.60% | AP: 28.44%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.45% | AP: 28.95%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.23% | AP: 33.02%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 86.05% | AP: 30.44%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 86.00% | AP: 31.78%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 86.09% | AP: 31.96%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.44% | AP: 31.67%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.18% | AP: 32.48%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.17% | AP: 32.29%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 77.39% | AP: 28.55%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 77.37% | AP: 28.39%
+  mAP@0.1 = 6.17%
+  mAP@0.2 = 4.80%
+  mAP@0.3 = 3.66%
+  mAP@0.4 = 2.85%
+  mAP@0.5 = 2.44%
+  Average mAP: 3.98%
+  ==> [BEST METRIC] Frame-level AUC: 86.24% | AP: 33.45%
+  [Epoch 10/10 Step 1280/16000 (8.0%)] Total: 0.5414 | MIL: 0.0142 CLASM: 0.2555 | Consist: 0.0122 | Aux: 0.0287 | omega: 1.00
+  [Epoch 10/10 Step 2560/16000 (16.0%)] Total: 0.5676 | MIL: 0.0144 CLASM: 0.2684 | Consist: 0.0123 | Aux: 0.0178 | omega: 1.00
+  [Epoch 10/10 Step 3840/16000 (24.0%)] Total: 0.5433 | MIL: 0.0145 CLASM: 0.2559 | Consist: 0.0114 | Aux: 0.0267 | omega: 1.00
+  [Epoch 10/10 Step 5120/16000 (32.0%)] Total: 0.5416 | MIL: 0.0142 CLASM: 0.2556 | Consist: 0.0116 | Aux: 0.0216 | omega: 1.00
+  [Epoch 10/10 Step 6400/16000 (40.0%)] Total: 0.5423 | MIL: 0.0142 CLASM: 0.2553 | Consist: 0.0138 | Aux: 0.0296 | omega: 1.00
+  [Epoch 10/10 Step 7680/16000 (48.0%)] Total: 0.5404 | MIL: 0.0141 CLASM: 0.2554 | Consist: 0.0117 | Aux: 0.0305 | omega: 1.00
+  [Epoch 10/10 Step 8960/16000 (56.0%)] Total: 0.5435 | MIL: 0.0144 CLASM: 0.2554 | Consist: 0.0138 | Aux: 0.0301 | omega: 1.00
+  [Epoch 10/10 Step 10240/16000 (64.0%)] Total: 0.5795 | MIL: 0.0142 CLASM: 0.2757 | Consist: 0.0131 | Aux: 0.0257 | omega: 1.00
+  [Epoch 10/10 Step 11520/16000 (72.0%)] Total: 0.5429 | MIL: 0.0141 CLASM: 0.2557 | Consist: 0.0117 | Aux: 0.0241 | omega: 1.00
+  [Epoch 10/10 Step 12800/16000 (80.0%)] Total: 0.5426 | MIL: 0.0141 CLASM: 0.2564 | Consist: 0.0120 | Aux: 0.0316 | omega: 1.00
+  [Epoch 10/10 Step 14080/16000 (88.0%)] Total: 0.5407 | MIL: 0.0144 CLASM: 0.2554 | Consist: 0.0117 | Aux: 0.0183 | omega: 1.00
+  [Epoch 10/10 Step 15360/16000 (96.0%)] Total: 0.5427 | MIL: 0.0142 CLASM: 0.2554 | Consist: 0.0130 | Aux: 0.0198 | omega: 1.00
+  [Epoch 10/10 Step 16000/16000 (100.0%)] Total: 0.5395 | MIL: 0.0141 CLASM: 0.2559 | Consist: 0.0114 | Aux: 0.0178 | omega: 1.00
+
+--- Epoch 10/10 Summary ---
+Loss Total: 0.5455 | MIL: 0.0142 | CLASM: 0.2573 | Consist: 0.0125 | Aux: 0.0251 | Gather: 0.0506 | Orth: 1.0057 | Res: 0.0032 | Smooth: 0.0414 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.29% | AP: 32.00%
+[Evaluation] Frame-level AUC (Detector): 86.18% | AP: 32.96%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.65% | AP: 28.28%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.54% | AP: 29.19%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.27% | AP: 32.55%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 86.09% | AP: 30.09%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA): 86.06% | AP: 31.39%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 86.15% | AP: 31.54%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.53% | AP: 31.28%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.23% | AP: 32.03%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.22% | AP: 31.86%
+[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): 76.18% | AP: 28.02%
+[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): 76.16% | AP: 27.86%
+  mAP@0.1 = 6.56%
+  mAP@0.2 = 5.09%
+  mAP@0.3 = 3.52%
+  mAP@0.4 = 3.08%
+  mAP@0.5 = 2.47%
+  Average mAP: 4.14%
+  ==> [BEST METRIC] Frame-level AUC: 86.29% | AP: 32.96%
+
+======================================================================
+[COMPLETE] UCF-CRIME TRAINING COMPLETE! FINAL BEST AUC: 86.35% | AP: 30.93%
+======================================================================
+
+
+✅ Huấn luyện UCF-Crime thành công! Model tốt nhất lưu tại: /kaggle/working/rupa_artifacts/model_ucf_best.pth

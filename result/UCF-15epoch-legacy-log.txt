@@ -1,0 +1,832 @@
+
+MA-RUPA: Modality-Adaptive Multiscale Prototype Alignment Network
+Weakly-Supervised Video Anomaly Detection (WS-VAD) on Kaggle GPU T4 x 2
+Architectural Innovations:
+
+End-to-End Trainable from Scratch: Completely removes dependency on pre-trained DSANet checkpoints and frozen two-stage warm-starting (main-lr=0.0 is removed).
+Dual GPU T4 x 2 Acceleration: Built-in torch.nn.DataParallel distributing batch workloads across both GPUs.
+Automatic Dataset Discovery with # -> + Resolution: Automatically finds pre-extracted visual and audio .npy features, unzips archives if needed, and maps all Kaggle # -> + renamed files.
+Multi-Scale Dilated Temporal Backbone (MDTBackbone): Windowed Attention + MDTP Dilations (1, 2, 4) with GLU.
+Modality-Adaptive Branch (ModalityAdaptiveBranch): Multimodal Audio-Visual fusion for XD-Violence and automatic Motion-Residual mode (
+) for silent UCF-Crime.
+Gradient-Safe Prototype Alignment (GradientSafeRUPA): Controlled gradient detachment preventing prototype gradient collapse.
+Quad-Stream Dynamic Safe Gate (QuadSafeGate): Dynamically routes 
+ with safe bias initialization (-4.5).
+add Codeadd Markdown
+# ========================= 1. SETUP ENVIRONMENT & GPU PREFLIGHT =========================
+import os, sys, shutil, subprocess, time
+from pathlib import Path
+import torch
+
+WORK = Path("/kaggle/working")
+INPUT = Path("/kaggle/input")
+REPO_DIR = WORK / "MA-RUPA"
+ARTIFACTS = WORK / "rupa_artifacts"
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
+
+# Clone or synchronize repository
+REPO_URL = "https://github.com/Sharvuz/MA-RUPA.git"
+REPO_REF = None  # Đặt tên branch nếu cần (ví dụ "main")
+
+if REPO_DIR.exists():
+    shutil.rmtree(REPO_DIR)
+
+print("📥 Cloning repository from GitHub...", flush=True)
+clone_cmd = ["git", "clone", "--depth", "1"]
+if REPO_REF:
+    clone_cmd += ["--branch", REPO_REF]
+clone_cmd += [REPO_URL, str(REPO_DIR)]
+subprocess.run(clone_cmd, check=True)
+
+os.chdir(REPO_DIR)
+
+# Install required dependencies (bao gồm ipdb và packaging để tránh lỗi)
+print("📦 Installing dependencies...", flush=True)
+subprocess.run([
+    sys.executable, "-m", "pip", "install", "-q",
+    "ftfy", "regex", "einops==0.8.0", "ipdb", "packaging", "scikit-learn", "pandas", "scipy"
+], check=True)
+
+# Auto-fix bất kỳ lỗi import cũ nào nếu repo chưa kịp push commit mới nhất
+adapter_file = REPO_DIR / "src/utils/adapter_modules.py"
+if adapter_file.exists():
+    txt = adapter_file.read_text(encoding="utf-8")
+    if "import ipdb" in txt:
+        txt = txt.replace("import ipdb\n", "").replace("import ipdb", "")
+        adapter_file.write_text(txt, encoding="utf-8")
+        print("🔧 Auto-hotfixed: Removed unused 'import ipdb' from adapter_modules.py")
+
+clip_file = REPO_DIR / "src/clip/clip.py"
+if clip_file.exists():
+    txt = clip_file.read_text(encoding="utf-8")
+    if "from pkg_resources import packaging" in txt:
+        txt = txt.replace(
+            "from pkg_resources import packaging",
+            "try:\n    import packaging.version as _pkg_version\nexcept ImportError:\n    _pkg_version = None"
+        )
+        clip_file.write_text(txt, encoding="utf-8")
+        print("🔧 Auto-hotfixed: Patched pkg_resources warning in clip.py")
+
+# Hardware & GPU Verification
+print("\n" + "=" * 60)
+print(f"PyTorch Version: {torch.__version__}")
+print(f"CUDA Available : {torch.cuda.is_available()}")
+gpu_count = torch.cuda.device_count()
+print(f"Detected GPUs  : {gpu_count}")
+for i in range(gpu_count):
+    print(f"  GPU [{i}]: {torch.cuda.get_device_name(i)}")
+
+if gpu_count >= 2:
+    print("🔥 Dual GPU T4 x 2 detected! DataParallel will be automatically activated.")
+elif gpu_count == 1:
+    print("⚡ Single GPU detected.")
+else:
+    print("⚠️ No GPU detected. Please set Accelerator = GPU T4 x 2 in Notebook Settings.")
+print("=" * 60)
+📥 Cloning repository from GitHub...
+Cloning into '/kaggle/working/MA-RUPA'...
+📦 Installing dependencies...
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 43.2/43.2 kB 1.2 MB/s eta 0:00:00
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 44.8/44.8 kB 1.9 MB/s eta 0:00:00
+
+============================================================
+PyTorch Version: 2.11.0+cu128
+CUDA Available : True
+Detected GPUs  : 2
+  GPU [0]: Tesla T4
+  GPU [1]: Tesla T4
+🔥 Dual GPU T4 x 2 detected! DataParallel will be automatically activated.
+============================================================
+add Codeadd Markdown
+# ========================= 2. RADAR: QUÉT DỮ LIỆU & XỬ LÝ '#' -> '+' =========================
+    file_map[fname] = full_path
+    
+    # Kaggle không cho phép ký tự '#' nên đổi thành '+'
+    if '+' in fname:
+        file_map[fname.replace('+', '#')] = full_path
+    if '#' in fname:
+        file_map[fname.replace('#', '+')] = full_path
+    if '_' in fname and ('+' in fname or '#' in fname):
+        file_map[fname.replace('+', '_').replace('#', '_')] = full_path
+
+
+def sync_csv_list(dataset_name, csv_rel_path, output_name):
+    """Đồng bộ đường dẫn CSV gốc sang đường dẫn thực tế trên Kaggle."""
+    input_csv = REPO_DIR / csv_rel_path
+    output_csv = ARTIFACTS / output_name
+    
+    if not input_csv.exists():
+        raise FileNotFoundError(f"Không tìm thấy file danh sách mẫu: {input_csv}")
+        
+    df = pd.read_csv(input_csv)
+    resolved_paths = []
+    missing_files = []
+    
+    for orig_path in df['path'].astype(str):
+        base_name = Path(orig_path).name
+        
+        # Danh sách các biến thể tên khả dĩ
+        candidates = [
+            base_name,
+            base_name.replace('#', '+'),
+            base_name.replace('+', '#'),
+            base_name.replace('#', '_'),
+            base_name.replace('#', '')
+        ]
+        
+        match = None
+        for cand in candidates:
+            if cand in file_map:
+                match = file_map[cand]
+                break
+                
+        if match:
+            resolved_paths.append(match)
+        else:
+            missing_files.append(base_name)
+            resolved_paths.append(orig_path)
+            
+    if missing_files:
+        print(f"⚠️ Cảnh báo: Thiếu {len(missing_files)}/{len(df)} files cho {output_name}. Ví dụ: {missing_files[:3]}")
+    else:
+        print(f"✅ Đồng bộ 100% {len(df)} file cho {output_name} thành công!")
+        
+    df['path'] = resolved_paths
+    df.to_csv(output_csv, index=False)
+    return output_csv
+
+# Đồng bộ danh sách cho cả 2 tập dữ liệu
+ucf_train_csv = sync_csv_list("ucf", "list/ucf_CLIP_rgb.csv", "ucf_train.csv")
+ucf_test_csv = sync_csv_list("ucf", "list/ucf_CLIP_rgbtest.csv", "ucf_test.csv")
+xd_train_csv = sync_csv_list("xd", "list/xd_CLIP_rgb.csv", "xd_train.csv")
+xd_test_csv = sync_csv_list("xd", "list/xd_CLIP_rgbtest.csv", "xd_test.csv")
+
+# Kiểm tra thử nghiệm 1 file bất kỳ
+sample_p = Path(pd.read_csv(ucf_train_csv).iloc[0]['path'])
+if sample_p.exists():
+    sample_feat = np.load(sample_p, mmap_mode='r')
+    print(f"\n🎯 Feature Preflight Test: {sample_p.name} | Shape: {sample_feat.shape}")
+🔍 Đang quét toàn bộ /kaggle/input và /kaggle/working để lập bản đồ feature (.npy)...
+📡 Radar phát hiện tổng cộng 67046 tệp tin .npy trên hệ thống!
+✅ Đồng bộ 100% 16100 file cho ucf_train.csv thành công!
+✅ Đồng bộ 100% 290 file cho ucf_test.csv thành công!
+✅ Đồng bộ 100% 39540 file cho xd_train.csv thành công!
+✅ Đồng bộ 100% 800 file cho xd_test.csv thành công!
+
+🎯 Feature Preflight Test: Abuse001_x264__0.npy | Shape: (170, 512)
+add Codeadd Markdown
+3. UCF-Crime Training (Single-Stage End-to-End on GPU T4 x 2)
+Mục tiêu hiệu năng: 89.5% – 90.0% Frame-level ROC-AUC (~40% AP).
+Cơ chế: Huấn luyện End-to-End từ đầu (không dùng DSANet cũ). Branch tự động kích hoạt Motion-Residual Mode (
+) bổ sung thông tin động học cho CCTV không có audio.
+Multi-GPU: Tự động kích hoạt DataParallel chia đều batch 64 (32 mẫu/GPU) trên 2x GPU T4.
+add Codeadd Markdown
+arrow_upwardarrow_downwarddelete
+# ========================= 3. TRAIN UCF-CRIME (GPU T4 x 2) =========================
+import subprocess, sys
+
+UCF_BATCH_SIZE = 64
+UCF_EPOCHS = 15
+UCF_LR = 1e-4  # Tinh chỉnh từ 2e-4 -> 1e-4 giúp hội tụ đều đặn, không bị bão hòa sớm
+SEED = 234
+
+ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
+ucf_checkpoint_path = ARTIFACTS / "checkpoint_ucf.pth"
+
+cmd_train_ucf = [
+    sys.executable, "-u", "src/ucf_train.py",
+    "--train-list", str(ucf_train_csv),
+    "--test-list", str(ucf_test_csv),
+    "--gt-path", "list/gt_ucf.npy",
+    "--gt-segment-path", "list/gt_segment_ucf.npy",
+    "--gt-label-path", "list/gt_label_ucf.npy",
+    "--batch-size", "64",
+    "--lr", "1e-4",
+    "--max-epoch", "15",          # 15 epochs để Cosine Scheduler hạ nhiệt tối ưu
+    "--curriculum-epochs", "3.0",
+    "--sampling", "topk",
+    "--topk-ratio", "16",         # CỐT LÕI: L/16 (~6.25% frames) chọn frame chuẩn xác, không ép nhầm frame normal
+    "--label-smoothing", "0.02",  # Giữ gradient luôn sống suốt 15 epochs
+    "--lambda-aux", "0.15",
+    "--lambda-smooth", "0.3",     # Làm mượt vừa phải, giữ ranh giới sắc nét
+    "--loss2_weight", "1.5",      # Tăng lực ép CLASM căn chỉnh 14 danh mục tội phạm
+    "--lambda-consistency", "1.0",# Khóa chặt Detector với Prototype Reconstruction
+    "--lambda-bkg", "0.5",        # Ép prototype chỉ tái tạo background Normal
+    "--seed", "234",
+    "--model-path", str(ucf_model_path),
+    "--checkpoint-path", str(ucf_checkpoint_path),
+    "--temp", "2.0",              # Nhiệt độ 2.0 tạo độ tương phản xác suất cực sắc nét
+    "--smooth-eval", "True",
+    "--smooth-sigma", "1.0"       # Sigma 1.0 chuẩn xác, không làm nhòe sự kiện chớp nhoáng
+]
+print("🚀 Bắt đầu huấn luyện End-to-End MA-RUPA trên UCF-Crime (Tối ưu SOTA 88-90% AUC) với GPU T4x2...\n", flush=True)
+
+process = subprocess.Popen(
+    cmd_train_ucf, cwd=REPO_DIR, text=True,
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1
+)
+
+for line in process.stdout:
+    print(line, end="")
+    sys.stdout.flush()
+
+ret_code = process.wait()
+if ret_code != 0:
+    raise RuntimeError(f"❌ Training UCF-Crime thất bại với mã lỗi {ret_code}")
+else:
+    print(f"\n✅ Huấn luyện UCF-Crime thành công! Model tốt nhất lưu tại: {ucf_model_path}")
+🚀 Bắt đầu huấn luyện End-to-End MA-RUPA trên UCF-Crime (Tối ưu SOTA 88-90% AUC) với GPU T4x2...
+
+[MA-RUPA] Training on device: cuda
+
+  0%|                                               | 0.00/335M [00:00<?, ?iB/s]
+  0%|                                       | 368k/335M [00:00<01:33, 3.75MiB/s]
+  1%|▌                                     | 4.85M/335M [00:00<00:11, 29.2MiB/s]
+  6%|██▏                                   | 19.0M/335M [00:00<00:03, 83.5MiB/s]
+  8%|███▏                                  | 27.9M/335M [00:00<00:03, 82.5MiB/s]
+ 13%|█████                                  | 43.5M/335M [00:00<00:02, 110MiB/s]
+ 16%|██████▎                                | 54.4M/335M [00:00<00:02, 112MiB/s]
+ 19%|███████▍                              | 65.1M/335M [00:00<00:02, 97.3MiB/s]
+ 22%|████████▍                             | 74.7M/335M [00:00<00:02, 92.9MiB/s]
+ 25%|█████████▌                            | 83.8M/335M [00:00<00:02, 90.6MiB/s]
+ 28%|██████████▋                           | 94.6M/335M [00:01<00:02, 96.8MiB/s]
+ 31%|████████████▏                          | 104M/335M [00:01<00:02, 90.7MiB/s]
+ 34%|█████████████▏                         | 113M/335M [00:01<00:02, 88.4MiB/s]
+ 36%|██████████████▏                        | 121M/335M [00:01<00:02, 85.4MiB/s]
+ 40%|███████████████▍                       | 133M/335M [00:01<00:02, 94.3MiB/s]
+ 42%|████████████████▌                      | 142M/335M [00:01<00:02, 94.6MiB/s]
+ 45%|█████████████████▋                     | 152M/335M [00:01<00:01, 98.5MiB/s]
+ 48%|██████████████████▊                    | 162M/335M [00:01<00:01, 99.6MiB/s]
+ 52%|████████████████████▋                   | 173M/335M [00:01<00:01, 105MiB/s]
+ 55%|██████████████████████                  | 184M/335M [00:02<00:01, 109MiB/s]
+ 58%|███████████████████████▎                | 195M/335M [00:02<00:01, 102MiB/s]
+ 61%|███████████████████████▊               | 205M/335M [00:02<00:01, 92.9MiB/s]
+ 64%|█████████████████████████              | 215M/335M [00:02<00:01, 95.9MiB/s]
+ 67%|██████████████████████████▏            | 224M/335M [00:02<00:01, 96.8MiB/s]
+ 70%|███████████████████████████▏           | 234M/335M [00:02<00:01, 96.6MiB/s]
+ 73%|████████████████████████████▍          | 244M/335M [00:02<00:00, 99.7MiB/s]
+ 76%|██████████████████████████████▎         | 254M/335M [00:02<00:00, 102MiB/s]
+ 79%|██████████████████████████████▊        | 264M/335M [00:02<00:00, 97.3MiB/s]
+ 82%|███████████████████████████████▊       | 273M/335M [00:03<00:00, 95.3MiB/s]
+ 84%|████████████████████████████████▉      | 282M/335M [00:03<00:00, 91.1MiB/s]
+ 87%|█████████████████████████████████▉     | 291M/335M [00:03<00:00, 90.3MiB/s]
+ 90%|███████████████████████████████████▏   | 302M/335M [00:03<00:00, 98.3MiB/s]
+ 93%|████████████████████████████████████▎  | 312M/335M [00:03<00:00, 86.8MiB/s]
+ 96%|█████████████████████████████████████▎ | 320M/335M [00:03<00:00, 87.1MiB/s]
+ 98%|██████████████████████████████████████▎| 329M/335M [00:03<00:00, 85.9MiB/s]
+100%|███████████████████████████████████████| 335M/335M [00:03<00:00, 93.2MiB/s]
+[Multi-GPU] Detected 2 GPUs (Tesla T4, Tesla T4). Activating DataParallel for T4x2!
+
+======================================================================
+[START] STARTING END-TO-END TRAINING FOR UCF-CRIME: 15 EPOCHS
+======================================================================
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 1/15 Step 1280/16000 (8.0%)] Total: 3.9121 | MIL: 0.2775 CLASM: 1.3194 | Consist: 0.0490 | Aux: 0.2675 | omega: 0.33
+  [Epoch 1/15 Step 2560/16000 (16.0%)] Total: 3.3279 | MIL: 0.2505 CLASM: 1.1228 | Consist: 0.0340 | Aux: 0.2178 | omega: 0.33
+  [Epoch 1/15 Step 3840/16000 (24.0%)] Total: 2.7129 | MIL: 0.2241 CLASM: 0.9032 | Consist: 0.0290 | Aux: 0.1856 | omega: 0.33
+  [Epoch 1/15 Step 5120/16000 (32.0%)] Total: 3.1788 | MIL: 0.2584 CLASM: 1.0811 | Consist: 0.0240 | Aux: 0.2086 | omega: 0.33
+  [Epoch 1/15 Step 6400/16000 (40.0%)] Total: 3.3080 | MIL: 0.3248 CLASM: 1.1196 | Consist: 0.0278 | Aux: 0.3581 | omega: 0.33
+  [Epoch 1/15 Step 7680/16000 (48.0%)] Total: 2.6268 | MIL: 0.2130 CLASM: 0.8525 | Consist: 0.0305 | Aux: 0.1897 | omega: 0.33
+  [Epoch 1/15 Step 8960/16000 (56.0%)] Total: 2.5712 | MIL: 0.1616 CLASM: 0.8676 | Consist: 0.0299 | Aux: 0.1392 | omega: 0.33
+  [Epoch 1/15 Step 10240/16000 (64.0%)] Total: 2.6405 | MIL: 0.1701 CLASM: 0.9165 | Consist: 0.0250 | Aux: 0.1467 | omega: 0.33
+  [Epoch 1/15 Step 11520/16000 (72.0%)] Total: 2.1976 | MIL: 0.2098 CLASM: 0.7118 | Consist: 0.0217 | Aux: 0.2043 | omega: 0.33
+  [Epoch 1/15 Step 12800/16000 (80.0%)] Total: 2.2944 | MIL: 0.1465 CLASM: 0.7849 | Consist: 0.0256 | Aux: 0.1119 | omega: 0.33
+  [Epoch 1/15 Step 14080/16000 (88.0%)] Total: 2.5042 | MIL: 0.2517 CLASM: 0.8496 | Consist: 0.0228 | Aux: 0.2411 | omega: 0.33
+  [Epoch 1/15 Step 15360/16000 (96.0%)] Total: 2.1388 | MIL: 0.1987 CLASM: 0.7028 | Consist: 0.0248 | Aux: 0.1968 | omega: 0.33
+  [Epoch 1/15 Step 16000/16000 (100.0%)] Total: 2.3314 | MIL: 0.1947 CLASM: 0.7960 | Consist: 0.0231 | Aux: 0.2058 | omega: 0.33
+
+--- Epoch 1/15 Summary ---
+Loss Total: 2.9345 | MIL: 0.2388 | CLASM: 0.9768 | Consist: 0.0289 | Aux: 0.2262 | Gather: 0.3633 | Omega: 0.33
+[Evaluation] Frame-level AUC (Routing): 85.56% | AP: 28.68%
+[Evaluation] Frame-level AUC (Detector): 85.54% | AP: 27.68%
+[Evaluation] Frame-level AUC (Semantics Backbone): 84.54% | AP: 26.59%
+[Evaluation] Frame-level AUC (Semantics RUPA): 85.71% | AP: 29.04%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 85.57% | AP: 28.50%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.16% | AP: 28.55%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 85.55% | AP: 28.05%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.55% | AP: 27.95%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.64% | AP: 28.06%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 85.53% | AP: 27.82%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.56% | AP: 28.68%
+  mAP@0.1 = 13.92%
+  mAP@0.2 = 8.77%
+  mAP@0.3 = 6.23%
+  mAP@0.4 = 3.79%
+  mAP@0.5 = 1.17%
+  Average mAP: 6.78%
+  ==> [BEST METRIC] Frame-level AUC: 85.71% | AP: 29.04%
+[BEST MODEL] Best AUC: 85.71% | AP: 29.04% saved to /kaggle/working/rupa_artifacts/model_ucf_best.pth
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 2/15 Step 1280/16000 (8.0%)] Total: 2.0683 | MIL: 0.1472 CLASM: 0.5311 | Consist: 0.0258 | Aux: 0.1274 | omega: 0.67
+  [Epoch 2/15 Step 2560/16000 (16.0%)] Total: 1.9310 | MIL: 0.1391 CLASM: 0.5021 | Consist: 0.0256 | Aux: 0.0794 | omega: 0.67
+  [Epoch 2/15 Step 3840/16000 (24.0%)] Total: 2.1693 | MIL: 0.1478 CLASM: 0.5621 | Consist: 0.0306 | Aux: 0.1268 | omega: 0.67
+  [Epoch 2/15 Step 5120/16000 (32.0%)] Total: 1.8539 | MIL: 0.1007 CLASM: 0.4845 | Consist: 0.0392 | Aux: 0.0666 | omega: 0.67
+  [Epoch 2/15 Step 6400/16000 (40.0%)] Total: 1.7886 | MIL: 0.1085 CLASM: 0.4687 | Consist: 0.0273 | Aux: 0.0736 | omega: 0.67
+  [Epoch 2/15 Step 7680/16000 (48.0%)] Total: 2.1313 | MIL: 0.1720 CLASM: 0.5496 | Consist: 0.0260 | Aux: 0.1192 | omega: 0.67
+  [Epoch 2/15 Step 8960/16000 (56.0%)] Total: 2.0532 | MIL: 0.2095 CLASM: 0.5049 | Consist: 0.0281 | Aux: 0.1642 | omega: 0.67
+  [Epoch 2/15 Step 10240/16000 (64.0%)] Total: 2.5611 | MIL: 0.1960 CLASM: 0.6718 | Consist: 0.0241 | Aux: 0.1695 | omega: 0.67
+  [Epoch 2/15 Step 11520/16000 (72.0%)] Total: 2.0757 | MIL: 0.1163 CLASM: 0.5434 | Consist: 0.0283 | Aux: 0.0726 | omega: 0.67
+  [Epoch 2/15 Step 12800/16000 (80.0%)] Total: 1.5825 | MIL: 0.1728 CLASM: 0.4065 | Consist: 0.0220 | Aux: 0.1765 | omega: 0.67
+  [Epoch 2/15 Step 14080/16000 (88.0%)] Total: 1.8361 | MIL: 0.1204 CLASM: 0.5000 | Consist: 0.0208 | Aux: 0.0973 | omega: 0.67
+  [Epoch 2/15 Step 15360/16000 (96.0%)] Total: 1.5888 | MIL: 0.1257 CLASM: 0.4231 | Consist: 0.0252 | Aux: 0.0748 | omega: 0.67
+  [Epoch 2/15 Step 16000/16000 (100.0%)] Total: 1.6987 | MIL: 0.1197 CLASM: 0.4662 | Consist: 0.0255 | Aux: 0.0851 | omega: 0.67
+
+--- Epoch 2/15 Summary ---
+Loss Total: 1.9594 | MIL: 0.1475 | CLASM: 0.5107 | Consist: 0.0276 | Aux: 0.1153 | Gather: 0.2038 | Omega: 0.67
+[Evaluation] Frame-level AUC (Routing): 86.33% | AP: 30.01%
+[Evaluation] Frame-level AUC (Detector): 86.15% | AP: 27.80%
+[Evaluation] Frame-level AUC (Semantics Backbone): 85.51% | AP: 29.28%
+[Evaluation] Frame-level AUC (Semantics RUPA): 85.56% | AP: 28.99%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.35% | AP: 29.68%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 86.18% | AP: 30.17%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 86.19% | AP: 29.19%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 86.24% | AP: 29.25%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 86.39% | AP: 29.19%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.25% | AP: 28.98%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.33% | AP: 30.01%
+  mAP@0.1 = 11.93%
+  mAP@0.2 = 8.50%
+  mAP@0.3 = 5.97%
+  mAP@0.4 = 4.04%
+  mAP@0.5 = 2.07%
+  Average mAP: 6.50%
+  ==> [BEST METRIC] Frame-level AUC: 86.39% | AP: 30.17%
+[BEST MODEL] Best AUC: 86.39% | AP: 30.17% saved to /kaggle/working/rupa_artifacts/model_ucf_best.pth
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 3/15 Step 1280/16000 (8.0%)] Total: 1.4342 | MIL: 0.1123 CLASM: 0.3520 | Consist: 0.0221 | Aux: 0.0825 | omega: 1.00
+  [Epoch 3/15 Step 2560/16000 (16.0%)] Total: 1.6347 | MIL: 0.1261 CLASM: 0.4199 | Consist: 0.0289 | Aux: 0.1237 | omega: 1.00
+  [Epoch 3/15 Step 3840/16000 (24.0%)] Total: 1.6156 | MIL: 0.1436 CLASM: 0.3900 | Consist: 0.0270 | Aux: 0.0938 | omega: 1.00
+  [Epoch 3/15 Step 5120/16000 (32.0%)] Total: 1.8404 | MIL: 0.1122 CLASM: 0.4493 | Consist: 0.0194 | Aux: 0.1077 | omega: 1.00
+  [Epoch 3/15 Step 6400/16000 (40.0%)] Total: 1.3563 | MIL: 0.1020 CLASM: 0.3442 | Consist: 0.0216 | Aux: 0.0706 | omega: 1.00
+  [Epoch 3/15 Step 7680/16000 (48.0%)] Total: 1.3929 | MIL: 0.1074 CLASM: 0.3593 | Consist: 0.0254 | Aux: 0.0698 | omega: 1.00
+  [Epoch 3/15 Step 8960/16000 (56.0%)] Total: 1.3959 | MIL: 0.1208 CLASM: 0.3549 | Consist: 0.0161 | Aux: 0.0916 | omega: 1.00
+  [Epoch 3/15 Step 10240/16000 (64.0%)] Total: 1.3596 | MIL: 0.1126 CLASM: 0.3505 | Consist: 0.0221 | Aux: 0.0684 | omega: 1.00
+  [Epoch 3/15 Step 11520/16000 (72.0%)] Total: 1.8111 | MIL: 0.1955 CLASM: 0.4611 | Consist: 0.0194 | Aux: 0.2037 | omega: 1.00
+  [Epoch 3/15 Step 12800/16000 (80.0%)] Total: 1.3848 | MIL: 0.1051 CLASM: 0.3636 | Consist: 0.0219 | Aux: 0.0897 | omega: 1.00
+  [Epoch 3/15 Step 14080/16000 (88.0%)] Total: 1.2420 | MIL: 0.0840 CLASM: 0.3408 | Consist: 0.0211 | Aux: 0.0623 | omega: 1.00
+  [Epoch 3/15 Step 15360/16000 (96.0%)] Total: 1.5683 | MIL: 0.1370 CLASM: 0.4478 | Consist: 0.0193 | Aux: 0.1485 | omega: 1.00
+  [Epoch 3/15 Step 16000/16000 (100.0%)] Total: 1.2134 | MIL: 0.0729 CLASM: 0.3403 | Consist: 0.0218 | Aux: 0.0656 | omega: 1.00
+
+--- Epoch 3/15 Summary ---
+Loss Total: 1.4332 | MIL: 0.1055 | CLASM: 0.3670 | Consist: 0.0226 | Aux: 0.0796 | Gather: 0.1221 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.60% | AP: 30.59%
+[Evaluation] Frame-level AUC (Detector): 85.84% | AP: 29.86%
+[Evaluation] Frame-level AUC (Semantics Backbone): 83.76% | AP: 26.92%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.86% | AP: 30.72%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.61% | AP: 30.45%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.26% | AP: 30.35%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 85.85% | AP: 30.95%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 86.00% | AP: 30.95%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 86.66% | AP: 31.02%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 86.05% | AP: 31.03%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.60% | AP: 30.59%
+  mAP@0.1 = 11.95%
+  mAP@0.2 = 7.74%
+  mAP@0.3 = 5.28%
+  mAP@0.4 = 4.42%
+  mAP@0.5 = 3.97%
+  Average mAP: 6.67%
+  ==> [BEST METRIC] Frame-level AUC: 86.66% | AP: 31.03%
+[BEST MODEL] Best AUC: 86.66% | AP: 31.03% saved to /kaggle/working/rupa_artifacts/model_ucf_best.pth
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 4/15 Step 1280/16000 (8.0%)] Total: 1.2525 | MIL: 0.0995 CLASM: 0.3344 | Consist: 0.0178 | Aux: 0.0625 | omega: 1.00
+  [Epoch 4/15 Step 2560/16000 (16.0%)] Total: 1.8200 | MIL: 0.2346 CLASM: 0.4194 | Consist: 0.0135 | Aux: 0.1927 | omega: 1.00
+  [Epoch 4/15 Step 3840/16000 (24.0%)] Total: 1.2017 | MIL: 0.0760 CLASM: 0.3381 | Consist: 0.0149 | Aux: 0.0632 | omega: 1.00
+  [Epoch 4/15 Step 5120/16000 (32.0%)] Total: 1.2791 | MIL: 0.1061 CLASM: 0.3355 | Consist: 0.0114 | Aux: 0.0824 | omega: 1.00
+  [Epoch 4/15 Step 6400/16000 (40.0%)] Total: 1.4075 | MIL: 0.1394 CLASM: 0.3997 | Consist: 0.0158 | Aux: 0.1205 | omega: 1.00
+  [Epoch 4/15 Step 7680/16000 (48.0%)] Total: 1.1818 | MIL: 0.0835 CLASM: 0.3280 | Consist: 0.0128 | Aux: 0.0719 | omega: 1.00
+  [Epoch 4/15 Step 8960/16000 (56.0%)] Total: 1.1672 | MIL: 0.0777 CLASM: 0.3289 | Consist: 0.0118 | Aux: 0.0594 | omega: 1.00
+  [Epoch 4/15 Step 10240/16000 (64.0%)] Total: 1.1621 | MIL: 0.0827 CLASM: 0.3289 | Consist: 0.0156 | Aux: 0.0600 | omega: 1.00
+  [Epoch 4/15 Step 11520/16000 (72.0%)] Total: 1.1707 | MIL: 0.0743 CLASM: 0.3307 | Consist: 0.0154 | Aux: 0.0626 | omega: 1.00
+  [Epoch 4/15 Step 12800/16000 (80.0%)] Total: 1.1330 | MIL: 0.0735 CLASM: 0.3240 | Consist: 0.0112 | Aux: 0.0595 | omega: 1.00
+  [Epoch 4/15 Step 14080/16000 (88.0%)] Total: 1.1379 | MIL: 0.0664 CLASM: 0.3193 | Consist: 0.0106 | Aux: 0.0596 | omega: 1.00
+  [Epoch 4/15 Step 15360/16000 (96.0%)] Total: 1.1375 | MIL: 0.0669 CLASM: 0.3291 | Consist: 0.0109 | Aux: 0.0587 | omega: 1.00
+  [Epoch 4/15 Step 16000/16000 (100.0%)] Total: 1.1459 | MIL: 0.0756 CLASM: 0.3240 | Consist: 0.0136 | Aux: 0.0599 | omega: 1.00
+
+--- Epoch 4/15 Summary ---
+Loss Total: 1.2112 | MIL: 0.0820 | CLASM: 0.3350 | Consist: 0.0149 | Aux: 0.0667 | Gather: 0.0813 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 87.02% | AP: 33.53%
+[Evaluation] Frame-level AUC (Detector): 86.33% | AP: 30.48%
+[Evaluation] Frame-level AUC (Semantics Backbone): 84.60% | AP: 26.74%
+[Evaluation] Frame-level AUC (Semantics RUPA): 84.85% | AP: 32.51%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 87.11% | AP: 32.76%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 85.97% | AP: 31.26%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 85.71% | AP: 33.43%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 85.83% | AP: 33.54%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 86.92% | AP: 33.57%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 85.84% | AP: 33.32%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 87.02% | AP: 33.53%
+  mAP@0.1 = 9.10%
+  mAP@0.2 = 6.37%
+  mAP@0.3 = 3.74%
+  mAP@0.4 = 2.68%
+  mAP@0.5 = 1.99%
+  Average mAP: 4.77%
+  ==> [BEST METRIC] Frame-level AUC: 87.11% | AP: 33.57%
+[BEST MODEL] Best AUC: 87.11% | AP: 33.57% saved to /kaggle/working/rupa_artifacts/model_ucf_best.pth
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 5/15 Step 1280/16000 (8.0%)] Total: 1.0951 | MIL: 0.0643 CLASM: 0.3203 | Consist: 0.0087 | Aux: 0.0601 | omega: 1.00
+  [Epoch 5/15 Step 2560/16000 (16.0%)] Total: 1.1008 | MIL: 0.0654 CLASM: 0.3217 | Consist: 0.0085 | Aux: 0.0582 | omega: 1.00
+  [Epoch 5/15 Step 3840/16000 (24.0%)] Total: 1.0961 | MIL: 0.0655 CLASM: 0.3202 | Consist: 0.0111 | Aux: 0.0589 | omega: 1.00
+  [Epoch 5/15 Step 5120/16000 (32.0%)] Total: 1.1089 | MIL: 0.0678 CLASM: 0.3191 | Consist: 0.0105 | Aux: 0.0590 | omega: 1.00
+  [Epoch 5/15 Step 6400/16000 (40.0%)] Total: 1.2622 | MIL: 0.0618 CLASM: 0.3553 | Consist: 0.0085 | Aux: 0.0604 | omega: 1.00
+  [Epoch 5/15 Step 7680/16000 (48.0%)] Total: 1.0805 | MIL: 0.0607 CLASM: 0.3174 | Consist: 0.0082 | Aux: 0.0588 | omega: 1.00
+  [Epoch 5/15 Step 8960/16000 (56.0%)] Total: 1.0700 | MIL: 0.0620 CLASM: 0.3156 | Consist: 0.0062 | Aux: 0.0600 | omega: 1.00
+  [Epoch 5/15 Step 10240/16000 (64.0%)] Total: 1.2780 | MIL: 0.0705 CLASM: 0.3557 | Consist: 0.0063 | Aux: 0.0596 | omega: 1.00
+  [Epoch 5/15 Step 11520/16000 (72.0%)] Total: 1.0829 | MIL: 0.0595 CLASM: 0.3161 | Consist: 0.0074 | Aux: 0.0580 | omega: 1.00
+  [Epoch 5/15 Step 12800/16000 (80.0%)] Total: 1.0949 | MIL: 0.0714 CLASM: 0.3184 | Consist: 0.0068 | Aux: 0.0582 | omega: 1.00
+  [Epoch 5/15 Step 14080/16000 (88.0%)] Total: 1.1241 | MIL: 0.0674 CLASM: 0.3250 | Consist: 0.0063 | Aux: 0.0572 | omega: 1.00
+  [Epoch 5/15 Step 15360/16000 (96.0%)] Total: 1.0902 | MIL: 0.0659 CLASM: 0.3162 | Consist: 0.0079 | Aux: 0.0592 | omega: 1.00
+  [Epoch 5/15 Step 16000/16000 (100.0%)] Total: 1.1177 | MIL: 0.0606 CLASM: 0.3215 | Consist: 0.0064 | Aux: 0.0578 | omega: 1.00
+
+--- Epoch 5/15 Summary ---
+Loss Total: 1.1070 | MIL: 0.0648 | CLASM: 0.3207 | Consist: 0.0089 | Aux: 0.0597 | Gather: 0.0611 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.45% | AP: 31.52%
+[Evaluation] Frame-level AUC (Detector): 83.63% | AP: 31.58%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.47% | AP: 23.08%
+[Evaluation] Frame-level AUC (Semantics RUPA): 78.02% | AP: 30.35%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 85.57% | AP: 31.88%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.43% | AP: 28.53%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 81.14% | AP: 31.89%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 81.85% | AP: 32.09%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.04% | AP: 32.57%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 82.04% | AP: 32.41%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.45% | AP: 31.52%
+  mAP@0.1 = 9.22%
+  mAP@0.2 = 6.46%
+  mAP@0.3 = 3.99%
+  mAP@0.4 = 2.38%
+  mAP@0.5 = 2.05%
+  Average mAP: 4.82%
+  ==> [BEST METRIC] Frame-level AUC: 85.57% | AP: 32.57%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 6/15 Step 1280/16000 (8.0%)] Total: 1.0613 | MIL: 0.0605 CLASM: 0.3135 | Consist: 0.0049 | Aux: 0.0582 | omega: 1.00
+  [Epoch 6/15 Step 2560/16000 (16.0%)] Total: 1.0736 | MIL: 0.0578 CLASM: 0.3149 | Consist: 0.0063 | Aux: 0.0579 | omega: 1.00
+  [Epoch 6/15 Step 3840/16000 (24.0%)] Total: 1.0717 | MIL: 0.0665 CLASM: 0.3156 | Consist: 0.0051 | Aux: 0.0603 | omega: 1.00
+  [Epoch 6/15 Step 5120/16000 (32.0%)] Total: 1.0513 | MIL: 0.0580 CLASM: 0.3134 | Consist: 0.0069 | Aux: 0.0582 | omega: 1.00
+  [Epoch 6/15 Step 6400/16000 (40.0%)] Total: 1.0454 | MIL: 0.0570 CLASM: 0.3128 | Consist: 0.0039 | Aux: 0.0577 | omega: 1.00
+  [Epoch 6/15 Step 7680/16000 (48.0%)] Total: 1.0510 | MIL: 0.0580 CLASM: 0.3130 | Consist: 0.0047 | Aux: 0.0570 | omega: 1.00
+  [Epoch 6/15 Step 8960/16000 (56.0%)] Total: 1.0440 | MIL: 0.0580 CLASM: 0.3138 | Consist: 0.0050 | Aux: 0.0576 | omega: 1.00
+  [Epoch 6/15 Step 10240/16000 (64.0%)] Total: 1.0538 | MIL: 0.0631 CLASM: 0.3122 | Consist: 0.0041 | Aux: 0.0591 | omega: 1.00
+  [Epoch 6/15 Step 11520/16000 (72.0%)] Total: 1.2409 | MIL: 0.0641 CLASM: 0.3503 | Consist: 0.0058 | Aux: 0.0579 | omega: 1.00
+  [Epoch 6/15 Step 12800/16000 (80.0%)] Total: 1.0360 | MIL: 0.0583 CLASM: 0.3129 | Consist: 0.0042 | Aux: 0.0587 | omega: 1.00
+  [Epoch 6/15 Step 14080/16000 (88.0%)] Total: 1.0494 | MIL: 0.0572 CLASM: 0.3125 | Consist: 0.0048 | Aux: 0.0574 | omega: 1.00
+  [Epoch 6/15 Step 15360/16000 (96.0%)] Total: 1.0382 | MIL: 0.0585 CLASM: 0.3110 | Consist: 0.0039 | Aux: 0.0576 | omega: 1.00
+  [Epoch 6/15 Step 16000/16000 (100.0%)] Total: 1.0683 | MIL: 0.0580 CLASM: 0.3183 | Consist: 0.0043 | Aux: 0.0569 | omega: 1.00
+
+--- Epoch 6/15 Summary ---
+Loss Total: 1.0651 | MIL: 0.0599 | CLASM: 0.3152 | Consist: 0.0051 | Aux: 0.0585 | Gather: 0.0499 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.22% | AP: 30.43%
+[Evaluation] Frame-level AUC (Detector): 84.97% | AP: 31.11%
+[Evaluation] Frame-level AUC (Semantics Backbone): 82.38% | AP: 22.69%
+[Evaluation] Frame-level AUC (Semantics RUPA): 83.23% | AP: 30.44%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.20% | AP: 30.86%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 84.51% | AP: 27.76%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 84.57% | AP: 31.22%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 84.74% | AP: 31.34%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 86.33% | AP: 31.47%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 84.72% | AP: 31.48%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.22% | AP: 30.43%
+  mAP@0.1 = 10.03%
+  mAP@0.2 = 6.33%
+  mAP@0.3 = 4.44%
+  mAP@0.4 = 2.86%
+  mAP@0.5 = 2.66%
+  Average mAP: 5.26%
+  ==> [BEST METRIC] Frame-level AUC: 86.33% | AP: 31.48%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 7/15 Step 1280/16000 (8.0%)] Total: 1.0360 | MIL: 0.0585 CLASM: 0.3128 | Consist: 0.0051 | Aux: 0.0586 | omega: 1.00
+  [Epoch 7/15 Step 2560/16000 (16.0%)] Total: 1.0357 | MIL: 0.0584 CLASM: 0.3105 | Consist: 0.0031 | Aux: 0.0578 | omega: 1.00
+  [Epoch 7/15 Step 3840/16000 (24.0%)] Total: 1.0310 | MIL: 0.0575 CLASM: 0.3105 | Consist: 0.0031 | Aux: 0.0570 | omega: 1.00
+  [Epoch 7/15 Step 5120/16000 (32.0%)] Total: 1.0373 | MIL: 0.0578 CLASM: 0.3111 | Consist: 0.0037 | Aux: 0.0576 | omega: 1.00
+  [Epoch 7/15 Step 6400/16000 (40.0%)] Total: 1.0447 | MIL: 0.0653 CLASM: 0.3121 | Consist: 0.0025 | Aux: 0.0583 | omega: 1.00
+  [Epoch 7/15 Step 7680/16000 (48.0%)] Total: 1.0302 | MIL: 0.0571 CLASM: 0.3113 | Consist: 0.0037 | Aux: 0.0576 | omega: 1.00
+  [Epoch 7/15 Step 8960/16000 (56.0%)] Total: 1.0293 | MIL: 0.0571 CLASM: 0.3104 | Consist: 0.0027 | Aux: 0.0571 | omega: 1.00
+  [Epoch 7/15 Step 10240/16000 (64.0%)] Total: 1.0561 | MIL: 0.0573 CLASM: 0.3134 | Consist: 0.0031 | Aux: 0.0573 | omega: 1.00
+  [Epoch 7/15 Step 11520/16000 (72.0%)] Total: 1.0347 | MIL: 0.0578 CLASM: 0.3106 | Consist: 0.0036 | Aux: 0.0585 | omega: 1.00
+  [Epoch 7/15 Step 12800/16000 (80.0%)] Total: 1.0267 | MIL: 0.0573 CLASM: 0.3108 | Consist: 0.0036 | Aux: 0.0570 | omega: 1.00
+  [Epoch 7/15 Step 14080/16000 (88.0%)] Total: 1.0327 | MIL: 0.0570 CLASM: 0.3104 | Consist: 0.0036 | Aux: 0.0571 | omega: 1.00
+  [Epoch 7/15 Step 15360/16000 (96.0%)] Total: 1.0281 | MIL: 0.0575 CLASM: 0.3102 | Consist: 0.0033 | Aux: 0.0574 | omega: 1.00
+  [Epoch 7/15 Step 16000/16000 (100.0%)] Total: 1.0212 | MIL: 0.0574 CLASM: 0.3102 | Consist: 0.0034 | Aux: 0.0569 | omega: 1.00
+
+--- Epoch 7/15 Summary ---
+Loss Total: 1.0425 | MIL: 0.0578 | CLASM: 0.3129 | Consist: 0.0035 | Aux: 0.0576 | Gather: 0.0426 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.73% | AP: 31.33%
+[Evaluation] Frame-level AUC (Detector): 84.80% | AP: 31.71%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.18% | AP: 23.82%
+[Evaluation] Frame-level AUC (Semantics RUPA): 77.99% | AP: 29.55%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 85.88% | AP: 31.74%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.32% | AP: 28.47%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 81.38% | AP: 30.74%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 81.88% | AP: 30.93%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 84.85% | AP: 31.29%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 82.13% | AP: 31.11%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.73% | AP: 31.33%
+  mAP@0.1 = 8.67%
+  mAP@0.2 = 5.85%
+  mAP@0.3 = 4.14%
+  mAP@0.4 = 2.56%
+  mAP@0.5 = 2.06%
+  Average mAP: 4.66%
+  ==> [BEST METRIC] Frame-level AUC: 85.88% | AP: 31.74%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 8/15 Step 1280/16000 (8.0%)] Total: 1.0246 | MIL: 0.0577 CLASM: 0.3101 | Consist: 0.0027 | Aux: 0.0572 | omega: 1.00
+  [Epoch 8/15 Step 2560/16000 (16.0%)] Total: 1.0327 | MIL: 0.0586 CLASM: 0.3100 | Consist: 0.0025 | Aux: 0.0577 | omega: 1.00
+  [Epoch 8/15 Step 3840/16000 (24.0%)] Total: 1.0284 | MIL: 0.0569 CLASM: 0.3100 | Consist: 0.0028 | Aux: 0.0572 | omega: 1.00
+  [Epoch 8/15 Step 5120/16000 (32.0%)] Total: 1.0353 | MIL: 0.0569 CLASM: 0.3133 | Consist: 0.0026 | Aux: 0.0568 | omega: 1.00
+  [Epoch 8/15 Step 6400/16000 (40.0%)] Total: 1.0289 | MIL: 0.0567 CLASM: 0.3091 | Consist: 0.0022 | Aux: 0.0570 | omega: 1.00
+  [Epoch 8/15 Step 7680/16000 (48.0%)] Total: 1.0253 | MIL: 0.0568 CLASM: 0.3093 | Consist: 0.0027 | Aux: 0.0570 | omega: 1.00
+  [Epoch 8/15 Step 8960/16000 (56.0%)] Total: 1.0285 | MIL: 0.0572 CLASM: 0.3106 | Consist: 0.0032 | Aux: 0.0571 | omega: 1.00
+  [Epoch 8/15 Step 10240/16000 (64.0%)] Total: 1.0202 | MIL: 0.0565 CLASM: 0.3098 | Consist: 0.0025 | Aux: 0.0567 | omega: 1.00
+  [Epoch 8/15 Step 11520/16000 (72.0%)] Total: 1.0210 | MIL: 0.0568 CLASM: 0.3100 | Consist: 0.0033 | Aux: 0.0570 | omega: 1.00
+  [Epoch 8/15 Step 12800/16000 (80.0%)] Total: 1.0211 | MIL: 0.0565 CLASM: 0.3100 | Consist: 0.0041 | Aux: 0.0568 | omega: 1.00
+  [Epoch 8/15 Step 14080/16000 (88.0%)] Total: 1.0125 | MIL: 0.0567 CLASM: 0.3102 | Consist: 0.0035 | Aux: 0.0572 | omega: 1.00
+  [Epoch 8/15 Step 15360/16000 (96.0%)] Total: 1.0197 | MIL: 0.0572 CLASM: 0.3090 | Consist: 0.0023 | Aux: 0.0572 | omega: 1.00
+  [Epoch 8/15 Step 16000/16000 (100.0%)] Total: 1.0200 | MIL: 0.0568 CLASM: 0.3100 | Consist: 0.0020 | Aux: 0.0568 | omega: 1.00
+
+--- Epoch 8/15 Summary ---
+Loss Total: 1.0283 | MIL: 0.0571 | CLASM: 0.3111 | Consist: 0.0028 | Aux: 0.0572 | Gather: 0.0393 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.78% | AP: 30.65%
+[Evaluation] Frame-level AUC (Detector): 84.81% | AP: 31.14%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.55% | AP: 23.17%
+[Evaluation] Frame-level AUC (Semantics RUPA): 79.06% | AP: 30.59%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 85.90% | AP: 31.19%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.79% | AP: 28.05%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.59% | AP: 31.38%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 82.91% | AP: 31.28%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.20% | AP: 31.78%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 83.04% | AP: 31.48%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.78% | AP: 30.65%
+  mAP@0.1 = 8.58%
+  mAP@0.2 = 5.61%
+  mAP@0.3 = 3.54%
+  mAP@0.4 = 2.18%
+  mAP@0.5 = 1.95%
+  Average mAP: 4.37%
+  ==> [BEST METRIC] Frame-level AUC: 85.90% | AP: 31.78%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 9/15 Step 1280/16000 (8.0%)] Total: 1.0264 | MIL: 0.0567 CLASM: 0.3102 | Consist: 0.0026 | Aux: 0.0572 | omega: 1.00
+  [Epoch 9/15 Step 2560/16000 (16.0%)] Total: 1.0131 | MIL: 0.0569 CLASM: 0.3097 | Consist: 0.0032 | Aux: 0.0567 | omega: 1.00
+  [Epoch 9/15 Step 3840/16000 (24.0%)] Total: 1.0116 | MIL: 0.0569 CLASM: 0.3092 | Consist: 0.0030 | Aux: 0.0569 | omega: 1.00
+  [Epoch 9/15 Step 5120/16000 (32.0%)] Total: 1.0221 | MIL: 0.0566 CLASM: 0.3093 | Consist: 0.0022 | Aux: 0.0568 | omega: 1.00
+  [Epoch 9/15 Step 6400/16000 (40.0%)] Total: 1.0102 | MIL: 0.0570 CLASM: 0.3087 | Consist: 0.0022 | Aux: 0.0565 | omega: 1.00
+  [Epoch 9/15 Step 7680/16000 (48.0%)] Total: 1.0194 | MIL: 0.0567 CLASM: 0.3089 | Consist: 0.0021 | Aux: 0.0569 | omega: 1.00
+  [Epoch 9/15 Step 8960/16000 (56.0%)] Total: 1.0215 | MIL: 0.0568 CLASM: 0.3108 | Consist: 0.0022 | Aux: 0.0569 | omega: 1.00
+  [Epoch 9/15 Step 10240/16000 (64.0%)] Total: 1.0233 | MIL: 0.0566 CLASM: 0.3093 | Consist: 0.0021 | Aux: 0.0569 | omega: 1.00
+  [Epoch 9/15 Step 11520/16000 (72.0%)] Total: 1.0168 | MIL: 0.0567 CLASM: 0.3088 | Consist: 0.0019 | Aux: 0.0572 | omega: 1.00
+  [Epoch 9/15 Step 12800/16000 (80.0%)] Total: 1.1025 | MIL: 0.0566 CLASM: 0.3256 | Consist: 0.0021 | Aux: 0.0574 | omega: 1.00
+  [Epoch 9/15 Step 14080/16000 (88.0%)] Total: 1.0190 | MIL: 0.0566 CLASM: 0.3090 | Consist: 0.0026 | Aux: 0.0564 | omega: 1.00
+  [Epoch 9/15 Step 15360/16000 (96.0%)] Total: 1.0213 | MIL: 0.0567 CLASM: 0.3091 | Consist: 0.0015 | Aux: 0.0565 | omega: 1.00
+  [Epoch 9/15 Step 16000/16000 (100.0%)] Total: 1.0097 | MIL: 0.0566 CLASM: 0.3087 | Consist: 0.0016 | Aux: 0.0567 | omega: 1.00
+
+--- Epoch 9/15 Summary ---
+Loss Total: 1.0245 | MIL: 0.0567 | CLASM: 0.3107 | Consist: 0.0022 | Aux: 0.0569 | Gather: 0.0381 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 86.01% | AP: 31.46%
+[Evaluation] Frame-level AUC (Detector): 85.61% | AP: 31.43%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.51% | AP: 23.49%
+[Evaluation] Frame-level AUC (Semantics RUPA): 79.26% | AP: 29.52%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.18% | AP: 31.94%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.91% | AP: 28.90%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.89% | AP: 31.77%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 83.19% | AP: 31.85%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.87% | AP: 32.26%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 83.32% | AP: 32.05%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 86.01% | AP: 31.46%
+  mAP@0.1 = 8.64%
+  mAP@0.2 = 5.32%
+  mAP@0.3 = 3.34%
+  mAP@0.4 = 2.22%
+  mAP@0.5 = 2.11%
+  Average mAP: 4.33%
+  ==> [BEST METRIC] Frame-level AUC: 86.18% | AP: 32.26%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 10/15 Step 1280/16000 (8.0%)] Total: 1.0135 | MIL: 0.0564 CLASM: 0.3090 | Consist: 0.0018 | Aux: 0.0567 | omega: 1.00
+  [Epoch 10/15 Step 2560/16000 (16.0%)] Total: 1.0176 | MIL: 0.0565 CLASM: 0.3093 | Consist: 0.0019 | Aux: 0.0566 | omega: 1.00
+  [Epoch 10/15 Step 3840/16000 (24.0%)] Total: 1.0258 | MIL: 0.0568 CLASM: 0.3123 | Consist: 0.0017 | Aux: 0.0567 | omega: 1.00
+  [Epoch 10/15 Step 5120/16000 (32.0%)] Total: 1.0179 | MIL: 0.0566 CLASM: 0.3092 | Consist: 0.0019 | Aux: 0.0569 | omega: 1.00
+  [Epoch 10/15 Step 6400/16000 (40.0%)] Total: 1.0153 | MIL: 0.0566 CLASM: 0.3097 | Consist: 0.0023 | Aux: 0.0568 | omega: 1.00
+  [Epoch 10/15 Step 7680/16000 (48.0%)] Total: 1.0110 | MIL: 0.0566 CLASM: 0.3089 | Consist: 0.0019 | Aux: 0.0569 | omega: 1.00
+  [Epoch 10/15 Step 8960/16000 (56.0%)] Total: 1.1063 | MIL: 0.0568 CLASM: 0.3252 | Consist: 0.0019 | Aux: 0.0572 | omega: 1.00
+  [Epoch 10/15 Step 10240/16000 (64.0%)] Total: 1.0109 | MIL: 0.0566 CLASM: 0.3088 | Consist: 0.0024 | Aux: 0.0577 | omega: 1.00
+  [Epoch 10/15 Step 11520/16000 (72.0%)] Total: 1.0134 | MIL: 0.0566 CLASM: 0.3088 | Consist: 0.0024 | Aux: 0.0571 | omega: 1.00
+  [Epoch 10/15 Step 12800/16000 (80.0%)] Total: 1.0106 | MIL: 0.0566 CLASM: 0.3090 | Consist: 0.0019 | Aux: 0.0570 | omega: 1.00
+  [Epoch 10/15 Step 14080/16000 (88.0%)] Total: 1.0114 | MIL: 0.0565 CLASM: 0.3089 | Consist: 0.0016 | Aux: 0.0568 | omega: 1.00
+  [Epoch 10/15 Step 15360/16000 (96.0%)] Total: 1.0119 | MIL: 0.0566 CLASM: 0.3089 | Consist: 0.0019 | Aux: 0.0574 | omega: 1.00
+  [Epoch 10/15 Step 16000/16000 (100.0%)] Total: 1.0125 | MIL: 0.0565 CLASM: 0.3089 | Consist: 0.0017 | Aux: 0.0565 | omega: 1.00
+
+--- Epoch 10/15 Summary ---
+Loss Total: 1.0214 | MIL: 0.0566 | CLASM: 0.3104 | Consist: 0.0020 | Aux: 0.0568 | Gather: 0.0368 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.83% | AP: 31.27%
+[Evaluation] Frame-level AUC (Detector): 85.46% | AP: 31.22%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.28% | AP: 23.26%
+[Evaluation] Frame-level AUC (Semantics RUPA): 78.81% | AP: 28.90%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 85.97% | AP: 31.76%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.61% | AP: 28.65%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.55% | AP: 31.15%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 82.78% | AP: 31.25%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.66% | AP: 31.65%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 82.97% | AP: 31.60%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.83% | AP: 31.27%
+  mAP@0.1 = 8.40%
+  mAP@0.2 = 5.77%
+  mAP@0.3 = 3.56%
+  mAP@0.4 = 2.45%
+  mAP@0.5 = 2.21%
+  Average mAP: 4.48%
+  ==> [BEST METRIC] Frame-level AUC: 85.97% | AP: 31.76%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 11/15 Step 1280/16000 (8.0%)] Total: 1.0072 | MIL: 0.0565 CLASM: 0.3088 | Consist: 0.0020 | Aux: 0.0567 | omega: 1.00
+  [Epoch 11/15 Step 2560/16000 (16.0%)] Total: 1.0094 | MIL: 0.0566 CLASM: 0.3086 | Consist: 0.0026 | Aux: 0.0568 | omega: 1.00
+  [Epoch 11/15 Step 3840/16000 (24.0%)] Total: 1.0072 | MIL: 0.0565 CLASM: 0.3086 | Consist: 0.0021 | Aux: 0.0566 | omega: 1.00
+  [Epoch 11/15 Step 5120/16000 (32.0%)] Total: 1.0119 | MIL: 0.0565 CLASM: 0.3085 | Consist: 0.0014 | Aux: 0.0568 | omega: 1.00
+  [Epoch 11/15 Step 6400/16000 (40.0%)] Total: 1.0099 | MIL: 0.0566 CLASM: 0.3088 | Consist: 0.0021 | Aux: 0.0568 | omega: 1.00
+  [Epoch 11/15 Step 7680/16000 (48.0%)] Total: 1.0121 | MIL: 0.0567 CLASM: 0.3085 | Consist: 0.0015 | Aux: 0.0568 | omega: 1.00
+  [Epoch 11/15 Step 8960/16000 (56.0%)] Total: 1.0142 | MIL: 0.0565 CLASM: 0.3088 | Consist: 0.0022 | Aux: 0.0565 | omega: 1.00
+  [Epoch 11/15 Step 10240/16000 (64.0%)] Total: 1.0133 | MIL: 0.0566 CLASM: 0.3089 | Consist: 0.0019 | Aux: 0.0566 | omega: 1.00
+  [Epoch 11/15 Step 11520/16000 (72.0%)] Total: 1.0113 | MIL: 0.0568 CLASM: 0.3087 | Consist: 0.0023 | Aux: 0.0567 | omega: 1.00
+  [Epoch 11/15 Step 12800/16000 (80.0%)] Total: 1.0128 | MIL: 0.0567 CLASM: 0.3087 | Consist: 0.0021 | Aux: 0.0564 | omega: 1.00
+  [Epoch 11/15 Step 14080/16000 (88.0%)] Total: 1.0084 | MIL: 0.0564 CLASM: 0.3082 | Consist: 0.0017 | Aux: 0.0565 | omega: 1.00
+  [Epoch 11/15 Step 15360/16000 (96.0%)] Total: 1.0790 | MIL: 0.0566 CLASM: 0.3201 | Consist: 0.0015 | Aux: 0.0570 | omega: 1.00
+  [Epoch 11/15 Step 16000/16000 (100.0%)] Total: 1.0532 | MIL: 0.0565 CLASM: 0.3156 | Consist: 0.0015 | Aux: 0.0567 | omega: 1.00
+
+--- Epoch 11/15 Summary ---
+Loss Total: 1.0166 | MIL: 0.0565 | CLASM: 0.3098 | Consist: 0.0018 | Aux: 0.0567 | Gather: 0.0359 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.83% | AP: 30.89%
+[Evaluation] Frame-level AUC (Detector): 85.51% | AP: 30.58%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.01% | AP: 22.97%
+[Evaluation] Frame-level AUC (Semantics RUPA): 78.90% | AP: 28.50%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.01% | AP: 31.31%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.54% | AP: 28.36%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.51% | AP: 30.65%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 82.90% | AP: 30.77%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.77% | AP: 31.19%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 83.03% | AP: 31.02%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.83% | AP: 30.89%
+  mAP@0.1 = 7.77%
+  mAP@0.2 = 5.23%
+  mAP@0.3 = 3.35%
+  mAP@0.4 = 2.21%
+  mAP@0.5 = 1.89%
+  Average mAP: 4.09%
+  ==> [BEST METRIC] Frame-level AUC: 86.01% | AP: 31.31%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 12/15 Step 1280/16000 (8.0%)] Total: 1.0094 | MIL: 0.0565 CLASM: 0.3084 | Consist: 0.0018 | Aux: 0.0565 | omega: 1.00
+  [Epoch 12/15 Step 2560/16000 (16.0%)] Total: 1.0077 | MIL: 0.0565 CLASM: 0.3086 | Consist: 0.0018 | Aux: 0.0566 | omega: 1.00
+  [Epoch 12/15 Step 3840/16000 (24.0%)] Total: 1.0060 | MIL: 0.0564 CLASM: 0.3085 | Consist: 0.0026 | Aux: 0.0567 | omega: 1.00
+  [Epoch 12/15 Step 5120/16000 (32.0%)] Total: 1.0032 | MIL: 0.0566 CLASM: 0.3082 | Consist: 0.0017 | Aux: 0.0566 | omega: 1.00
+  [Epoch 12/15 Step 6400/16000 (40.0%)] Total: 1.0138 | MIL: 0.0564 CLASM: 0.3084 | Consist: 0.0018 | Aux: 0.0565 | omega: 1.00
+  [Epoch 12/15 Step 7680/16000 (48.0%)] Total: 1.0096 | MIL: 0.0565 CLASM: 0.3082 | Consist: 0.0017 | Aux: 0.0566 | omega: 1.00
+  [Epoch 12/15 Step 8960/16000 (56.0%)] Total: 1.0116 | MIL: 0.0565 CLASM: 0.3085 | Consist: 0.0018 | Aux: 0.0569 | omega: 1.00
+  [Epoch 12/15 Step 10240/16000 (64.0%)] Total: 1.1007 | MIL: 0.0564 CLASM: 0.3288 | Consist: 0.0016 | Aux: 0.0564 | omega: 1.00
+  [Epoch 12/15 Step 11520/16000 (72.0%)] Total: 1.0037 | MIL: 0.0564 CLASM: 0.3084 | Consist: 0.0020 | Aux: 0.0566 | omega: 1.00
+  [Epoch 12/15 Step 12800/16000 (80.0%)] Total: 1.0061 | MIL: 0.0564 CLASM: 0.3084 | Consist: 0.0016 | Aux: 0.0568 | omega: 1.00
+  [Epoch 12/15 Step 14080/16000 (88.0%)] Total: 1.0092 | MIL: 0.0564 CLASM: 0.3084 | Consist: 0.0018 | Aux: 0.0566 | omega: 1.00
+  [Epoch 12/15 Step 15360/16000 (96.0%)] Total: 1.0100 | MIL: 0.0564 CLASM: 0.3086 | Consist: 0.0020 | Aux: 0.0566 | omega: 1.00
+  [Epoch 12/15 Step 16000/16000 (100.0%)] Total: 1.0081 | MIL: 0.0563 CLASM: 0.3085 | Consist: 0.0015 | Aux: 0.0566 | omega: 1.00
+
+--- Epoch 12/15 Summary ---
+Loss Total: 1.0148 | MIL: 0.0565 | CLASM: 0.3096 | Consist: 0.0017 | Aux: 0.0567 | Gather: 0.0351 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.98% | AP: 30.98%
+[Evaluation] Frame-level AUC (Detector): 85.59% | AP: 30.78%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.28% | AP: 23.02%
+[Evaluation] Frame-level AUC (Semantics RUPA): 79.10% | AP: 28.52%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.10% | AP: 31.49%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.69% | AP: 28.56%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.92% | AP: 30.93%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 83.04% | AP: 30.96%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.96% | AP: 31.43%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 83.25% | AP: 31.31%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.98% | AP: 30.98%
+  mAP@0.1 = 7.78%
+  mAP@0.2 = 5.17%
+  mAP@0.3 = 3.28%
+  mAP@0.4 = 1.98%
+  mAP@0.5 = 1.81%
+  Average mAP: 4.00%
+  ==> [BEST METRIC] Frame-level AUC: 86.10% | AP: 31.49%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 13/15 Step 1280/16000 (8.0%)] Total: 1.0056 | MIL: 0.0564 CLASM: 0.3087 | Consist: 0.0021 | Aux: 0.0566 | omega: 1.00
+  [Epoch 13/15 Step 2560/16000 (16.0%)] Total: 1.0082 | MIL: 0.0565 CLASM: 0.3085 | Consist: 0.0013 | Aux: 0.0567 | omega: 1.00
+  [Epoch 13/15 Step 3840/16000 (24.0%)] Total: 1.0070 | MIL: 0.0564 CLASM: 0.3085 | Consist: 0.0015 | Aux: 0.0566 | omega: 1.00
+  [Epoch 13/15 Step 5120/16000 (32.0%)] Total: 1.0053 | MIL: 0.0565 CLASM: 0.3085 | Consist: 0.0018 | Aux: 0.0567 | omega: 1.00
+  [Epoch 13/15 Step 6400/16000 (40.0%)] Total: 1.0020 | MIL: 0.0565 CLASM: 0.3082 | Consist: 0.0014 | Aux: 0.0564 | omega: 1.00
+  [Epoch 13/15 Step 7680/16000 (48.0%)] Total: 1.0050 | MIL: 0.0564 CLASM: 0.3083 | Consist: 0.0014 | Aux: 0.0566 | omega: 1.00
+  [Epoch 13/15 Step 8960/16000 (56.0%)] Total: 1.0132 | MIL: 0.0565 CLASM: 0.3087 | Consist: 0.0018 | Aux: 0.0566 | omega: 1.00
+  [Epoch 13/15 Step 10240/16000 (64.0%)] Total: 1.0007 | MIL: 0.0565 CLASM: 0.3084 | Consist: 0.0025 | Aux: 0.0565 | omega: 1.00
+  [Epoch 13/15 Step 11520/16000 (72.0%)] Total: 1.1151 | MIL: 0.0565 CLASM: 0.3337 | Consist: 0.0022 | Aux: 0.0568 | omega: 1.00
+  [Epoch 13/15 Step 12800/16000 (80.0%)] Total: 1.0098 | MIL: 0.0564 CLASM: 0.3085 | Consist: 0.0015 | Aux: 0.0567 | omega: 1.00
+  [Epoch 13/15 Step 14080/16000 (88.0%)] Total: 1.0088 | MIL: 0.0568 CLASM: 0.3083 | Consist: 0.0019 | Aux: 0.0569 | omega: 1.00
+  [Epoch 13/15 Step 15360/16000 (96.0%)] Total: 1.0072 | MIL: 0.0564 CLASM: 0.3087 | Consist: 0.0017 | Aux: 0.0566 | omega: 1.00
+  [Epoch 13/15 Step 16000/16000 (100.0%)] Total: 1.0096 | MIL: 0.0564 CLASM: 0.3085 | Consist: 0.0015 | Aux: 0.0565 | omega: 1.00
+
+--- Epoch 13/15 Summary ---
+Loss Total: 1.0134 | MIL: 0.0565 | CLASM: 0.3094 | Consist: 0.0017 | Aux: 0.0566 | Gather: 0.0349 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.95% | AP: 31.04%
+[Evaluation] Frame-level AUC (Detector): 85.57% | AP: 30.71%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.28% | AP: 23.08%
+[Evaluation] Frame-level AUC (Semantics RUPA): 78.73% | AP: 28.20%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.08% | AP: 31.51%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.65% | AP: 28.60%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.71% | AP: 30.77%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 82.96% | AP: 30.87%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.86% | AP: 31.28%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 83.15% | AP: 31.23%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.95% | AP: 31.04%
+  mAP@0.1 = 7.79%
+  mAP@0.2 = 5.21%
+  mAP@0.3 = 3.31%
+  mAP@0.4 = 1.98%
+  mAP@0.5 = 1.79%
+  Average mAP: 4.02%
+  ==> [BEST METRIC] Frame-level AUC: 86.08% | AP: 31.51%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 14/15 Step 2560/16000 (16.0%)] Total: 1.0092 | MIL: 0.0565 CLASM: 0.3085 | Consist: 0.0015 | Aux: 0.0566 | omega: 1.00
+  [Epoch 14/15 Step 3840/16000 (24.0%)] Total: 1.0035 | MIL: 0.0566 CLASM: 0.3082 | Consist: 0.0021 | Aux: 0.0567 | omega: 1.00
+  [Epoch 14/15 Step 5120/16000 (32.0%)] Total: 1.0104 | MIL: 0.0563 CLASM: 0.3083 | Consist: 0.0012 | Aux: 0.0565 | omega: 1.00
+  [Epoch 14/15 Step 6400/16000 (40.0%)] Total: 1.0021 | MIL: 0.0564 CLASM: 0.3082 | Consist: 0.0022 | Aux: 0.0566 | omega: 1.00
+  [Epoch 14/15 Step 7680/16000 (48.0%)] Total: 1.0102 | MIL: 0.0565 CLASM: 0.3082 | Consist: 0.0016 | Aux: 0.0566 | omega: 1.00
+  [Epoch 14/15 Step 8960/16000 (56.0%)] Total: 1.0081 | MIL: 0.0564 CLASM: 0.3083 | Consist: 0.0013 | Aux: 0.0563 | omega: 1.00
+  [Epoch 14/15 Step 10240/16000 (64.0%)] Total: 1.0110 | MIL: 0.0566 CLASM: 0.3083 | Consist: 0.0015 | Aux: 0.0569 | omega: 1.00
+  [Epoch 14/15 Step 11520/16000 (72.0%)] Total: 1.0030 | MIL: 0.0565 CLASM: 0.3084 | Consist: 0.0019 | Aux: 0.0569 | omega: 1.00
+  [Epoch 14/15 Step 12800/16000 (80.0%)] Total: 1.0091 | MIL: 0.0564 CLASM: 0.3084 | Consist: 0.0016 | Aux: 0.0566 | omega: 1.00
+  [Epoch 14/15 Step 14080/16000 (88.0%)] Total: 1.0082 | MIL: 0.0564 CLASM: 0.3083 | Consist: 0.0014 | Aux: 0.0566 | omega: 1.00
+  [Epoch 14/15 Step 15360/16000 (96.0%)] Total: 1.0060 | MIL: 0.0565 CLASM: 0.3085 | Consist: 0.0018 | Aux: 0.0567 | omega: 1.00
+  [Epoch 14/15 Step 16000/16000 (100.0%)] Total: 1.0072 | MIL: 0.0565 CLASM: 0.3083 | Consist: 0.0014 | Aux: 0.0569 | omega: 1.00
+
+--- Epoch 14/15 Summary ---
+Loss Total: 1.0124 | MIL: 0.0565 | CLASM: 0.3092 | Consist: 0.0016 | Aux: 0.0566 | Gather: 0.0348 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.98% | AP: 31.04%
+[Evaluation] Frame-level AUC (Detector): 85.56% | AP: 30.69%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.38% | AP: 22.96%
+[Evaluation] Frame-level AUC (Semantics RUPA): 78.90% | AP: 28.23%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.07% | AP: 31.49%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.70% | AP: 28.58%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.75% | AP: 30.76%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 82.99% | AP: 30.86%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.89% | AP: 31.27%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 83.16% | AP: 31.23%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.98% | AP: 31.04%
+  mAP@0.1 = 7.72%
+  mAP@0.2 = 5.20%
+  mAP@0.3 = 3.09%
+  mAP@0.4 = 2.00%
+  mAP@0.5 = 1.77%
+  Average mAP: 3.95%
+  ==> [BEST METRIC] Frame-level AUC: 86.07% | AP: 31.49%
+/usr/local/lib/python3.13/dist-packages/torch/autograd/function.py:596: UserWarning: Was asked to gather along dimension 0, but all input tensors were scalars; will instead unsqueeze and return a vector.
+  return super().apply(*args, **kwargs)  # type: ignore[misc]
+  [Epoch 15/15 Step 1280/16000 (8.0%)] Total: 1.0076 | MIL: 0.0563 CLASM: 0.3084 | Consist: 0.0016 | Aux: 0.0566 | omega: 1.00
+  [Epoch 15/15 Step 2560/16000 (16.0%)] Total: 1.0753 | MIL: 0.0565 CLASM: 0.3206 | Consist: 0.0019 | Aux: 0.0566 | omega: 1.00
+  [Epoch 15/15 Step 3840/16000 (24.0%)] Total: 1.0060 | MIL: 0.0564 CLASM: 0.3082 | Consist: 0.0014 | Aux: 0.0565 | omega: 1.00
+  [Epoch 15/15 Step 5120/16000 (32.0%)] Total: 1.0081 | MIL: 0.0564 CLASM: 0.3082 | Consist: 0.0012 | Aux: 0.0566 | omega: 1.00
+  [Epoch 15/15 Step 6400/16000 (40.0%)] Total: 1.0164 | MIL: 0.0565 CLASM: 0.3088 | Consist: 0.0014 | Aux: 0.0565 | omega: 1.00
+  [Epoch 15/15 Step 7680/16000 (48.0%)] Total: 1.0045 | MIL: 0.0566 CLASM: 0.3083 | Consist: 0.0018 | Aux: 0.0566 | omega: 1.00
+  [Epoch 15/15 Step 8960/16000 (56.0%)] Total: 1.0044 | MIL: 0.0563 CLASM: 0.3084 | Consist: 0.0017 | Aux: 0.0568 | omega: 1.00
+  [Epoch 15/15 Step 10240/16000 (64.0%)] Total: 1.0093 | MIL: 0.0565 CLASM: 0.3089 | Consist: 0.0013 | Aux: 0.0568 | omega: 1.00
+  [Epoch 15/15 Step 11520/16000 (72.0%)] Total: 1.0075 | MIL: 0.0565 CLASM: 0.3080 | Consist: 0.0012 | Aux: 0.0567 | omega: 1.00
+  [Epoch 15/15 Step 12800/16000 (80.0%)] Total: 1.0079 | MIL: 0.0564 CLASM: 0.3084 | Consist: 0.0019 | Aux: 0.0564 | omega: 1.00
+  [Epoch 15/15 Step 14080/16000 (88.0%)] Total: 1.0051 | MIL: 0.0565 CLASM: 0.3080 | Consist: 0.0015 | Aux: 0.0567 | omega: 1.00
+  [Epoch 15/15 Step 15360/16000 (96.0%)] Total: 1.0027 | MIL: 0.0565 CLASM: 0.3083 | Consist: 0.0015 | Aux: 0.0569 | omega: 1.00
+  [Epoch 15/15 Step 16000/16000 (100.0%)] Total: 1.0122 | MIL: 0.0565 CLASM: 0.3082 | Consist: 0.0011 | Aux: 0.0564 | omega: 1.00
+
+--- Epoch 15/15 Summary ---
+Loss Total: 1.0119 | MIL: 0.0565 | CLASM: 0.3092 | Consist: 0.0016 | Aux: 0.0566 | Gather: 0.0346 | Omega: 1.00
+[Evaluation] Frame-level AUC (Routing): 85.99% | AP: 30.97%
+[Evaluation] Frame-level AUC (Detector): 85.56% | AP: 30.62%
+[Evaluation] Frame-level AUC (Semantics Backbone): 81.43% | AP: 23.00%
+[Evaluation] Frame-level AUC (Semantics RUPA): 79.00% | AP: 28.27%
+[Evaluation] Frame-level AUC (Ensemble Routing+Detector): 86.08% | AP: 31.41%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): 83.72% | AP: 28.56%
+[Evaluation] Frame-level AUC (Ensemble Routing+Semantics RUPA - SOTA): 82.81% | AP: 30.74%
+[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): 83.00% | AP: 30.82%
+[Evaluation] Frame-level AUC (Geometric Mean Filtered): 85.90% | AP: 31.25%
+[Evaluation] Frame-level AUC (Tri-Stream Ensemble): 83.20% | AP: 31.21%
+[Evaluation] Frame-level AUC (Hierarchical Refined): 85.99% | AP: 30.97%
+  mAP@0.1 = 7.62%
+  mAP@0.2 = 5.23%
+  mAP@0.3 = 3.10%
+  mAP@0.4 = 1.97%
+  mAP@0.5 = 1.78%
+  Average mAP: 3.94%
+  ==> [BEST METRIC] Frame-level AUC: 86.08% | AP: 31.41%
+
+======================================================================
+[COMPLETE] UCF-CRIME TRAINING COMPLETE! FINAL BEST AUC: 87.11% | AP: 33.57%
+======================================================================
+
+
+✅ Huấn luyện UCF-Crime thành công! Model tốt nhất lưu tại: /kaggle/working/rupa_artifacts/model_ucf_best.pth
