@@ -56,7 +56,7 @@ class Prototype_Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, prototype_token):
+    def forward(self, x, prototype_token, slot_mask=None):
         B, N, C = x.shape
         prototype_num = prototype_token.shape[1]
         # prototype_token = prototype_token.repeat((B, 1, 1))
@@ -68,6 +68,8 @@ class Prototype_Attention(nn.Module):
         k = torch.nn.functional.normalize(k, dim=-1)
         attn = (q @ k.transpose(-2, -1)) * self.learn_scale
         attn = F.relu(attn)
+        if slot_mask is not None:
+            attn = attn * slot_mask.unsqueeze(1).unsqueeze(2).to(attn.dtype)
         attn = self.attn_drop(attn)
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -75,12 +77,15 @@ class Prototype_Attention(nn.Module):
         return x, attn
 
 class Aggregation_Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 slot_competition: bool = True):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
+        self.slot_competition = slot_competition
+        self.slot_log_scale = nn.Parameter(torch.tensor(2.3026))  # ~exp(2.3026) = 10.0 cosine temperature
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
         # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -94,8 +99,18 @@ class Aggregation_Attention(nn.Module):
         q = self.q(x).reshape(B, T, 1, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)[0]
         kv = self.kv(y).reshape(B, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         k, v = kv[0], kv[1]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attnmap = attn.softmax(dim=-1)
+        if self.slot_competition and T > 1:
+            # Slot-Competitive Cosine Attention: prototypes compete along slot dim (-2)
+            # so distinct slots partition diverse normal background modes instead of rank-1 collapse
+            q_norm = F.normalize(q.float(), dim=-1).to(x.dtype)
+            k_norm = F.normalize(k.float(), dim=-1).to(x.dtype)
+            slot_scale = self.slot_log_scale.exp().clamp(2.0, 20.0).to(x.dtype)
+            attn_logits = (q_norm @ k_norm.transpose(-2, -1)) * slot_scale  # [B, H, T, N]
+            slot_probs = attn_logits.float().softmax(dim=-2) + 1e-6         # compete across T prototype slots
+            attnmap = (slot_probs / slot_probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)).to(x.dtype)
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attnmap = attn.softmax(dim=-1)
         attn = self.attn_drop(attnmap)
         x = (attn @ v).transpose(1, 2).reshape(B, T, C)
         x = self.proj(x)
@@ -104,11 +119,12 @@ class Aggregation_Attention(nn.Module):
 
 class Aggregation_Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, slot_competition: bool = True):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Aggregation_Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+            attn_drop=attn_drop, proj_drop=drop, slot_competition=slot_competition)
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -117,7 +133,7 @@ class Aggregation_Block(nn.Module):
 
     def forward(self, x, y):
         x = x + self.drop_path(self.attn(self.norm1(x), self.norm1(y)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = x + 0.5 * self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 class Prototype_Block(nn.Module):
@@ -132,11 +148,8 @@ class Prototype_Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, prototype, return_attention=False):
-        # if attn_mask is not None:
-        #     y, attn = self.attn(self.norm1(x))
-        # else:
-        y, attn = self.attn(self.norm1(x), self.norm1(prototype))
+    def forward(self, x, prototype, return_attention=False, slot_mask=None):
+        y, attn = self.attn(self.norm1(x), self.norm1(prototype), slot_mask=slot_mask)
         x = self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         if return_attention:

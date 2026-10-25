@@ -27,6 +27,7 @@ from utils.losses import (
     compute_confidence_gated_consistency_loss,
     compute_residual_event_loss,
     compute_clasm_loss,
+    compute_tasl_cross_modal_loss,
     compute_bkg_loss,
     compute_consistency_loss,
     compute_event_loss,
@@ -44,14 +45,22 @@ def train(args):
         args.max_epoch = 10
     if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
         args.curriculum_epochs = 3.0
-    if getattr(args, 'max_omega', 0.25) > 0.25:
-        args.max_omega = 0.25
-    if getattr(args, 'lambda_aux', 0.25) > 0.25:
-        args.lambda_aux = 0.25
-    if getattr(args, 'routing_aux_weight', 0.18) > 0.20:
-        args.routing_aux_weight = 0.18
+    if getattr(args, 'use_aspm', True):
+        if getattr(args, 'max_omega', 0.40) > 0.45:
+            args.max_omega = 0.45
+        elif getattr(args, 'max_omega', 0.40) <= 0.26:
+            args.max_omega = 0.38
+    else:
+        if getattr(args, 'max_omega', 0.25) > 0.25:
+            args.max_omega = 0.25
+    if getattr(args, 'lambda_aux', 0.25) > 0.30:
+        args.lambda_aux = 0.28
+    if getattr(args, 'routing_aux_weight', 0.18) > 0.22:
+        args.routing_aux_weight = 0.20
     if getattr(args, 'lambda_smooth', 0.10) > 0.15:
         args.lambda_smooth = 0.10
+    if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 1.0) > 1.25:
+        args.smooth_sigma = 1.0
 
     # Set random seeds
     random.seed(args.seed)
@@ -201,6 +210,7 @@ def train(args):
     for epoch in range(start_epoch, args.max_epoch):
         model.train()
         epoch_idx = epoch + 1
+        base_model.set_epoch(epoch_idx)
 
         # Resample crops per video every epoch to avoid memorization
         if hasattr(normal_dataset, 'resample_crops'):
@@ -211,12 +221,12 @@ def train(args):
         # Smooth Cosine Curriculum Ramp-up with max_omega ceiling
         omega = get_curriculum_omega(
             epoch_idx,
-            curriculum_epochs=getattr(args, 'curriculum_epochs', 5.0),
-            max_omega=getattr(args, 'max_omega', 0.35)
+            curriculum_epochs=getattr(args, 'curriculum_epochs', 3.0),
+            max_omega=getattr(args, 'max_omega', 0.40)
         )
 
         loss_accum = {
-            'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'bkg': 0.0, 'consist': 0.0,
+            'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'tasl': 0.0, 'bkg': 0.0, 'consist': 0.0,
             'smooth': 0.0, 'gather': 0.0, 'orth': 0.0, 'residual': 0.0, 'gate': 0.0, 'total': 0.0
         }
 
@@ -271,32 +281,52 @@ def train(args):
             s_aux = dnp_dict['aux_scores']
             s_det = dnp_dict['detector_scores']
 
-            # 1. Primary & Auxiliary MIL Losses (AT-BCE + VAT-K + OHNM + Snippet Dropout)
+            # 1. Primary & Auxiliary MIL Losses (Per-Sample AT-BCE + VAT-K + OHNM + Peak Erasure)
             topk_r = getattr(args, 'topk_ratio', 8)
+            topk_r_clasm = getattr(args, 'topk_ratio_clasm', topk_r)
             snip_drop = getattr(args, 'snippet_dropout', 0.15)
+            use_epts_flag = getattr(args, 'use_epts', True)
+            use_tasl_flag = getattr(args, 'use_tasl', True)
 
             loss_mil_routing = compute_at_bce_topk_mil_loss(
                 p_routing, binary_labels, lengths_batch, device=device,
                 topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
-                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True
+                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True,
+                peak_drop_prob=0.25, use_epts=use_epts_flag
             )
             loss_mil_det = compute_at_bce_topk_mil_loss(
                 s_det, binary_labels, lengths_batch, device=device,
                 topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
-                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True
+                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True,
+                peak_drop_prob=0.25, use_epts=use_epts_flag
             )
             loss_mil_aux = compute_at_bce_topk_mil_loss(
                 s_aux, binary_labels, lengths_batch, device=device,
                 topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
-                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True
+                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True,
+                peak_drop_prob=0.15, use_epts=use_epts_flag
             )
 
-            # 2. Multi-class Semantic Alignment & Consistency Losses
-            loss_clasm_bb = compute_clasm_loss(logits2, one_hot_labels, lengths_batch, k_ratio=topk_r)
+            # 2. Multi-class Semantic Alignment, TASL Audio-Visual & Consistency Losses
+            loss_clasm_bb = compute_clasm_loss(
+                logits2, one_hot_labels, lengths_batch,
+                k_ratio=topk_r_clasm, is_training=use_epts_flag, peak_drop_prob=0.20
+            )
             if 'semantic_logits' in dnp_dict:
-                loss_clasm_rupa = compute_clasm_loss(dnp_dict['semantic_logits'], one_hot_labels, lengths_batch, k_ratio=topk_r)
+                loss_clasm_rupa = compute_clasm_loss(
+                    dnp_dict['semantic_logits'], one_hot_labels, lengths_batch,
+                    k_ratio=topk_r_clasm, is_training=use_epts_flag, peak_drop_prob=0.20
+                )
             else:
                 loss_clasm_rupa = torch.tensor(0.0, device=device)
+
+            if use_tasl_flag and 'audio_semantic_logits' in dnp_dict:
+                loss_tasl = compute_tasl_cross_modal_loss(
+                    dnp_dict['audio_semantic_logits'], logits2, one_hot_labels, lengths_batch,
+                    device=device, k_ratio=topk_r_clasm, is_training=True
+                )
+            else:
+                loss_tasl = torch.tensor(0.0, device=device)
 
             loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
 
@@ -315,7 +345,7 @@ def train(args):
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dnp_normal = dnp_dict.get('dnp_normal_loss', torch.tensor(0.0, device=device)).mean()
 
-            # 3. Feature-Guided Edge-Preserving TV Smoothness & Compactness Loss (DODO Training Stage)
+            # 3. SA-EPTS: Semantic-Affinity Edge-Preserving Charbonnier Smoothness & Halo Expansion
             loss_smooth = compute_fg_tv_smoothness_loss(
                 scores=p_routing,
                 visual_features=visual_batch,
@@ -323,7 +353,8 @@ def train(args):
                 gamma_edge=getattr(args, 'gamma_edge', 5.0),
                 lambda_compact=0.1,
                 binary_labels=binary_labels,
-                device=device
+                device=device,
+                use_epts=use_epts_flag
             )
 
             # 4. RUPA Prototype Losses (modulated by smooth cosine curriculum omega(e))
@@ -332,7 +363,7 @@ def train(args):
 
             if 'residual_semantic_logits' in dnp_dict:
                 loss_residual = compute_residual_event_loss(
-                    dnp_dict['residual_semantic_logits'], one_hot_labels, lengths_batch, k_ratio=topk_r
+                    dnp_dict['residual_semantic_logits'], one_hot_labels, lengths_batch, k_ratio=topk_r_clasm
                 )
             else:
                 loss_residual = torch.tensor(0.0, device=device)
@@ -347,23 +378,26 @@ def train(args):
             loss_av_sup = dnp_dict.get('av_suppress_loss', torch.tensor(0.0, device=device)).mean()
 
             # Total Loss Computation with Pareto Optimal Weighting & Cosine Aux Annealing
-            loss_clasm = loss_clasm_bb + 0.8 * loss_clasm_rupa
-            lambda_aux_base = getattr(args, 'lambda_aux', 0.30)
+            max_om = max(0.25, getattr(args, 'max_omega', 0.40))
+            rupa_clasm_w = 0.8 * (0.30 + 0.70 * min(1.0, omega / max_om))
+            loss_clasm = loss_clasm_bb + rupa_clasm_w * loss_clasm_rupa
+            lambda_aux_base = getattr(args, 'lambda_aux', 0.28)
             lambda_aux_eff = lambda_aux_base * (0.45 + 0.55 * math.cos(0.5 * math.pi * min(1.0, epoch / max(1, args.max_epoch))))
             total_loss = (
                 loss_mil_routing
                 + 0.8 * loss_mil_det
                 + lambda_aux_eff * loss_mil_aux
+                + getattr(args, 'lambda_tasl', 0.25) * loss_tasl
                 + 0.15 * loss_av_sup
                 + getattr(args, 'loss2_weight', 0.8) * loss_clasm_bb
-                + 0.8 * loss_clasm_rupa
+                + rupa_clasm_w * loss_clasm_rupa
                 + getattr(args, 'lambda_bkg', 0.5) * loss_bkg
                 + getattr(args, 'lambda_consistency', 0.35) * loss_consistency
                 + getattr(args, 'lambda_smooth', 0.08) * loss_smooth
                 + 0.1 * loss_text_orth
                 + omega * (
-                    getattr(args, 'lambda_gather', 0.05) * loss_gather
-                    + getattr(args, 'lambda_orth', 0.02) * loss_orth
+                    getattr(args, 'lambda_gather', 0.12) * loss_gather
+                    + getattr(args, 'lambda_orth', 0.05) * loss_orth
                     + getattr(args, 'lambda_residual', 0.05) * loss_residual
                     + 0.15 * loss_event
                     + 0.2 * loss_dnp_normal
@@ -379,6 +413,10 @@ def train(args):
 
             optimizer.step()
             scheduler.step()
+
+            # Update Global Normal Memory Bank strictly from pure Normal bags on primary GPU
+            if 'dynamic_normal_patterns' in dnp_dict:
+                base_model.update_global_normal_bank(dnp_dict['dynamic_normal_patterns'], binary_labels)
 
             # Update Polyak-EMA shadow weights after Epoch 1 warmup
             if epoch >= 1:
@@ -397,6 +435,7 @@ def train(args):
             loss_accum['mil'] += loss_mil_routing.item()
             loss_accum['aux'] += loss_mil_aux.item()
             loss_accum['clasm'] += loss_clasm.item()
+            loss_accum['tasl'] += loss_tasl.item()
             loss_accum['bkg'] += loss_bkg.item()
             loss_accum['consist'] += loss_consistency.item()
             loss_accum['smooth'] += loss_smooth.item()

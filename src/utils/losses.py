@@ -84,11 +84,16 @@ def compute_at_bce_topk_mil_loss(scores: torch.Tensor,
                                  lambda_ohnm: float = 0.2,
                                  target_loss: float = 0.15,
                                  is_training: bool = True,
-                                 training: bool = None) -> torch.Tensor:
-    """Detached Adaptive-Temperature BCE (AT-BCE) + Online Hard Negative Mining (OHNM)
-    + Soft Entropy Regularization + Snippet Dropout.
+                                 training: bool = None,
+                                 peak_drop_prob: float = 0.25,
+                                 use_epts: bool = True) -> torch.Tensor:
+    """Detached Per-Sample Adaptive-Temperature BCE (AT-BCE v2) + OHNM + Stochastic Peak Erasure.
     
-    Prevents loss from collapsing to 0.0038 while avoiding the 0.0560 label-smoothing floor.
+    Breaks the 1-2 snippet MIL shortcut plateau (0.0142) by:
+    1. Per-sample (rather than batch-mean) gradient damping so converged easy bags never
+       dampen hard/subtle surveillance bags in the same mini-batch.
+    2. Stochastic Peak Erasure on Abnormal bags (masks top 1-3 memorized spikes in 25% of
+       steps), forcing Top-K supervision onto secondary onset/offset event frames.
     """
     if training is not None:
         is_training = training
@@ -112,11 +117,22 @@ def compute_at_bce_topk_mil_loss(scores: torch.Tensor,
         valid_s = scores_flat[i, :l_i]
         k_i = min(k_list[i], l_i)
 
-        # Snippet Dropout on training features to prevent 1-frame spike collapse
-        if is_training and snippet_dropout > 0.0 and l_i > 2:
-            keep_mask = (torch.rand(l_i, device=device) >= snippet_dropout)
+        # Snippet Dropout + Stochastic Peak Erasure on Abnormal bags
+        if is_training and l_i > 2:
+            if snippet_dropout > 0.0:
+                keep_mask = (torch.rand(l_i, device=device) >= snippet_dropout)
+            else:
+                keep_mask = torch.ones(l_i, dtype=torch.bool, device=device)
+
+            if use_epts and peak_drop_prob > 0.0 and binary_labels[i].item() > 0.5 and l_i > 8:
+                if float(torch.rand((), device=device).item()) < peak_drop_prob:
+                    k_erase = max(1, min(3, int(l_i * 0.03)))
+                    _, peak_idx = torch.topk(valid_s.detach(), k=k_erase, largest=True)
+                    keep_mask = keep_mask.clone()
+                    keep_mask[peak_idx] = False
+
             if not keep_mask.any():
-                keep_mask[torch.randint(0, l_i, (1,))] = True
+                keep_mask[torch.randint(0, l_i, (1,), device=device)] = True
             valid_for_topk = valid_s[keep_mask]
         else:
             valid_for_topk = valid_s
@@ -138,14 +154,13 @@ def compute_at_bce_topk_mil_loss(scores: torch.Tensor,
 
     bag_scores = torch.cat(instance_scores, dim=0).clamp(1e-6, 1.0 - 1e-6)
 
-    # Soft Target-Loss Margin Damping: when current_bce < target_loss, smoothly damp gradient
-    # to prevent memorization & logit runaway while preserving sharp calibration
+    # Per-sample Target-Loss Margin Damping: easy bags damp gently while hard bags keep 1.0 gradient
     with torch.no_grad():
-        current_bce = F.binary_cross_entropy(bag_scores, binary_labels, reduction='mean')
-        grad_damping = torch.clamp(current_bce / max(target_loss, 1e-4), min=0.25, max=1.0)
+        per_bag_bce = F.binary_cross_entropy(bag_scores, binary_labels, reduction='none')
+        grad_damping = torch.clamp(per_bag_bce / max(target_loss, 1e-4), min=0.30, max=1.0)
 
     smooth_targets = binary_labels * (1.0 - 0.02) + 0.5 * 0.02
-    loss_bce = grad_damping * F.binary_cross_entropy(bag_scores, smooth_targets)
+    loss_bce = (grad_damping * F.binary_cross_entropy(bag_scores, smooth_targets, reduction='none')).mean()
 
     # Soft Maximum Entropy Regularization: -lambda_ent * H(p)
     entropy = -(bag_scores * torch.log(bag_scores + 1e-6) + (1.0 - bag_scores) * torch.log(1.0 - bag_scores + 1e-6))
@@ -235,11 +250,21 @@ def compute_fg_tv_smoothness_loss(scores: torch.Tensor,
                                   gamma_edge: float = 5.0,
                                   lambda_compact: float = 0.1,
                                   binary_labels: torch.Tensor = None,
-                                  device: torch.device = None) -> torch.Tensor:
-    """Feature-Guided Edge-Preserving TV Loss (L_FG-TV) + Regional Compactness Loss.
+                                  device: torch.device = None,
+                                  use_epts: bool = True,
+                                  charbonnier_eps: float = 0.015,
+                                  lambda_halo: float = 0.25) -> torch.Tensor:
+    """SA-EPTS: Feature- & Score-Gated Charbonnier Edge-Preserving Smoothness
+    + Vectorized Semantic-Affinity Contextual Halo Expansion (SA-BEMIL).
     
-    L_FG-TV = (1 / (N_i - 1)) * sum_{t=1}^{N_i - 1} exp(-gamma_edge * (1 - cos(X_t, X_{t-1}))) * |S_t - S_{t-1}|
-    L_compact: For abnormal bags, penalizes |S_t - S_{t+-1}|^2 for neighbors with cosine sim > 0.85.
+    1. Gated Charbonnier Penalty:
+       w_t = exp(-gamma_edge * (1 - cos(X_t, X_{t-1}))) * (0.35 + 0.65 * exp(-Delta_s^2 / 2*sigma_g^2))
+       psi_eps(Delta_s) = sqrt(Delta_s^2 + eps^2) - eps
+       Smoothly damps static normal jitter while preserving 1-2s explosive anomaly peaks.
+    2. Vectorized CLIP-Affinity Halo Expansion (on Abnormal bags y=1 only):
+       Expands confident core seeds (s > 0.42) to temporal neighbors delta in {-2, -1, +1, +2}
+       strictly when raw CLIP visual cosine cos(X_t, X_{t*}) > 0.85, preventing boundary
+       bleeding into normal background while sharpening temporal localization mAP@IoU.
     """
     if device is None:
         device = scores.device
@@ -247,9 +272,10 @@ def compute_fg_tv_smoothness_loss(scores: torch.Tensor,
     B, T = scores_flat.shape
 
     tv_losses = []
-    compact_losses = []
+    halo_losses = []
 
     v_norm = F.normalize(visual_features.detach(), dim=-1)
+    halo_offsets = torch.tensor([-2, -1, 1, 2], device=device, dtype=torch.long)
 
     for i in range(B):
         l_i = int(lengths[i].item()) if lengths is not None else T
@@ -263,30 +289,55 @@ def compute_fg_tv_smoothness_loss(scores: torch.Tensor,
         # Feature change between adjacent frames: 1 - cos(X_t, X_{t-1})
         cos_adj = (v_seq[1:] * v_seq[:-1]).sum(dim=-1).clamp(-1.0, 1.0)
         delta_f = (1.0 - cos_adj).clamp_min(0.0)
+        raw_diff = s_seq[1:] - s_seq[:-1]
 
-        edge_weight = torch.exp(-gamma_edge * delta_f)
-        score_diff = torch.abs(s_seq[1:] - s_seq[:-1])
-
-        tv_loss_i = (edge_weight * score_diff).mean()
+        if use_epts:
+            diff_det = raw_diff.detach().abs()
+            sigma_g = torch.median(diff_det).clamp_min(0.05)
+            score_gate = 0.35 + 0.65 * torch.exp(-(diff_det ** 2) / (2.0 * ((sigma_g + 0.08) ** 2)))
+            edge_weight = torch.exp(-gamma_edge * delta_f) * score_gate
+            charb = torch.sqrt(raw_diff ** 2 + (charbonnier_eps ** 2)) - charbonnier_eps
+            tv_loss_i = (edge_weight * charb).mean()
+        else:
+            edge_weight = torch.exp(-gamma_edge * delta_f)
+            tv_loss_i = (edge_weight * torch.abs(raw_diff)).mean()
         tv_losses.append(tv_loss_i)
 
-        if binary_labels is not None and binary_labels[i].item() > 0.5 and l_i > 3:
-            k_eff = max(1, min(l_i // 8, 16))
-            _, topk_idx = torch.topk(s_seq.detach(), k=k_eff, largest=True)
-            comp_diffs = []
-            for idx in topk_idx:
-                t = int(idx.item())
-                if t > 0 and cos_adj[t - 1].item() > 0.85:
-                    comp_diffs.append((s_seq[t] - s_seq[t - 1]) ** 2)
-                if t < l_i - 1 and cos_adj[t].item() > 0.85:
-                    comp_diffs.append((s_seq[t] - s_seq[t + 1]) ** 2)
-            if comp_diffs:
-                compact_losses.append(torch.stack(comp_diffs).mean())
+        if binary_labels is not None and binary_labels[i].item() > 0.5 and l_i > 4:
+            k_core = max(1, min(l_i // 10, 12))
+            core_vals, core_idx = torch.topk(s_seq.detach(), k=k_core, largest=True)
+            if use_epts:
+                conf_mask = core_vals > 0.42
+                if conf_mask.any():
+                    seeds = core_idx[conf_mask]                    # [K_c]
+                    seed_scores = core_vals[conf_mask]             # [K_c]
+                    seed_feats = v_seq[seeds]                      # [K_c, D]
+                    nbr_idx = (seeds.unsqueeze(1) + halo_offsets.unsqueeze(0)).clamp(0, l_i - 1)  # [K_c, 4]
+                    nbr_feats = v_seq[nbr_idx]                     # [K_c, 4, D]
+                    cos_aff = (nbr_feats * seed_feats.unsqueeze(1)).sum(dim=-1)                   # [K_c, 4]
+                    aff_w = ((cos_aff - 0.85) / 0.10).clamp(0.0, 1.0)
+                    if aff_w.sum().item() > 1e-4:
+                        nbr_scores = s_seq[nbr_idx]                # [K_c, 4]
+                        target_halo = (0.85 * seed_scores.unsqueeze(1)).clamp(0.0, 0.95)
+                        halo_err = F.relu(target_halo - nbr_scores) ** 2
+                        halo_loss_i = (aff_w * halo_err).sum() / aff_w.sum().clamp_min(1e-4)
+                        halo_losses.append(halo_loss_i)
+            else:
+                comp_diffs = []
+                for idx in core_idx:
+                    t = int(idx.item())
+                    if t > 0 and cos_adj[t - 1].item() > 0.85:
+                        comp_diffs.append((s_seq[t] - s_seq[t - 1]) ** 2)
+                    if t < l_i - 1 and cos_adj[t].item() > 0.85:
+                        comp_diffs.append((s_seq[t] - s_seq[t + 1]) ** 2)
+                if comp_diffs:
+                    halo_losses.append(torch.stack(comp_diffs).mean())
 
     mean_tv = torch.stack(tv_losses).mean() if tv_losses else torch.tensor(0.0, device=device)
-    mean_compact = torch.stack(compact_losses).mean() if compact_losses else torch.tensor(0.0, device=device)
+    mean_halo = torch.stack(halo_losses).mean() if halo_losses else torch.tensor(0.0, device=device)
+    eff_w = lambda_halo if use_epts else lambda_compact
 
-    return mean_tv + lambda_compact * mean_compact
+    return mean_tv + eff_w * mean_halo
 
 
 def compute_temporal_smoothness_loss(scores: torch.Tensor,
@@ -412,8 +463,12 @@ def compute_clasm_loss(logits: torch.Tensor,
                        lengths: torch.Tensor,
                        device: torch.device = None,
                        k_ratio: int = 10,
-                       epsilon: float = 0.02) -> torch.Tensor:
-    """Snippet-level multi-class MIL cross-entropy loss against fine-grained categories."""
+                       epsilon: float = 0.02,
+                       is_training: bool = False,
+                       peak_drop_prob: float = 0.20) -> torch.Tensor:
+    """Snippet-level multi-class MIL cross-entropy loss against fine-grained categories,
+    with optional Stochastic Peak Erasure on Abnormal bags to prevent 1-frame memorization.
+    """
     if device is None:
         device = logits.device
     labels_dev = labels.to(device)
@@ -426,13 +481,76 @@ def compute_clasm_loss(logits: torch.Tensor,
     for i in range(B):
         l_i = int(lengths[i].item()) if lengths is not None else T
         l_i = max(1, min(l_i, T))
+        cand_logits = logits[i, :l_i]
+
+        if is_training and peak_drop_prob > 0.0 and l_i > 8 and labels_dev[i, 1:].sum().item() > 0 and num_classes > 1:
+            if float(torch.rand((), device=device).item()) < peak_drop_prob:
+                k_erase = max(1, min(2, int(l_i * 0.025)))
+                abn_peak = cand_logits[:, 1:].detach().max(dim=-1).values
+                _, peak_idx = torch.topk(abn_peak, k=k_erase, largest=True)
+                keep_mask = torch.ones(l_i, dtype=torch.bool, device=device)
+                keep_mask[peak_idx] = False
+                if keep_mask.any():
+                    cand_logits = cand_logits[keep_mask]
+
         k_count = max(1, int(l_i / k_ratio) + 1)
-        topk_vals, _ = torch.topk(logits[i, :l_i], k=min(k_count, l_i), largest=True, dim=0)
+        topk_vals, _ = torch.topk(cand_logits, k=min(k_count, cand_logits.shape[0]), largest=True, dim=0)
         instance_logits.append(topk_vals.mean(dim=0, keepdim=True))
 
     instance_logits = torch.cat(instance_logits, dim=0)
     loss = -torch.mean(torch.sum(labels_sm * F.log_softmax(instance_logits, dim=1), dim=1))
     return loss
+
+
+def compute_tasl_cross_modal_loss(audio_sem_logits: torch.Tensor,
+                                  visual_sem_logits: torch.Tensor,
+                                  one_hot_labels: torch.Tensor,
+                                  lengths: torch.Tensor,
+                                  device: torch.device = None,
+                                  k_ratio: int = 8,
+                                  is_training: bool = True) -> torch.Tensor:
+    """TASL (Text-Anchored Semantic Audio Lifting) Loss.
+
+    Grounds 128-D VGGish / auxiliary features directly in CLIP's 512-D semantic space
+    without needing raw .wav waveforms or external CLAP models via:
+    1. Multi-class Audio-to-CLIP-Text CLASM supervision (distinguishing gunshot/explosion/fighting
+       from loud normal stadium cheering/music).
+    2. Certainty-gated snippet-level cross-modal KL distillation from the visual CLIP teacher.
+    """
+    if audio_sem_logits is None:
+        return torch.tensor(0.0, device=device if device is not None else visual_sem_logits.device)
+    if device is None:
+        device = audio_sem_logits.device
+
+    loss_aud_clasm = compute_clasm_loss(
+        audio_sem_logits, one_hot_labels, lengths,
+        device=device, k_ratio=k_ratio, is_training=is_training, peak_drop_prob=0.15
+    )
+
+    B, T, C = audio_sem_logits.shape
+    if visual_sem_logits is None or C < 2:
+        return loss_aud_clasm
+
+    tau_kd = 1.5
+    with torch.no_grad():
+        p_vis = F.softmax(visual_sem_logits.detach().float() / tau_kd, dim=-1)
+        ent_v = -(p_vis * torch.log(p_vis.clamp_min(1e-6))).sum(dim=-1) / math.log(float(C))
+        cert_v = (1.0 - ent_v).clamp(0.0, 1.0)  # [B, T]
+
+    log_p_aud = F.log_softmax(audio_sem_logits.float() / tau_kd, dim=-1)
+    kl_snip = (p_vis * (torch.log(p_vis.clamp_min(1e-6)) - log_p_aud)).sum(dim=-1)  # [B, T]
+
+    if lengths is not None:
+        valid_mask = torch.arange(T, device=device)[None, :] < lengths.to(device)[:, None]
+    else:
+        valid_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+
+    if valid_mask.any():
+        loss_cm_kl = (cert_v[valid_mask] * kl_snip[valid_mask]).mean().to(audio_sem_logits.dtype)
+    else:
+        loss_cm_kl = torch.tensor(0.0, device=device, dtype=audio_sem_logits.dtype)
+
+    return loss_aud_clasm + 0.30 * loss_cm_kl
 
 
 def compute_residual_event_loss(residual_logits: torch.Tensor,

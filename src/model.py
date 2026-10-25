@@ -382,25 +382,67 @@ class TemporalConvProjector(nn.Module):
         return h
 
 
+class GradientProjectionJunction(torch.autograd.Function):
+    """Per-Snippet Multi-Objective PCGrad Junction (Zero Extra Backward Passes).
+    
+    Projects conflicting secondary/prototype/cross-modal gradients onto the orthogonal complement
+    of the primary task gradient at each individual snippet (b, t) along feature dimension D,
+    with relative gradient norm bounding so auxiliary/prototype branches cannot destabilize
+    the backbone.
+    
+    Complexity: O(B * T * D), zero extra backward passes, 100% DataParallel compatible.
+    """
+    @staticmethod
+    def forward(ctx, x):
+        return x, x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_main, grad_rupa):
+        if grad_main is None or grad_rupa is None:
+            return (grad_main if grad_main is not None else grad_rupa)
+
+        orig_dtype = grad_main.dtype
+        g_main = grad_main.float()
+        g_rupa = grad_rupa.float()
+
+        # Per-snippet inner product along feature dimension D (dim=-1): [B, T, 1]
+        dot = (g_rupa * g_main).sum(dim=-1, keepdim=True)
+        norm_sq = (g_main * g_main).sum(dim=-1, keepdim=True).clamp_min(1e-7)
+
+        # Project only snippets where dot < 0 (conflicting gradient directions)
+        proj_coeff = torch.clamp(dot, max=0.0) / norm_sq
+        g_rupa_proj = g_rupa - proj_coeff * g_main
+
+        # Relative norm bounding per snippet: prevent secondary gradient norm from exceeding main norm
+        main_norm = g_main.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-6)
+        rupa_norm = g_rupa_proj.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-6)
+        norm_scale = torch.clamp(main_norm / rupa_norm, max=1.0)
+        g_rupa_safe = g_rupa_proj * norm_scale
+
+        return (g_main + g_rupa_safe).to(orig_dtype)
+
+
 class ModalityAdaptiveBranch(nn.Module):
-    """Overhauled Modality-Adaptive Audio-Visual / Motion Branch (TD-AVCA + DropAudio).
+    """Overhauled Modality-Adaptive Audio-Visual / Motion Branch (TD-AVCA + TASL + PCGrad).
     
     Supports:
     1. XD-Violence Multimodal Mode: Project pre-extracted audio features
        (VGGish 128-D or CLAP/AST 512-D) aligned with 16-frame video snippets.
-    2. Missing-Modality / Motion-Residual Mode: For UCF-Crime (no audio) or
+    2. TASL (CLIP-Text-Anchored Semantic Audio Lifting): Lifts 128-D VGGish into
+       CLIP's 512-D semantic space and aligns directly against CLIP category text prompts
+       (zero raw .wav waveforms or external CLAP teacher required).
+    3. Missing-Modality / Motion-Residual Mode: For UCF-Crime (no audio) or
        missing audio snippets, computes 1st- and 2nd-order visual temporal
        residuals (M1 = X_t - X_{t-1}, M2 = M1_t - M1_{t-1}) as dynamic auxiliary modality.
-    3. Banded Temporal Delay-Aware Cross-Attention (TD-AVCA) over window [t - delta, t + delta]
-       with learnable per-head relative lag bias to prevent global bag-level audio memorization.
-    4. Dual-Level Stochastic Modality Dropout (DropAudio) blending with visual motion residuals.
-    5. Acoustic-Energy & Cross-Modal Cosine Decoupled Gate G_av to suppress loud non-violent
-       background sounds (cheering, music, traffic) + Auxiliary anomaly score stream S_aux.
+    4. Banded Temporal Delay-Aware Cross-Attention (TD-AVCA) over window [t - delta, t + delta]
+       with Per-Snippet PCGrad Junction so cross-modal gradients never conflict with MDTBackbone.
+    5. Acoustic-Energy & Cross-Modal Cosine Decoupled Gate G_av + Semantic-Calibrated S_aux.
     """
     def __init__(self, embed_dim: int = 512, audio_dim: int = 128,
                  num_heads: int = 4, dropout: float = 0.1, no_audio: bool = False,
                  delay_window: int = 4, drop_audio_bag_p: float = 0.25,
-                 drop_audio_snip_p: float = 0.25):
+                 drop_audio_snip_p: float = 0.25, use_tasl: bool = True,
+                 use_pcgrad: bool = True):
         super().__init__()
         self.embed_dim = embed_dim
         self.audio_dim = audio_dim
@@ -409,6 +451,8 @@ class ModalityAdaptiveBranch(nn.Module):
         self.delay_window = delay_window
         self.drop_audio_bag_p = drop_audio_bag_p
         self.drop_audio_snip_p = drop_audio_snip_p
+        self.use_tasl = use_tasl
+        self.use_pcgrad = use_pcgrad
 
         # Audio projector (from audio_dim to embed_dim)
         self.audio_proj = TemporalConvProjector(audio_dim, embed_dim, kernel_size=3, padding=1)
@@ -417,6 +461,18 @@ class ModalityAdaptiveBranch(nn.Module):
 
         # Motion residual projector (from 2*embed_dim to embed_dim)
         self.motion_proj = TemporalConvProjector(embed_dim * 2, embed_dim, kernel_size=3, padding=1)
+
+        # TASL: CLIP-Text-Anchored Semantic Lifting Adapter (512 -> 1024 -> 512)
+        self.tasl_head = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(embed_dim, embed_dim * 2)),
+            ("ln", LayerNormFP32(embed_dim * 2)),
+            ("gelu", QuickGELU()),
+            ("dropout", nn.Dropout(dropout)),
+            ("c_proj", nn.Linear(embed_dim * 2, embed_dim))
+        ]))
+        self.ln_tasl = LayerNormFP32(embed_dim)
+        self.alpha_tasl = nn.Parameter(torch.tensor(0.30))
+        self.tasl_log_temp = nn.Parameter(torch.tensor(math.log(0.08)))
 
         # Cross-Modal Attention: Query=F_base (Visual), Key=F_a (Auxiliary), Value=F_a
         self.cross_attn = nn.MultiheadAttention(
@@ -505,14 +561,18 @@ class ModalityAdaptiveBranch(nn.Module):
 
     def forward(self, f_base: torch.Tensor, visual_raw: torch.Tensor,
                 audio_features: torch.Tensor = None, lengths: torch.Tensor = None,
-                return_suppress_loss: bool = False):
+                return_suppress_loss: bool = False,
+                category_text_features: torch.Tensor = None,
+                return_tasl: bool = False):
         """
         Args:
             f_base: [B, T, D] visual base features from MDTBackbone
             visual_raw: [B, T, D] raw snippet visual features
             audio_features: [B, T_a, D_a] audio features (if available) or None
             lengths: [B] valid lengths
-            return_suppress_loss: if True, returns 5th element av_suppress_loss [B, 1]
+            return_suppress_loss: if True, returns av_suppress_loss [B, 1]
+            category_text_features: [C, D] CLIP category text embeddings for TASL lifting
+            return_tasl: if True, returns audio_semantic_logits [B, T, C] (or None)
         Returns:
             F_fused: [B, T, D] multimodal/motion fused features
             S_aux: [B, T, 1] auxiliary anomaly scores
@@ -521,6 +581,13 @@ class ModalityAdaptiveBranch(nn.Module):
         """
         B, T, D = f_base.shape
         device = f_base.device
+
+        # Per-Snippet PCGrad Junction on f_base so cross-modal attention gradients
+        # never conflict with MDTBackbone's primary visual representation
+        if self.training and self.use_pcgrad:
+            f_base_skip, f_base_q = GradientProjectionJunction.apply(f_base)
+        else:
+            f_base_skip, f_base_q = f_base, f_base
 
         # Always compute visual motion residuals as structural anchor & fallback
         motion = self.compute_motion_residuals(visual_raw)  # [B, T, 2*D]
@@ -534,7 +601,8 @@ class ModalityAdaptiveBranch(nn.Module):
                 >= lengths.to(device)[:, None]
             )
 
-        if audio_features is not None and not self.no_audio:
+        has_real_audio = (audio_features is not None and not self.no_audio)
+        if has_real_audio:
             # Multi-Modal Audio Mode
             if audio_features.ndim == 2:
                 audio_features = audio_features.unsqueeze(0)
@@ -587,11 +655,25 @@ class ModalityAdaptiveBranch(nn.Module):
                 ).transpose(1, 2)
                 f_a_raw = self.audio_proj_512(adapted_audio).transpose(1, 2)
 
+            # TASL: Lift projected VGGish/audio into CLIP-aligned 512-D semantic space
+            if self.use_tasl:
+                f_a_lifted = self.ln_tasl(
+                    f_a_raw + self.alpha_tasl.clamp(0.05, 0.60) * self.tasl_head(f_a_raw)
+                )
+            else:
+                f_a_lifted = f_a_raw
+
             # Apply Dual-Level Stochastic DropAudio during training
-            f_a = self.apply_stochastic_drop_audio(f_a_raw, f_motion)
+            f_a = self.apply_stochastic_drop_audio(f_a_lifted, f_motion)
         else:
             # Missing-Modality / Motion-Residual Mode (UCF-Crime or Audio Fallback)
-            f_a = f_motion
+            if self.use_tasl:
+                f_a_lifted = self.ln_tasl(
+                    f_motion + self.alpha_tasl.clamp(0.05, 0.60) * self.tasl_head(f_motion)
+                )
+            else:
+                f_a_lifted = f_motion
+            f_a = f_a_lifted
             motion_norm = torch.norm(f_motion.float(), p=2, dim=-1, keepdim=True)
             if cross_pad_mask is not None:
                 motion_norm = motion_norm.masked_fill(cross_pad_mask.unsqueeze(-1), 0.0)
@@ -601,12 +683,27 @@ class ModalityAdaptiveBranch(nn.Module):
                 max_motion = motion_norm.amax(dim=1, keepdim=True).clamp_min(1e-6)
             raw_audio_energy = (motion_norm / max_motion).to(f_base.dtype)
 
+        # Compute TASL Audio-to-CLIP-Text Semantic Logits (detached text anchor)
+        audio_semantic_logits = None
+        s_aux_sem = None
+        if self.use_tasl and category_text_features is not None:
+            aud_norm = F.normalize(f_a_lifted, dim=-1)
+            aud_text_mat = F.normalize(category_text_features.detach(), dim=-1).t().to(f_base.dtype)
+            aud_temp = self.tasl_log_temp.exp().clamp(0.03, 0.25)
+            audio_semantic_logits = (aud_norm @ aud_text_mat) / aud_temp  # [B, T, C]
+            if cross_pad_mask is not None:
+                audio_semantic_logits = audio_semantic_logits.masked_fill(cross_pad_mask.unsqueeze(-1), 0.0)
+            if has_real_audio:
+                p0_aud = F.softmax(audio_semantic_logits, dim=-1)[:, :, :1]
+                num_c_aud = max(2, audio_semantic_logits.shape[-1])
+                s_aux_sem = ((1.0 - p0_aud) / (1.0 + (num_c_aud - 2.0) * p0_aud)).clamp(0.0, 1.0)
+
         delay_attn_mask = self.build_delay_attention_mask(
             B, T, device, f_base.dtype, key_pad_mask=cross_pad_mask
         )
 
         attn_out, _ = self.cross_attn(
-            query=f_base, key=f_a, value=f_a,
+            query=f_base_q, key=f_a, value=f_a,
             attn_mask=delay_attn_mask,
             need_weights=False
         )
@@ -616,24 +713,28 @@ class ModalityAdaptiveBranch(nn.Module):
         f_v_from_a = self.ln_cross(attn_out)
 
         # Cross-modal semantic cosine agreement rho_t in [-1, 1]
-        cos_av = F.cosine_similarity(f_base, f_v_from_a, dim=-1).unsqueeze(-1)  # [B, T, 1]
+        cos_av = F.cosine_similarity(f_base_skip, f_v_from_a, dim=-1).unsqueeze(-1)  # [B, T, 1]
 
         # Acoustic-Energy Decoupled Suppression Gate G_av: [B, T, D]
-        gate_input = torch.cat([f_base, f_v_from_a, f_base * f_v_from_a, cos_av, raw_audio_energy], dim=-1)
+        gate_input = torch.cat([f_base_skip, f_v_from_a, f_base_skip * f_v_from_a, cos_av, raw_audio_energy], dim=-1)
         g_av = self.noise_gate_mlp(gate_input)
         if cross_pad_mask is not None:
             g_av = g_av.masked_fill(cross_pad_mask.unsqueeze(-1), 0.0)
 
         # Gated residual injection: F_fused = LayerNorm(F_base + alpha_mod * (G_av * F_v_from_a))
         alpha_eff = self.alpha_mod.clamp(0.01, 0.35)
-        f_fused = self.ln_fused(f_base + alpha_eff * (g_av * f_v_from_a))
+        f_fused = self.ln_fused(f_base_skip + alpha_eff * (g_av * f_v_from_a))
 
         # Auxiliary Anomaly Classifier: detach f_base anchor so overconfident S_aux
         # cannot corrupt MDTBackbone's visual representation
-        f_aux_in = f_base.detach() + (g_av * f_v_from_a)
+        f_aux_in = f_base_skip.detach() + (g_av * f_v_from_a)
         aux_features = f_aux_in + self.mlp_aux(f_aux_in)
         logits_aux = self.classifier_aux(aux_features)  # [B, T, 1]
-        s_aux = torch.sigmoid(logits_aux)
+        s_aux_cls = torch.sigmoid(logits_aux)
+        if s_aux_sem is not None:
+            s_aux = (0.75 * s_aux_cls + 0.25 * s_aux_sem).clamp(1e-5, 1.0 - 1e-5)
+        else:
+            s_aux = s_aux_cls
 
         # Loud-Normal Audio-Visual Contrastive Suppression Penalty: [B, 1]
         # Penalizes high S_aux and high G_av when acoustic energy is loud but visual-audio cosine is low
@@ -646,52 +747,67 @@ class ModalityAdaptiveBranch(nn.Module):
         else:
             av_suppress_loss = av_pen_t.mean(dim=1)
 
+        if return_suppress_loss and return_tasl:
+            return f_fused, s_aux, logits_aux, g_av, av_suppress_loss, audio_semantic_logits
         if return_suppress_loss:
             return f_fused, s_aux, logits_aux, g_av, av_suppress_loss
         return f_fused, s_aux, logits_aux, g_av
 
 
 # ============================================================================
-# 3. Core Module 3: GradientSafeRUPA
+# 3. Core Module 3: GradientSafeRUPA (with SM-ASPM v2)
 # ============================================================================
 
 class GradientSafeRUPA(nn.Module):
-    """Latent Manifold Orthogonal Subspace Projection (LM-OSP) RUPA Module.
+    """Soft-Masked Adaptive Stiefel Prototype Manifold (SM-ASPM) RUPA Module.
     
-    Stabilizes End-to-End training from scratch and eliminates normal prototype drift via:
-    1. Dual-Gated Pseudo-Normal Mining (joint detector + zero-shot CLIP normality score)
-       with conservative selection ceiling to prevent long-anomaly leakage.
-    2. Controlled Gradient Detachment on normal features entering the DNP memory.
-    3. Differentiable Stiefel Manifold Orthonormalization (QR with canonical sign) producing
-       an exact M-dimensional orthonormal basis U_norm in R^(B x M x D), U_norm @ U_norm^T = I_M.
-    4. Counterfactual Orthogonal Subspace Projection: F_proj = (F_fused @ U_norm^T) @ U_norm,
-       eliminating the unconstrained MLP identity shortcut so anomalies cannot be reconstructed.
-    5. Grassmannian Subspace Reconstruction Score & Margin-Enforced Abnormal Subspace Repulsion.
-    6. Domain-Adaptive Semantic Alignment with learnable temperature & feature variance scaling.
+    Eliminates normal prototype rank-1 collapse (Orth=1.00) and fixed-rank under-capacity via:
+    1. Dual-Gated Pseudo-Normal Mining (joint detector + zero-shot CLIP normality score).
+    2. Slot-Competitive Prototype Aggregation + Global Normal Memory Bank (updated strictly
+       from pure Normal bags y=0).
+    3. cuBLAS Newton-Schulz Polar Stiefel Orthonormalization on fixed [M_max, D] parameters
+       with Differentiable Epoch-Adaptive Soft-Rank Masking (M: 16 -> 48) capped by 0.35 * L_i
+       so short videos can never absorb anomalies into an over-complete normal subspace.
+    4. Exact Grassmannian Subspace Containment Alignment (1 - ||U_norm @ t_0||_2^2) satisfying
+       Bessel's inequality without pulling orthogonal slots into a single ray.
     """
     def __init__(self, feature_dim: int = 512, num_prototypes: int = 16,
                  num_heads: int = 8, extractor_depth: int = 1, decoder_depth: int = 4,
                  sampling: str = 'topk', normal_selection_ratio: float = 0.60,
                  min_normal_frames: int = 4, max_normal_ratio: float = 0.70,
-                 repulsion_margin: float = 0.25):
+                 repulsion_margin: float = 0.25, use_aspm: bool = True,
+                 aspm_max_rank: int = 48):
         super().__init__()
         self.feature_dim = feature_dim
-        self.num_prototypes = num_prototypes
+        self.base_prototypes = num_prototypes
+        self.use_aspm = use_aspm
+        self.num_prototypes = max(num_prototypes, aspm_max_rank) if use_aspm else num_prototypes
         self.sampling = sampling
         self.normal_selection_ratio = min(normal_selection_ratio, 0.65)
         self.min_normal_frames = min_normal_frames
         self.max_normal_ratio = min(max_normal_ratio, 0.75)
         self.repulsion_margin = repulsion_margin
 
-        # Dynamic Normal Prototypes memory seeds
-        self.video_prototypes = nn.Parameter(torch.randn(num_prototypes, feature_dim))
-        trunc_normal_(self.video_prototypes, std=0.02)
+        # Orthonormal Stiefel initialization via pure torch.bmm (zero cuSOLVER calls)
+        with torch.no_grad():
+            init_proto = self.build_orthonormal_subspace(
+                torch.randn(1, self.num_prototypes, feature_dim)
+            ).squeeze(0)
+            init_bank = self.build_orthonormal_subspace(
+                torch.randn(1, self.base_prototypes, feature_dim)
+            ).squeeze(0)
 
-        # DNP Prototype Extractor Blocks (Aggregation)
+        self.video_prototypes = nn.Parameter(init_proto)
+        self.register_buffer('current_epoch_buf', torch.tensor(1.0, dtype=torch.float32), persistent=True)
+        self.register_buffer('global_normal_bank', init_bank, persistent=True)
+        self.beta_global_logit = nn.Parameter(torch.tensor(-1.3863))  # sigmoid(-1.3863) = 0.20
+
+        # DNP Prototype Extractor Blocks (Slot-Competitive Aggregation)
         self.dnp_extractor = nn.ModuleList([
             Aggregation_Block(
                 dim=feature_dim, num_heads=num_heads, mlp_ratio=4.0,
-                qkv_bias=True, norm_layer=partial(LayerNormFP32, eps=1e-6)
+                qkv_bias=True, norm_layer=partial(LayerNormFP32, eps=1e-6),
+                slot_competition=True
             ) for _ in range(extractor_depth)
         ])
 
@@ -900,6 +1016,58 @@ class GradientSafeRUPA(nn.Module):
         loss_orth = (off_diag ** 2).sum(dim=(1, 2)) / (M * (M - 1))
         return loss_orth.mean()
 
+    def compute_rank_mask(self, lengths: torch.Tensor, B: int, N: int,
+                          device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Computes Differentiable Epoch-Adaptive & Length-Capped Soft Rank Mask [B, M].
+        
+        Schedule: M_sched(e) = M_0 + (M_max - M_0) * sigmoid(1.1 * (e - 3.5))
+        Length safety cap: M_eff(i, e) = min(M_sched(e), clamp(0.35 * L_i, min=8.0, max=M_max))
+        so short videos can never absorb anomalies into an over-complete normal subspace.
+        """
+        ep = float(self.current_epoch_buf.item())
+        if self.use_aspm:
+            sig_e = 1.0 / (1.0 + math.exp(-1.1 * (ep - 3.5)))
+            m_sched = float(self.base_prototypes) + float(self.num_prototypes - self.base_prototypes) * sig_e
+        else:
+            m_sched = float(self.base_prototypes)
+
+        if lengths is not None:
+            l_vec = lengths.to(device=device, dtype=torch.float32).clamp(min=1.0, max=float(N))
+            if not self.training and B > 1:
+                l_vec = l_vec.sum().expand(B)
+        else:
+            eff_n = float(N if self.training else B * N)
+            l_vec = torch.full((B,), eff_n, device=device, dtype=torch.float32)
+
+        l_cap = (0.35 * l_vec).clamp(min=8.0, max=float(self.num_prototypes))
+        m_eff = torch.clamp(l_cap, max=m_sched)  # [B]
+
+        slot_idx = torch.arange(self.num_prototypes, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
+        rank_mask = torch.sigmoid(2.0 * (m_eff.unsqueeze(1) - slot_idx)).to(dtype)  # [B, M]
+        return rank_mask
+
+    @torch.no_grad()
+    def update_global_normal_bank(self, u_norm_batch: torch.Tensor,
+                                  binary_labels: torch.Tensor, momentum: float = 0.98):
+        """Updates Global Normal Memory Bank strictly from pure Normal bags (y=0) on primary GPU."""
+        if u_norm_batch is None or binary_labels is None:
+            return
+        labels_flat = binary_labels.detach().view(-1)
+        norm_mask = labels_flat < 0.5
+        if not bool(norm_mask.any().item()):
+            return
+
+        m0 = self.base_prototypes
+        bank_dev = self.global_normal_bank.device
+        u_pure = u_norm_batch.detach()[norm_mask.to(u_norm_batch.device), :m0, :].to(
+            device=bank_dev, dtype=torch.float32
+        )
+        batch_proto = F.normalize(u_pure.mean(dim=0, keepdim=True), dim=-1)  # [1, M0, D]
+        cur_bank = self.global_normal_bank.float().unsqueeze(0)              # [1, M0, D]
+        blended = momentum * cur_bank + (1.0 - momentum) * batch_proto
+        updated_bank = self.build_orthonormal_subspace(blended).squeeze(0)
+        self.global_normal_bank.copy_(updated_bank.to(self.global_normal_bank.dtype))
+
     def forward(self, f_fused: torch.Tensor, s_det: torch.Tensor,
                 category_text_features: torch.Tensor, lengths: torch.Tensor = None,
                 visual_raw: torch.Tensor = None, text_features_zs: torch.Tensor = None):
@@ -930,6 +1098,19 @@ class GradientSafeRUPA(nn.Module):
             zs_text_matrix = F.normalize(text_features_zs, dim=-1).t().to(f_fused.dtype)
         else:
             zs_text_matrix = text_matrix
+
+        # Soft-Masked Adaptive Stiefel Rank [B, M] + Global Normal Memory Bank Seed Blending
+        rank_mask = self.compute_rank_mask(lengths, B, N, device, f_fused.dtype)  # [B, M]
+        mask_sq = rank_mask * rank_mask                                           # [B, M]
+
+        b_glob = torch.sigmoid(self.beta_global_logit).clamp(0.05, 0.35)
+        m0 = self.base_prototypes
+        bank_cast = self.global_normal_bank.to(device=device, dtype=self.video_prototypes.dtype)
+        seeded_head = F.normalize((1.0 - b_glob) * self.video_prototypes[:m0] + b_glob * bank_cast, dim=-1)
+        if self.num_prototypes > m0:
+            proto_seeds = torch.cat([seeded_head, self.video_prototypes[m0:]], dim=0)
+        else:
+            proto_seeds = seeded_head
 
         # 1. Dual-Gated Pseudo-Normal Mining (combines S_det with zero-shot CLIP semantic normality)
         with torch.no_grad():
@@ -977,7 +1158,7 @@ class GradientSafeRUPA(nn.Module):
                 )
 
             vid_norm_input = vid_sel_norm.detach() * (0.5 + 0.5 * vid_rel.unsqueeze(-1))
-            agg_vid = self.video_prototypes.unsqueeze(0)  # [1, M, D]
+            agg_vid = proto_seeds.unsqueeze(0)  # [1, M, D]
             for blk in self.dnp_extractor:
                 agg_vid = blk(agg_vid, vid_norm_input)
 
@@ -986,22 +1167,23 @@ class GradientSafeRUPA(nn.Module):
             u_norm = u_norm_vid.expand(B, -1, -1)                           # [B, M, D]
         else:
             normal_input = selected_normal.detach() * (0.5 + 0.5 * reliability.unsqueeze(-1))
-            agg_prototype = self.video_prototypes.unsqueeze(0).expand(B, -1, -1)
+            agg_prototype = proto_seeds.unsqueeze(0).expand(B, -1, -1)
             for blk in self.dnp_extractor:
                 agg_prototype = blk(agg_prototype, normal_input)
 
             dynamic_normal_patterns = agg_prototype  # [B, M, D]
-            # 3. Construct Orthonormal Normal Subspace Basis U_norm in St(M, D) via Differentiable QR
+            # 3. Construct Orthonormal Normal Subspace Basis U_norm in St(M, D) via Newton-Schulz Polar
             u_norm = self.build_orthonormal_subspace(dynamic_normal_patterns)  # [B, M, D]
 
-        # 4. Latent Manifold Orthogonal Subspace Projection (LM-OSP)
-        subspace_coords = torch.bmm(f_fused, u_norm.transpose(1, 2))  # [B, N, M]
-        f_proj = torch.bmm(subspace_coords, u_norm)                   # [B, N, D]
+        # 4. Soft-Masked Latent Manifold Orthogonal Subspace Projection (SM-ASPM)
+        raw_coords = torch.bmm(f_fused, u_norm.transpose(1, 2))               # [B, N, M]
+        subspace_coords = raw_coords * rank_mask.unsqueeze(1)                 # [B, N, M]
+        f_proj = torch.bmm(subspace_coords, u_norm)                           # [B, N, D]
 
-        # Subspace-constrained decoder refinement (operates on f_proj, preventing identity shortcut)
+        # Subspace-constrained decoder refinement (operates strictly on f_proj and active slots)
         f_dec = self.bottleneck(f_proj)
         for blk in self.decoder:
-            f_dec = blk(f_dec, u_norm)
+            f_dec = blk(f_dec, u_norm, slot_mask=rank_mask)
         alpha_dec = torch.sigmoid(self.alpha_subspace_dec) * 0.35
         f_rec = (1.0 - alpha_dec) * f_proj + alpha_dec * f_dec
 
@@ -1010,7 +1192,8 @@ class GradientSafeRUPA(nn.Module):
 
         # Grassmannian Subspace Reconstruction Score + Cosine Hybrid
         f_norm_unit = F.normalize(f_fused, dim=-1)
-        proj_energy = (torch.bmm(f_norm_unit, u_norm.transpose(1, 2)) ** 2).sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
+        unit_coords_sq = torch.bmm(f_norm_unit, u_norm.transpose(1, 2)) ** 2
+        proj_energy = (unit_coords_sq * mask_sq.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
         s_subspace = (1.0 - proj_energy).clamp(0.0, 1.0)
         cos_sim = F.cosine_similarity(f_fused, f_rec, dim=-1).unsqueeze(-1)
         s_cos = ((1.0 - cos_sim) / 2.0).clamp(0.0, 1.0)
@@ -1018,30 +1201,33 @@ class GradientSafeRUPA(nn.Module):
 
         # 5. Per-sample Subspace Gather Loss: [B, 1]
         norm_unit_sel = F.normalize(selected_normal, dim=-1)
-        norm_proj_energy = (torch.bmm(norm_unit_sel, u_norm.transpose(1, 2)) ** 2).sum(dim=-1).clamp(0.0, 1.0)
+        norm_coords_sq = torch.bmm(norm_unit_sel, u_norm.transpose(1, 2)) ** 2
+        norm_proj_energy = (norm_coords_sq * mask_sq.unsqueeze(1)).sum(dim=-1).clamp(0.0, 1.0)
         subspace_dist = 1.0 - norm_proj_energy
         rel_norm = reliability / reliability.sum(dim=1, keepdim=True).clamp_min(1e-6)
         sample_g_loss = (subspace_dist * rel_norm).sum(dim=1, keepdim=True)  # [B, 1]
 
-        # 6. Per-sample Prototype Diversity + Margin-Enforced Abnormal Subspace Repulsion Loss: [B, 1]
+        # 6. Per-sample Active-Slot Prototype Diversity + Margin-Enforced Abnormal Subspace Repulsion: [B, 1]
         p_norm = F.normalize(dynamic_normal_patterns, dim=-1)
         sim_matrix = torch.bmm(p_norm, p_norm.transpose(1, 2))
-        identity = torch.eye(self.num_prototypes, device=f_fused.device).unsqueeze(0).expand(B, -1, -1)
-        off_diag = sim_matrix - identity
-        raw_orth_loss = ((off_diag ** 2).sum(dim=(1, 2)) / max(1, self.num_prototypes * (self.num_prototypes - 1))).view(B, 1)
+        eye_m = torch.eye(self.num_prototypes, device=f_fused.device, dtype=f_fused.dtype).unsqueeze(0)
+        off_diag_mask = (1.0 - eye_m) * (rank_mask.unsqueeze(2) * rank_mask.unsqueeze(1))
+        denom_orth = off_diag_mask.sum(dim=(1, 2)).clamp_min(1.0)
+        raw_orth_loss = (((sim_matrix * off_diag_mask) ** 2).sum(dim=(1, 2)) / denom_orth).view(B, 1)
 
         abn_unit = F.normalize(selected_abn.detach(), dim=-1)
-        abn_proj_energy = (torch.bmm(abn_unit, u_norm.transpose(1, 2)) ** 2).sum(dim=-1)
+        abn_coords_sq = torch.bmm(abn_unit, u_norm.transpose(1, 2)) ** 2
+        abn_proj_energy = (abn_coords_sq * mask_sq.unsqueeze(1)).sum(dim=-1)
         abn_gate = (abn_conf > 0.55).to(f_fused.dtype) * abn_conf
         repulsion_loss = (F.relu(abn_proj_energy - self.repulsion_margin) * abn_gate).mean(dim=1, keepdim=True)
         sample_orth_loss = raw_orth_loss + 0.5 * repulsion_loss  # [B, 1]
 
-        # 7. Counterfactual Subspace-Split Semantic Alignment
-        # Normal Class 0 is matched against the normal subspace reconstruction F_rec;
-        # Anomaly Classes 1..C-1 are matched against the residual-amplified orthogonal complement R.
+        # 7. Counterfactual Subspace-Split Semantic Alignment (Semantic-Anchored Residual)
+        # Anchoring residual with 0.40 * F_fused prevents near-zero normal residuals from magnifying
+        # background noise through LayerNorm while amplifying true orthogonal anomaly excursions.
         temp = self.log_temp.exp().clamp(min=0.02, max=0.5)
         rec_norm = F.normalize(f_rec + 0.25 * visual_raw, dim=-1)
-        f_sem_rupa = self.ln_sem_rupa(residual + self.gamma_rupa * self.mlp_res(residual))
+        f_sem_rupa = self.ln_sem_rupa(0.40 * f_fused + residual + self.gamma_rupa * self.mlp_res(residual))
         res_norm = F.normalize(f_sem_rupa, dim=-1)
 
         rec_sem_logits = rec_norm @ text_matrix / temp
@@ -1060,10 +1246,12 @@ class GradientSafeRUPA(nn.Module):
         num_c = max(2, scaled_sem_logits.shape[-1])
         s_sem = ((1.0 - p0_rupa) / (1.0 + (num_c - 2.0) * p0_rupa)).clamp(0.0, 1.0)
 
-        # Prototype Normal Alignment Loss: [B, 1]
-        normal_text_vec = cat_text_norm[0].view(1, 1, -1)
-        dnp_normal_sim = F.cosine_similarity(u_norm, normal_text_vec, dim=-1)
-        sample_dnp_normal_loss = (1.0 - dnp_normal_sim).mean(dim=1, keepdim=True)  # [B, 1]
+        # Grassmannian Subspace Containment Loss: 1 - ||P_g t_0||_2^2 in [0, 1]
+        # Satisfies Bessel's inequality: aligns span(U_norm) to contain normal prompt t_0
+        # without collapsing M-1 orthogonal basis directions into a rank-1 ray!
+        normal_text_vec = cat_text_norm[0].view(1, D, 1).to(f_fused.dtype).expand(B, -1, -1)
+        t0_proj_sq = torch.bmm(u_norm, normal_text_vec).squeeze(-1) ** 2  # [B, M]
+        sample_dnp_normal_loss = 1.0 - (t0_proj_sq * mask_sq).sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
 
         rupa_dict = {
             'reconstructed_features': f_rec,
@@ -1083,48 +1271,8 @@ class GradientSafeRUPA(nn.Module):
 
 
 # ============================================================================
-# 4. Core Module 4: QuadSafeGate & Per-Snippet PCGrad
+# 4. Core Module 4: QuadSafeGate
 # ============================================================================
-
-class GradientProjectionJunction(torch.autograd.Function):
-    """Per-Snippet Multi-Objective PCGrad Junction (Zero Extra Backward Passes).
-    
-    Projects conflicting secondary/prototype gradients onto the orthogonal complement
-    of the primary task gradient at each individual snippet (b, t) along feature dimension D,
-    with relative gradient norm bounding so auxiliary/prototype branches cannot destabilize
-    the backbone.
-    
-    Complexity: O(B * T * D), zero extra backward passes, 100% DataParallel compatible.
-    """
-    @staticmethod
-    def forward(ctx, x):
-        return x, x.clone()
-
-    @staticmethod
-    def backward(ctx, grad_main, grad_rupa):
-        if grad_main is None or grad_rupa is None:
-            return (grad_main if grad_main is not None else grad_rupa)
-
-        orig_dtype = grad_main.dtype
-        g_main = grad_main.float()
-        g_rupa = grad_rupa.float()
-
-        # Per-snippet inner product along feature dimension D (dim=-1): [B, T, 1]
-        dot = (g_rupa * g_main).sum(dim=-1, keepdim=True)
-        norm_sq = (g_main * g_main).sum(dim=-1, keepdim=True).clamp_min(1e-7)
-
-        # Project only snippets where dot < 0 (conflicting gradient directions)
-        proj_coeff = torch.clamp(dot, max=0.0) / norm_sq
-        g_rupa_proj = g_rupa - proj_coeff * g_main
-
-        # Relative norm bounding per snippet: prevent RUPA gradient norm from exceeding main norm
-        main_norm = g_main.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-6)
-        rupa_norm = g_rupa_proj.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-6)
-        norm_scale = torch.clamp(main_norm / rupa_norm, max=1.0)
-        g_rupa_safe = g_rupa_proj * norm_scale
-
-        return (g_main + g_rupa_safe).to(orig_dtype)
-
 
 class QuadSafeGate(nn.Module):
     """Immunized Quad-Stream Calibration-Aware & Semantic-Anchored Safe Gate.
@@ -1353,12 +1501,16 @@ class MARUPA(nn.Module):
         self.device = device
         self.args = args
 
-        # Ablation study flags
+        # Ablation study & MA-RUPA v2 flags
         self.no_mdtp = getattr(args, 'no_mdtp', False)
         self.no_audio = getattr(args, 'no_audio', False)
         self.no_rupa = getattr(args, 'no_rupa', False)
         self.no_safegate = getattr(args, 'no_safegate', False)
         self.sampling = getattr(args, 'sampling', 'topk')
+        self.use_aspm = getattr(args, 'use_aspm', True)
+        self.aspm_max_rank = getattr(args, 'aspm_max_rank', 48)
+        self.use_tasl = getattr(args, 'use_tasl', True)
+        self.use_pcgrad = getattr(args, 'use_pcgrad', True)
         dataset_type = 'xd' if num_class == 7 else 'ucf'
 
         # 1. Core Module 1: MDTBackbone
@@ -1372,17 +1524,19 @@ class MARUPA(nn.Module):
             no_mdtp=self.no_mdtp
         )
 
-        # 2. Core Module 2: ModalityAdaptiveBranch
+        # 2. Core Module 2: ModalityAdaptiveBranch (TD-AVCA + TASL + PCGrad)
         audio_dim = getattr(args, 'audio_dim', 128)
         self.modality_branch = ModalityAdaptiveBranch(
             embed_dim=visual_width,
             audio_dim=audio_dim,
             num_heads=visual_head,
             dropout=getattr(args, 'mlp_dropout', 0.1),
-            no_audio=self.no_audio
+            no_audio=self.no_audio,
+            use_tasl=self.use_tasl,
+            use_pcgrad=self.use_pcgrad
         )
 
-        # 3. Core Module 3: GradientSafeRUPA
+        # 3. Core Module 3: GradientSafeRUPA (with SM-ASPM v2)
         self.rupa = GradientSafeRUPA(
             feature_dim=visual_width,
             num_prototypes=getattr(args, 'num_prototypes', 16),
@@ -1392,8 +1546,12 @@ class MARUPA(nn.Module):
             sampling=self.sampling,
             normal_selection_ratio=getattr(args, 'normal_selection_ratio', 0.60),
             min_normal_frames=getattr(args, 'min_normal_frames', 4),
-            max_normal_ratio=getattr(args, 'max_normal_ratio', 0.70)
+            max_normal_ratio=getattr(args, 'max_normal_ratio', 0.70),
+            use_aspm=self.use_aspm,
+            aspm_max_rank=self.aspm_max_rank
         )
+        # Learnable semantic blend weight between Backbone CLIP Semantics & RUPA Residual Semantics
+        self.sem_bb_weight_logit = nn.Parameter(torch.tensor(0.0))
 
         # 4. Core Module 4: QuadSafeGate
         prior_weights = None
@@ -1535,10 +1693,22 @@ class MARUPA(nn.Module):
             self._text_features_cache = text_features
         return text_features
 
+    def set_epoch(self, epoch_idx: int):
+        """Updates epoch buffer for SM-ASPM adaptive Stiefel rank scheduling (1-indexed)."""
+        if hasattr(self, 'rupa') and hasattr(self.rupa, 'current_epoch_buf'):
+            self.rupa.current_epoch_buf.fill_(float(max(1, epoch_idx)))
+
+    @torch.no_grad()
+    def update_global_normal_bank(self, u_norm_batch: torch.Tensor,
+                                  binary_labels: torch.Tensor, momentum: float = 0.98):
+        """Updates Global Normal Memory Bank on primary GPU strictly from pure Normal bags."""
+        if hasattr(self, 'rupa') and not self.no_rupa:
+            self.rupa.update_global_normal_bank(u_norm_batch, binary_labels, momentum=momentum)
+
     def forward(self, visual: torch.Tensor, padding_mask: torch.Tensor = None,
                 text: list = None, lengths: torch.Tensor = None,
                 audio: torch.Tensor = None, DNP_use: bool = True, scale: float = 10.0):
-        """Full MA-RUPA forward pass.
+        """Full MA-RUPA v2 forward pass.
         
         Args:
             visual: [B, T, D] visual features
@@ -1555,29 +1725,41 @@ class MARUPA(nn.Module):
         # Step 1: MDTBackbone -> F_base, S_det
         f_base, s_det, logits_det = self.backbone(visual, padding_mask, lengths)
 
-        # Step 2: ModalityAdaptiveBranch -> F_fused, S_aux, logits_aux, G_av, av_suppress_loss
-        f_fused, s_aux, logits_aux, g_av, av_suppress_loss = self.modality_branch(
-            f_base, visual, audio_features=audio, lengths=lengths, return_suppress_loss=True
-        )
-
-        # Text features for semantic alignment (adapted & pure zero-shot anchor)
+        # Text features for semantic alignment & TASL audio lifting (adapted & pure zero-shot anchor)
         text_features_ori = self.get_text_features(text, target_device=target_device)
         text_features_zs = self.get_zero_shot_text_features(text, target_device=target_device)
 
-        # Step 3 & 4: RUPA & QuadSafeGate
+        # Step 2: ModalityAdaptiveBranch -> F_fused, S_aux, logits_aux, G_av, av_suppress_loss, audio_sem_logits
+        f_fused, s_aux, logits_aux, g_av, av_suppress_loss, audio_sem_logits = self.modality_branch(
+            f_base, visual, audio_features=audio, lengths=lengths,
+            return_suppress_loss=True, category_text_features=text_features_ori, return_tasl=True
+        )
+
+        # Per-snippet Multi-Objective PCGrad Junction between Main CLIP Semantics & RUPA Subspace
+        if DNP_use and not self.no_rupa and self.training and self.use_pcgrad:
+            f_main, f_rupa_in = GradientProjectionJunction.apply(f_fused)
+        else:
+            f_main, f_rupa_in = f_fused, f_fused
+
+        # Backbone CLIP Category Logits & Prior-Balanced Backbone Semantic Score S_sem_bb
+        text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
+        f_norm = F.normalize(f_main, dim=-1)
+        logits2 = (f_norm @ text_mat) / 0.07  # [B, T, C]
+
+        p0_bb = F.softmax(logits2, dim=-1)[:, :, :1]
+        num_c_bb = max(2, logits2.shape[-1])
+        s_sem_bb = ((1.0 - p0_bb) / (1.0 + (num_c_bb - 2.0) * p0_bb)).clamp(1e-5, 1.0 - 1e-5)
+
+        # Step 3 & 4: SM-ASPM RUPA & QuadSafeGate
         dnp_dict = {}
         if DNP_use and not self.no_rupa:
-            # Per-snippet Multi-Objective PCGrad Junction
-            if self.training:
-                f_main, f_rupa_in = GradientProjectionJunction.apply(f_fused)
-            else:
-                f_main, f_rupa_in = f_fused, f_fused
-
             f_rec, residual, s_rec, s_sem, rupa_dict = self.rupa(
                 f_rupa_in, s_det, text_features_ori, lengths=lengths,
                 visual_raw=visual, text_features_zs=text_features_zs
             )
-            p_routing, gate, s_fixed = self.safegate(s_det, s_rec, s_sem, s_aux)
+            w_bb = torch.sigmoid(self.sem_bb_weight_logit).clamp(0.25, 0.75)
+            s_sem_joint = (w_bb * s_sem_bb + (1.0 - w_bb) * s_sem).clamp(1e-5, 1.0 - 1e-5)
+            p_routing, gate, s_fixed = self.safegate(s_det, s_rec, s_sem_joint, s_aux)
             dnp_dict.update(rupa_dict)
             dnp_dict.update({
                 'routing_scores': p_routing,
@@ -1588,6 +1770,7 @@ class MARUPA(nn.Module):
                 'aux_logits': logits_aux,
                 'reconstruction_scores': s_rec,
                 'semantic_scores': s_sem,
+                'backbone_semantic_scores': s_sem_bb,
                 'fixed_scores': s_fixed,
                 'gate': gate,
                 'noise_gate_av': g_av,
@@ -1596,13 +1779,14 @@ class MARUPA(nn.Module):
                 'reconstructed_features': f_rec,
                 'residual_features': residual,
             })
+            if audio_sem_logits is not None:
+                dnp_dict['audio_semantic_logits'] = audio_sem_logits
             logits1 = logits_det
             event_features = residual
             background_features = f_rec
         else:
             # Fallback when RUPA is disabled (Ablation mode)
-            f_main = f_fused
-            p_routing, gate, s_fixed = self.safegate(s_det, s_det, s_det, s_aux)
+            p_routing, gate, s_fixed = self.safegate(s_det, s_det, s_sem_bb, s_aux)
             logits1 = logits_det
             event_features = f_fused
             background_features = f_fused
@@ -1614,7 +1798,8 @@ class MARUPA(nn.Module):
                 'aux_scores': s_aux,
                 'aux_logits': logits_aux,
                 'reconstruction_scores': torch.zeros_like(s_det),
-                'semantic_scores': torch.zeros_like(s_det),
+                'semantic_scores': s_sem_bb,
+                'backbone_semantic_scores': s_sem_bb,
                 'fixed_scores': s_fixed,
                 'gate': gate,
                 'noise_gate_av': g_av,
@@ -1626,6 +1811,8 @@ class MARUPA(nn.Module):
                 'orth_loss': torch.zeros(B, 1, device=target_device),
                 'dnp_normal_loss': torch.zeros(B, 1, device=target_device),
             })
+            if audio_sem_logits is not None:
+                dnp_dict['audio_semantic_logits'] = audio_sem_logits
 
         # Event-centric & Background-centric attention pooling
         if lengths is not None:
@@ -1648,11 +1835,6 @@ class MARUPA(nn.Module):
         alpha_ctx = self.alpha_prompt_ctx.clamp(0.01, 0.25)
         abn_feat = abn_feat + alpha_ctx * self.mlp_event(abn_feat)
         nor_feat = torch.matmul(nor_weights.permute(0, 2, 1), background_features)  # [B, 1, D]
-
-        # Snippet-level and video-level classification logits anchored to pure category prompts
-        text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
-        f_norm = F.normalize(f_main, dim=-1)
-        logits2 = (f_norm @ text_mat) / 0.07  # [B, T, C]
 
         abn_feat_norm = F.normalize(abn_feat, dim=-1)
         nor_feat_norm = F.normalize(nor_feat, dim=-1)

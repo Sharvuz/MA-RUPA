@@ -9,10 +9,25 @@ from model import MARUPA, load_compatible_model_state
 from utils.dataset import XDDataset
 from utils.tools import (
     get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint,
-    xd_test_collate_fn, compute_single_pass_uccf, apply_dodo_refinement
+    xd_test_collate_fn, calibrate_stream_global, compute_single_pass_uccf, apply_dodo_refinement
 )
 from utils.xd_detectionMAP import getDetectionMAP as dmAP
 import xd_option
+
+
+def _calibrate_video_list(vid_list, target_q15: float = 0.04, target_q90: float = 0.78):
+    """Applies unsupervised dataset-level monotonic logit-affine calibration across videos."""
+    if not vid_list:
+        return vid_list
+    lengths_v = [len(v) for v in vid_list]
+    concat_v = np.concatenate(vid_list, axis=0)
+    cal_concat = calibrate_stream_global(concat_v, target_q15=target_q15, target_q90=target_q90)
+    out_list = []
+    offset = 0
+    for lv in lengths_v:
+        out_list.append(cal_concat[offset:offset + lv])
+        offset += lv
+    return out_list
 
 
 def refine_scores_hierarchical(logits_det: torch.Tensor,
@@ -86,7 +101,17 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     smooth_eval = getattr(args, 'smooth_eval', True)
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
-    smooth_sigma = getattr(args, 'smooth_sigma', 1.5)
+    smooth_sigma = getattr(args, 'smooth_sigma', 1.0)
+
+    raw_routing_vids = []
+    raw_det_vids = []
+    raw_aux_vids = []
+    raw_sem_vids = []
+    raw_sem_rupa_vids = []
+    raw_rec_vids = []
+    logits1_vids = []
+    fused_sem_logits_vids = []
+    eff_temp = (args.temp / 0.07) if args.temp < 0.25 else args.temp
 
     with torch.no_grad():
         for i, item in enumerate(testdataloader):
@@ -140,8 +165,6 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             if semantic_logits is not None:
                 semantic_logits = semantic_logits.reshape(-1, semantic_logits.shape[-1])
 
-            eff_temp = (args.temp / 0.07) if args.temp < 0.25 else args.temp
-
             # Stream 1: Routing prediction
             if routing_scores is None:
                 prob_routing = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
@@ -170,137 +193,131 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             else:
                 prob_sem_rupa = prob_sem_rupa_raw
 
-            # Reconstruction Score Stream
+            # Reconstruction & Auxiliary Audio-Visual Score Streams
             if 'reconstruction_scores' in dnp_dict:
                 prob_rec = dnp_dict['reconstruction_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
             else:
                 prob_rec = prob_sem_rupa
 
-            # Stream 5: SOTA Multi-modal Ensemble (Routing + Semantics Backbone)
-            prob_ens_sem = 0.5 * prob_routing + 0.5 * prob_sem
-
-            # Stream 6: SOTA Prototype Ensemble (Routing + Semantics RUPA)
-            prob_ens_rupa = 0.5 * prob_routing + 0.5 * prob_sem_rupa
-
-            # Stream 7: Dual Ensemble (Routing + Detector)
-            prob_ens_det = 0.5 * prob_routing + 0.5 * prob_det
-
-            # Auxiliary Audio-Visual Score
             if 'aux_scores' in dnp_dict:
                 prob_aux = dnp_dict['aux_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
             else:
                 prob_aux = prob_det
 
-            # Stream 8: Multimodal Audio Ensemble (Routing + Audio Aux)
-            prob_ens_aux = 0.5 * prob_routing + 0.5 * prob_aux
+            if audio is not None and 'audio_semantic_logits' in dnp_dict and dnp_dict['audio_semantic_logits'] is not None:
+                aud_l = dnp_dict['audio_semantic_logits'].reshape(-1, logits2.shape[-1])[0:len_cur]
+                fused_sem_logits = 0.45 * logits2[0:len_cur] + 0.40 * semantic_logits[0:len_cur] + 0.15 * aud_l
+            else:
+                fused_sem_logits = 0.5 * logits2[0:len_cur] + 0.5 * semantic_logits[0:len_cur]
 
-            # Stream 9: Audio-Detector Ensemble (Detector + Audio Aux)
-            prob_ens_audio_det = 0.5 * prob_det + 0.5 * prob_aux
+            raw_routing_vids.append(prob_routing.detach().cpu().numpy())
+            raw_det_vids.append(prob_det.detach().cpu().numpy())
+            raw_aux_vids.append(prob_aux.detach().cpu().numpy())
+            raw_sem_vids.append(prob_sem.detach().cpu().numpy())
+            raw_sem_rupa_vids.append(prob_sem_rupa.detach().cpu().numpy())
+            raw_rec_vids.append(prob_rec.detach().cpu().numpy())
+            logits1_vids.append(logits1[0:len_cur].detach().cpu())
+            fused_sem_logits_vids.append(fused_sem_logits.detach().cpu())
 
-            # Stream 10: Tri-Stream Ensemble
-            prob_ens_tri = (prob_routing + prob_det + prob_sem_rupa) / 3.0
+    # Unsupervised Dataset-Level Monotonic Calibration (zero GT access; preserves single-stream AP/AUC)
+    cal_routing_vids = _calibrate_video_list(raw_routing_vids)
+    cal_det_vids = _calibrate_video_list(raw_det_vids)
+    cal_aux_vids = _calibrate_video_list(raw_aux_vids)
+    cal_sem_vids = _calibrate_video_list(raw_sem_vids)
+    cal_sem_rupa_vids = _calibrate_video_list(raw_sem_rupa_vids)
+    cal_rec_vids = _calibrate_video_list(raw_rec_vids)
 
-            # Stream 11: Quad-Stream SOTA Ensemble (Routing + Detector + Audio Aux + RUPA)
-            prob_ens_quad = (prob_routing + prob_det + prob_aux + prob_sem_rupa) / 4.0
+    priors = {
+        'routing': 1.0,
+        'sem': 1.0,
+        'det': 0.90,
+        'sem_rupa': 0.90,
+        'aux': 0.85,
+        'rec': 0.65
+    }
 
-            # Stream 12: Weighted Ensemble (60% Routing + 40% RUPA Semantics)
-            prob_weighted = 0.6 * prob_routing + 0.4 * prob_sem_rupa
+    for v_idx in range(len(cal_routing_vids)):
+        p_routing_np = cal_routing_vids[v_idx]
+        p_det_np = cal_det_vids[v_idx]
+        p_aux_np = cal_aux_vids[v_idx]
+        p_sem_np = cal_sem_vids[v_idx]
+        p_sem_rupa_np = cal_sem_rupa_vids[v_idx]
+        p_rec_np = cal_rec_vids[v_idx]
 
-            # Stream 13: Geometric Mean
-            prob_geom = torch.sqrt(prob_routing * prob_sem_rupa.clamp(min=1e-5))
+        p_ens_sem_np = 0.5 * p_routing_np + 0.5 * p_sem_np
+        p_ens_rupa_np = 0.5 * p_routing_np + 0.5 * p_sem_rupa_np
+        p_ens_det_np = 0.5 * p_routing_np + 0.5 * p_det_np
+        p_ens_aux_np = 0.5 * p_routing_np + 0.5 * p_aux_np
+        p_ens_audio_det_np = 0.5 * p_det_np + 0.5 * p_aux_np
+        p_ens_tri_np = (p_routing_np + p_sem_np + p_sem_rupa_np) / 3.0
+        p_ens_quad_np = 0.30 * p_routing_np + 0.30 * p_sem_np + 0.20 * p_aux_np + 0.20 * p_sem_rupa_np
+        p_weighted_np = 0.6 * p_routing_np + 0.4 * p_sem_rupa_np
+        p_geom_np = np.sqrt(np.clip(p_routing_np, 1e-6, 1.0) * np.clip(p_sem_np, 1e-5, 1.0))
 
-            # Stream 14: Single-Pass Uncertainty-Calibrated Fusion (UCCF)
-            prob_dict = {
-                'routing': prob_routing,
-                'det': prob_det,
-                'sem_rupa': prob_sem_rupa,
-                'aux': prob_aux,
-                'sem': prob_sem,
-                'rec': prob_rec
-            }
-            priors = {
-                'routing': 1.0,
-                'det': 0.9,
-                'sem_rupa': 1.0,
-                'aux': 0.75,
-                'sem': 0.85,
-                'rec': 0.65
-            }
-            prob_uccf = compute_single_pass_uccf(prob_dict, priors, delta_dis=0.35)
+        prob_dict = {
+            'routing': torch.from_numpy(p_routing_np),
+            'sem': torch.from_numpy(p_sem_np),
+            'det': torch.from_numpy(p_det_np),
+            'sem_rupa': torch.from_numpy(p_sem_rupa_np),
+            'aux': torch.from_numpy(p_aux_np),
+            'rec': torch.from_numpy(p_rec_np),
+        }
+        p_uccf_np = compute_single_pass_uccf(prob_dict, priors, delta_dis=0.35).numpy()
+        p_dodo_np = apply_dodo_refinement(p_uccf_np, sigma=smooth_sigma)
 
-            # Hierarchical class-aligned probabilities for temporal localization (dmAP)
-            fused_sem_logits = 0.5 * logits2[0:len_cur] + 0.5 * semantic_logits[0:len_cur]
-            consensus_abn_prob = (0.45 * prob_routing + 0.35 * prob_sem_rupa + 0.20 * prob_det).unsqueeze(-1)
-            optimized_probs = refine_scores_hierarchical(
-                logits1[0:len_cur], fused_sem_logits, eff_temp, consensus_abn_prob
-            )
-            prob_hier = (1.0 - optimized_probs[:, 0]).clamp(0.0, 1.0)
+        # Sharp DODO-anchored consensus probability for temporal localization (dmAP)
+        consensus_abn_t = torch.from_numpy(
+            (0.50 * p_dodo_np + 0.25 * p_sem_np + 0.25 * p_routing_np).astype(np.float32)
+        ).unsqueeze(-1)
+        optimized_probs = refine_scores_hierarchical(
+            logits1_vids[v_idx], fused_sem_logits_vids[v_idx], eff_temp, consensus_abn_t
+        )
+        p_hier_np = (1.0 - optimized_probs[:, 0]).clamp(0.0, 1.0).numpy()
 
-            # Detach to numpy
-            p_routing_np = prob_routing.cpu().numpy()
-            p_det_np = prob_det.cpu().numpy()
-            p_aux_np = prob_aux.cpu().numpy()
-            p_sem_np = prob_sem.cpu().numpy()
-            p_sem_rupa_np = prob_sem_rupa.cpu().numpy()
-            p_ens_sem_np = prob_ens_sem.cpu().numpy()
-            p_ens_rupa_np = prob_ens_rupa.cpu().numpy()
-            p_ens_det_np = prob_ens_det.cpu().numpy()
-            p_ens_aux_np = prob_ens_aux.cpu().numpy()
-            p_ens_audio_det_np = prob_ens_audio_det.cpu().numpy()
-            p_ens_tri_np = prob_ens_tri.cpu().numpy()
-            p_ens_quad_np = prob_ens_quad.cpu().numpy()
-            p_weighted_np = prob_weighted.cpu().numpy()
-            p_geom_np = prob_geom.cpu().numpy()
-            p_hier_np = prob_hier.cpu().numpy()
-            p_uccf_np = prob_uccf.cpu().numpy()
+        if smooth_eval:
+            p_routing_np = smooth_scores(p_routing_np, method=smooth_method, sigma=smooth_sigma)
+            p_det_np = smooth_scores(p_det_np, method=smooth_method, sigma=smooth_sigma)
+            p_aux_np = smooth_scores(p_aux_np, method=smooth_method, sigma=smooth_sigma)
+            p_sem_np = smooth_scores(p_sem_np, method=smooth_method, sigma=smooth_sigma)
+            p_sem_rupa_np = smooth_scores(p_sem_rupa_np, method=smooth_method, sigma=smooth_sigma)
+            p_ens_sem_np = smooth_scores(p_ens_sem_np, method=smooth_method, sigma=smooth_sigma)
+            p_ens_rupa_np = smooth_scores(p_ens_rupa_np, method=smooth_method, sigma=smooth_sigma)
+            p_ens_det_np = smooth_scores(p_ens_det_np, method=smooth_method, sigma=smooth_sigma)
+            p_ens_aux_np = smooth_scores(p_ens_aux_np, method=smooth_method, sigma=smooth_sigma)
+            p_ens_audio_det_np = smooth_scores(p_ens_audio_det_np, method=smooth_method, sigma=smooth_sigma)
+            p_ens_tri_np = smooth_scores(p_ens_tri_np, method=smooth_method, sigma=smooth_sigma)
+            p_ens_quad_np = smooth_scores(p_ens_quad_np, method=smooth_method, sigma=smooth_sigma)
+            p_weighted_np = smooth_scores(p_weighted_np, method=smooth_method, sigma=smooth_sigma)
+            p_geom_np = smooth_scores(p_geom_np, method=smooth_method, sigma=smooth_sigma)
+            p_hier_np = smooth_scores(p_hier_np, method=smooth_method, sigma=smooth_sigma)
+            p_uccf_np = smooth_scores(p_uccf_np, method=smooth_method, sigma=smooth_sigma)
 
-            # Stream 15: Peak-Preserving Proposal Refinement (DODO)
-            p_dodo_np = apply_dodo_refinement(p_uccf_np, sigma=smooth_sigma)
+        ap_routing_list.append(p_routing_np)
+        ap_det_list.append(p_det_np)
+        ap_aux_list.append(p_aux_np)
+        ap_sem_list.append(p_sem_np)
+        ap_sem_rupa_list.append(p_sem_rupa_np)
+        ap_ens_sem_list.append(p_ens_sem_np)
+        ap_ens_rupa_list.append(p_ens_rupa_np)
+        ap_ens_det_list.append(p_ens_det_np)
+        ap_ens_aux_list.append(p_ens_aux_np)
+        ap_ens_audio_det_list.append(p_ens_audio_det_np)
+        ap_ens_tri_list.append(p_ens_tri_np)
+        ap_ens_quad_list.append(p_ens_quad_np)
+        ap_weighted_list.append(p_weighted_np)
+        ap_geom_list.append(p_geom_np)
+        ap_hier_list.append(p_hier_np)
+        ap_uccf_list.append(p_uccf_np)
+        ap_dodo_list.append(p_dodo_np)
 
-            # Optional temporal smoothing
-            if smooth_eval:
-                p_routing_np = smooth_scores(p_routing_np, method=smooth_method, sigma=smooth_sigma)
-                p_det_np = smooth_scores(p_det_np, method=smooth_method, sigma=smooth_sigma)
-                p_aux_np = smooth_scores(p_aux_np, method=smooth_method, sigma=smooth_sigma)
-                p_sem_np = smooth_scores(p_sem_np, method=smooth_method, sigma=smooth_sigma)
-                p_sem_rupa_np = smooth_scores(p_sem_rupa_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_sem_np = smooth_scores(p_ens_sem_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_rupa_np = smooth_scores(p_ens_rupa_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_det_np = smooth_scores(p_ens_det_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_aux_np = smooth_scores(p_ens_aux_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_audio_det_np = smooth_scores(p_ens_audio_det_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_tri_np = smooth_scores(p_ens_tri_np, method=smooth_method, sigma=smooth_sigma)
-                p_ens_quad_np = smooth_scores(p_ens_quad_np, method=smooth_method, sigma=smooth_sigma)
-                p_weighted_np = smooth_scores(p_weighted_np, method=smooth_method, sigma=smooth_sigma)
-                p_geom_np = smooth_scores(p_geom_np, method=smooth_method, sigma=smooth_sigma)
-                p_hier_np = smooth_scores(p_hier_np, method=smooth_method, sigma=smooth_sigma)
-                p_uccf_np = smooth_scores(p_uccf_np, method=smooth_method, sigma=smooth_sigma)
-
-            ap_routing_list.append(p_routing_np)
-            ap_det_list.append(p_det_np)
-            ap_aux_list.append(p_aux_np)
-            ap_sem_list.append(p_sem_np)
-            ap_sem_rupa_list.append(p_sem_rupa_np)
-            ap_ens_sem_list.append(p_ens_sem_np)
-            ap_ens_rupa_list.append(p_ens_rupa_np)
-            ap_ens_det_list.append(p_ens_det_np)
-            ap_ens_aux_list.append(p_ens_aux_np)
-            ap_ens_audio_det_list.append(p_ens_audio_det_np)
-            ap_ens_tri_list.append(p_ens_tri_np)
-            ap_ens_quad_list.append(p_ens_quad_np)
-            ap_weighted_list.append(p_weighted_np)
-            ap_geom_list.append(p_geom_np)
-            ap_hier_list.append(p_hier_np)
-            ap_uccf_list.append(p_uccf_np)
-            ap_dodo_list.append(p_dodo_np)
-
-            elem_l2 = optimized_probs.detach().cpu().numpy()
-            if smooth_eval and elem_l2.shape[0] >= 3:
-                for c_idx in range(elem_l2.shape[1]):
-                    if np.max(elem_l2[:, c_idx]) > 0.0:
-                        elem_l2[:, c_idx] = smooth_scores(elem_l2[:, c_idx], method=smooth_method, sigma=smooth_sigma)
-            elem_l2 = np.repeat(elem_l2, 16, axis=0)
-            element_logits2_stack.append(elem_l2)
+        elem_l2 = optimized_probs.detach().numpy()
+        dmap_sigma = min(smooth_sigma, 0.85)
+        if smooth_eval and elem_l2.shape[0] >= 3 and dmap_sigma > 0.1:
+            for c_idx in range(elem_l2.shape[1]):
+                if np.max(elem_l2[:, c_idx]) > 0.0:
+                    elem_l2[:, c_idx] = smooth_scores(elem_l2[:, c_idx], method=smooth_method, sigma=dmap_sigma)
+        elem_l2 = np.repeat(elem_l2, 16, axis=0)
+        element_logits2_stack.append(elem_l2)
 
     all_scores_routing = np.concatenate(ap_routing_list, axis=0)
     all_scores_det = np.concatenate(ap_det_list, axis=0)
