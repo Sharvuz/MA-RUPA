@@ -45,12 +45,26 @@ def train(args):
         args.max_epoch = 10
     if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
         args.curriculum_epochs = 3.0
-    if getattr(args, 'lambda_smooth', 0.10) > 0.15:
-        args.lambda_smooth = 0.10
+    if getattr(args, 'lambda_smooth', 0.08) > 0.15 or getattr(args, 'lambda_smooth', 0.08) < 0.02:
+        args.lambda_smooth = 0.08
     if getattr(args, 'lambda_aux', 0.15) > 0.20:
         args.lambda_aux = 0.15
-    if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 0.75) > 0.85:
-        args.smooth_sigma = 0.75
+    if getattr(args, 'use_epts', True):
+        if getattr(args, 'topk_ratio', 16) < 12:
+            args.topk_ratio = 16
+        if getattr(args, 'smooth_sigma', 0.75) > 0.85:
+            args.smooth_sigma = 0.75
+    if getattr(args, 'use_aspm', True):
+        if getattr(args, 'lambda_gather', 0.12) < 0.08:
+            args.lambda_gather = 0.12
+        if getattr(args, 'lambda_orth', 0.05) < 0.04:
+            args.lambda_orth = 0.05
+        if getattr(args, 'lambda_consistency', 0.35) < 0.15:
+            args.lambda_consistency = 0.35
+        if getattr(args, 'loss2_weight', 1.2) < 1.2:
+            args.loss2_weight = 1.2
+        if getattr(args, 'temp', 1.0) > 1.2:
+            args.temp = 1.0
 
     # Set random seeds
     random.seed(args.seed)

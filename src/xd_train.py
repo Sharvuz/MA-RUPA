@@ -57,10 +57,19 @@ def train(args):
         args.lambda_aux = 0.28
     if getattr(args, 'routing_aux_weight', 0.18) > 0.22:
         args.routing_aux_weight = 0.20
-    if getattr(args, 'lambda_smooth', 0.10) > 0.15:
-        args.lambda_smooth = 0.10
+    if getattr(args, 'lambda_smooth', 0.08) > 0.15 or getattr(args, 'lambda_smooth', 0.08) < 0.02:
+        args.lambda_smooth = 0.08
     if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 1.0) > 1.25:
         args.smooth_sigma = 1.0
+    if getattr(args, 'use_aspm', True):
+        if getattr(args, 'lambda_gather', 0.12) < 0.08:
+            args.lambda_gather = 0.12
+        if getattr(args, 'lambda_orth', 0.05) < 0.04:
+            args.lambda_orth = 0.05
+        if getattr(args, 'lambda_consistency', 0.35) < 0.15:
+            args.lambda_consistency = 0.35
+        if getattr(args, 'temp', 1.0) > 1.2:
+            args.temp = 1.0
 
     # Set random seeds
     random.seed(args.seed)
