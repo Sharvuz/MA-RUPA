@@ -783,9 +783,9 @@ class GradientSafeRUPA(nn.Module):
         self.use_aspm = use_aspm
         self.num_prototypes = max(num_prototypes, aspm_max_rank) if use_aspm else num_prototypes
         self.sampling = sampling
-        self.normal_selection_ratio = min(normal_selection_ratio, 0.65)
+        self.normal_selection_ratio = min(normal_selection_ratio, 0.85)
         self.min_normal_frames = min_normal_frames
-        self.max_normal_ratio = min(max_normal_ratio, 0.75)
+        self.max_normal_ratio = min(max_normal_ratio, 0.90)
         self.repulsion_margin = repulsion_margin
 
         # Orthonormal Stiefel initialization via pure torch.bmm (zero cuSOLVER calls)

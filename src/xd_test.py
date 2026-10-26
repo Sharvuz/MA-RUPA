@@ -230,10 +230,10 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     priors = {
         'routing': 1.0,
         'sem': 1.0,
-        'det': 0.90,
-        'sem_rupa': 0.90,
+        'det': 0.95,
+        'sem_rupa': 0.25,
         'aux': 0.85,
-        'rec': 0.65
+        'rec': 0.05
     }
 
     for v_idx in range(len(cal_routing_vids)):

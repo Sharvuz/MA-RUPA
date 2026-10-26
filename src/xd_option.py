@@ -35,9 +35,9 @@ parser.add_argument('--audio-dir', default=None, type=str, help='Optional direct
 parser.add_argument('--num_prototypes', type=int, default=16, help='Number of Dynamic Normal Prototypes (M=16)')
 parser.add_argument('--decoder_depth', type=int, default=4, help='Prototype reconstruction decoder depth')
 parser.add_argument('--sampling', choices=['topk', 'otsu'], default='topk', help='Pseudo-normal segment selection method')
-parser.add_argument('--normal_selection_ratio', type=float, default=0.60, help='Selection ratio for top-k normal mining (0.60 prevents long-anomaly leakage)')
+parser.add_argument('--normal_selection_ratio', type=float, default=0.80, help='Selection ratio for top-k normal mining (0.80 matches DSANet SOTA)')
 parser.add_argument('--min_normal_frames', type=int, default=4, help='Minimum normal frames to select per video')
-parser.add_argument('--max_normal_ratio', type=float, default=0.70, help='Maximum normal frames ratio')
+parser.add_argument('--max_normal_ratio', type=float, default=0.85, help='Maximum normal frames ratio')
 parser.add_argument('--DNP_use', default=True, type=str2bool, help='Whether to use Dynamic Normal Prototypes')
 
 # Adapter & Temperature
