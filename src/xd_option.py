@@ -67,7 +67,7 @@ parser.add_argument('--routing-aux-weight', default=0.12, type=float, help='Prio
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for optimal convergence)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size for training (32 normal + 32 anomaly)')
-parser.add_argument('--lr', type=float, default=4.5e-5, help='Learning rate for End-to-End AdamW optimizer (default 4.5e-5)')
+parser.add_argument('--lr', type=float, default=3.5e-5, help='Learning rate for End-to-End AdamW optimizer (default 3.5e-5)')
 parser.add_argument('--weight-decay', type=float, default=2e-3, help='Weight decay for regularization (default 2e-3)')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 3.0)')
 parser.add_argument('--max-omega', default=0.25, type=float, help='Maximum curriculum omega ceiling (default 0.25 for SM-ASPM v2)')
@@ -75,7 +75,7 @@ parser.add_argument('--topk-ratio', type=int, default=8, help='Base divisor for 
 parser.add_argument('--topk-ratio-clasm', type=int, default=8, help='Top-k divisor for snippet multi-class classification (default 8)')
 parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0; AT-BCE + OHNM prevents collapse)')
 parser.add_argument('--snippet-dropout', type=float, default=0.15, help='Snippet dropout rate during training to prevent 1-frame spike collapse (default 0.15)')
-parser.add_argument('--sample-one-crop-per-video', default=True, type=str2bool, help='Randomly sample 1 crop per video per epoch (default True: data augmentation & prevents crop memorization)')
+parser.add_argument('--sample-one-crop-per-video', default=False, type=str2bool, help='Randomly sample 1 crop per video per epoch (default False: use all crops for full coverage)')
 parser.add_argument('--vatk', default=True, type=str2bool, help='Whether to use Variance-Adaptive Top-K selection (default True)')
 parser.add_argument('--gamma-edge', default=5.0, type=float, help='Edge-preserving sensitivity for SA-EPTS smoothness loss (default 5.0)')
 parser.add_argument('--lambda-entropy', default=0.02, type=float, help='Soft maximum entropy regularization weight (default 0.02)')
@@ -89,7 +89,7 @@ parser.add_argument('--lambda-orth', type=float, default=0.05, help='Weight for 
 parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight for DNP subspace gather loss (default 0.12)')
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate KL regularization loss (default 0.01)')
-parser.add_argument('--loss2_weight', type=float, default=3.5, help='Weight for VLM snippet classification loss (default 3.5)')
+parser.add_argument('--loss2_weight', type=float, default=1.8, help='Weight for VLM snippet classification loss (default 1.8)')
 parser.add_argument('--lambda-consistency', type=float, default=0.10, help='Weight for confidence-gated consistency loss between detector and reconstruction (default 0.10)')
 parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss (default 0.5)')
 

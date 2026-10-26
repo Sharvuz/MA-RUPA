@@ -62,8 +62,8 @@ def train(args):
             args.lambda_orth = 0.05
         if getattr(args, 'lambda_consistency', 0.10) > 0.25:
             args.lambda_consistency = 0.10
-        if getattr(args, 'loss2_weight', 3.5) < 1.5:
-            args.loss2_weight = 3.5
+        if getattr(args, 'loss2_weight', 1.8) < 0.5:
+            args.loss2_weight = 1.8
         if getattr(args, 'temp', 1.0) > 1.2:
             args.temp = 1.0
 
