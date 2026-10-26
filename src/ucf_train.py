@@ -45,6 +45,8 @@ def train(args):
         args.max_epoch = 10
     if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
         args.curriculum_epochs = 3.0
+    if getattr(args, 'max_omega', 0.20) > 0.30:
+        args.max_omega = 0.20
     if getattr(args, 'lambda_smooth', 0.08) > 0.15 or getattr(args, 'lambda_smooth', 0.08) < 0.02:
         args.lambda_smooth = 0.08
     if getattr(args, 'lambda_aux', 0.15) > 0.20:
@@ -59,12 +61,12 @@ def train(args):
             args.lambda_gather = 0.12
         if getattr(args, 'lambda_orth', 0.05) < 0.04:
             args.lambda_orth = 0.05
-        if getattr(args, 'lambda_consistency', 0.35) < 0.15:
-            args.lambda_consistency = 0.35
-        if getattr(args, 'loss2_weight', 1.2) < 1.2:
+        if getattr(args, 'lambda_consistency', 0.10) > 0.25:
+            args.lambda_consistency = 0.10
+        if getattr(args, 'loss2_weight', 1.2) < 1.0:
             args.loss2_weight = 1.2
-        if getattr(args, 'temp', 1.0) > 1.2:
-            args.temp = 1.0
+        if getattr(args, 'temp', 1.0) > 5.5:
+            args.temp = 5.0
 
     # Set random seeds
     random.seed(args.seed)
@@ -203,8 +205,12 @@ def train(args):
         if hasattr(anomaly_dataset, 'resample_crops'):
             anomaly_dataset.resample_crops()
 
-        # Smooth Cosine Curriculum Ramp-up
-        omega = get_curriculum_omega(epoch_idx, getattr(args, 'curriculum_epochs', 3.0))
+        # Smooth Cosine Curriculum Ramp-up with max_omega ceiling
+        omega = get_curriculum_omega(
+            epoch_idx,
+            curriculum_epochs=getattr(args, 'curriculum_epochs', 3.0),
+            max_omega=getattr(args, 'max_omega', 0.20)
+        )
 
         loss_accum = {
             'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'tasl': 0.0, 'bkg': 0.0, 'consist': 0.0,

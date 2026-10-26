@@ -35,9 +35,9 @@ parser.add_argument('--max_normal_ratio', type=float, default=0.85, help='Maximu
 parser.add_argument('--DNP_use', default=True, type=str2bool, help='Whether to use Dynamic Normal Prototypes')
 
 # Adapter & Temperature
-parser.add_argument('--text_adapt_until', default=3, type=int, help='CLIP text adapter depth')
-parser.add_argument('--t_w', default=0.15, type=float, help='Text adapter residual interpolation weight')
-parser.add_argument('--temp', default=1.0, type=float, help='Logit scaling temperature for evaluation refinement (default 1.0)')
+parser.add_argument('--text_adapt_until', default=3, type=int, help='CLIP text adapter depth (default 3)')
+parser.add_argument('--t_w', default=0.10, type=float, help='Text adapter residual interpolation weight (default 0.10 matches DSANet)')
+parser.add_argument('--temp', default=5.0, type=float, help='Logit scaling temperature for evaluation refinement (default 5.0 matches DSANet)')
 
 # Ablation & MA-RUPA v2 Breakthrough Flags
 parser.add_argument('--no-mdtp', action='store_true', default=False, help='Ablation: disable Multi-Scale Dilated Temporal Pyramid')
@@ -61,9 +61,10 @@ parser.add_argument('--routing-aux-weight', default=0.15, type=float, help='Prio
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for optimal convergence)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size (32 normal + 32 anomaly)')
-parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for End-to-End AdamW optimizer (default 1e-4)')
+parser.add_argument('--lr', type=float, default=7e-5, help='Learning rate for End-to-End AdamW optimizer (default 7e-5)')
 parser.add_argument('--weight-decay', type=float, default=2e-3, help='Weight decay for regularization (default 2e-3)')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 3.0)')
+parser.add_argument('--max-omega', default=0.20, type=float, help='Maximum curriculum omega ceiling (default 0.20 to prevent over-regularization)')
 parser.add_argument('--topk-ratio', type=int, default=16, help='Base divisor for variance-adaptive top-k (VAT-K) selection (default 16 -> ~6.25%% frames for sparse CCTV crimes)')
 parser.add_argument('--topk-ratio-clasm', type=int, default=16, help='Top-k divisor for snippet multi-class classification (default 16)')
 parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0; AT-BCE + OHNM prevents collapse)')
@@ -83,7 +84,7 @@ parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight fo
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate KL regularization loss (default 0.01)')
 parser.add_argument('--loss2_weight', type=float, default=1.2, help='Weight for snippet multi-class classification loss (default 1.2)')
-parser.add_argument('--lambda-consistency', type=float, default=0.35, help='Weight for confidence-gated consistency loss between detector and RUPA (default 0.35)')
+parser.add_argument('--lambda-consistency', type=float, default=0.10, help='Weight for confidence-gated consistency loss between detector and RUPA (default 0.10)')
 parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss (default 0.5)')
 
 # Data & Paths
