@@ -129,7 +129,11 @@ def compute_at_bce_topk_mil_loss(scores: torch.Tensor,
                     k_erase = max(1, min(3, int(l_i * 0.03)))
                     _, peak_idx = torch.topk(valid_s.detach(), k=k_erase, largest=True)
                     keep_mask = keep_mask.clone()
-                    keep_mask[peak_idx] = False
+                    # Block-wise K-Dropout: mask peak snippets and their immediate temporal neighbors
+                    # so adjacent frames of the same spike cannot shortcut Top-K MIL
+                    for offset in (-1, 0, 1):
+                        nbr_idx = (peak_idx + offset).clamp(0, l_i - 1)
+                        keep_mask[nbr_idx] = False
 
             if not keep_mask.any():
                 keep_mask[torch.randint(0, l_i, (1,), device=device)] = True
@@ -489,7 +493,9 @@ def compute_clasm_loss(logits: torch.Tensor,
                 abn_peak = cand_logits[:, 1:].detach().max(dim=-1).values
                 _, peak_idx = torch.topk(abn_peak, k=k_erase, largest=True)
                 keep_mask = torch.ones(l_i, dtype=torch.bool, device=device)
-                keep_mask[peak_idx] = False
+                for offset in (-1, 0, 1):
+                    nbr_idx = (peak_idx + offset).clamp(0, l_i - 1)
+                    keep_mask[nbr_idx] = False
                 if keep_mask.any():
                     cand_logits = cand_logits[keep_mask]
 

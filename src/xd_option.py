@@ -42,7 +42,7 @@ parser.add_argument('--DNP_use', default=True, type=str2bool, help='Whether to u
 
 # Adapter & Temperature
 parser.add_argument('--text_adapt_until', default=2, type=int, help='CLIP text adapter depth')
-parser.add_argument('--t_w', default=0.25, type=float, help='Text adapter residual interpolation weight')
+parser.add_argument('--t_w', default=0.45, type=float, help='Text adapter residual interpolation weight')
 parser.add_argument('--temp', default=1.0, type=float, help='Logit scaling temperature for evaluation refinement')
 
 # Ablation & MA-RUPA v2 Breakthrough Flags
@@ -59,18 +59,18 @@ parser.add_argument('--routing-mode', choices=['fixed', 'safe_gate'], default='s
 parser.add_argument('--routing-gate-hidden', default=32, type=int, help='Hidden dimension of dynamic safe gate MLP')
 
 # Prior weights for XD-Violence (with Audio)
-parser.add_argument('--routing-det-weight', default=0.30, type=float, help='Prior weight for detector stream')
-parser.add_argument('--routing-rec-weight', default=0.20, type=float, help='Prior weight for reconstruction stream')
-parser.add_argument('--routing-sem-weight', default=0.30, type=float, help='Prior weight for semantic stream')
-parser.add_argument('--routing-aux-weight', default=0.20, type=float, help='Prior weight for auxiliary audio-visual stream')
+parser.add_argument('--routing-det-weight', default=0.40, type=float, help='Prior weight for detector stream')
+parser.add_argument('--routing-rec-weight', default=0.08, type=float, help='Prior weight for reconstruction stream')
+parser.add_argument('--routing-sem-weight', default=0.40, type=float, help='Prior weight for semantic stream')
+parser.add_argument('--routing-aux-weight', default=0.12, type=float, help='Prior weight for auxiliary audio-visual stream')
 
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for optimal convergence)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size for training (32 normal + 32 anomaly)')
-parser.add_argument('--lr', type=float, default=1.2e-4, help='Learning rate for End-to-End AdamW optimizer (default 1.2e-4)')
+parser.add_argument('--lr', type=float, default=4.5e-5, help='Learning rate for End-to-End AdamW optimizer (default 4.5e-5)')
 parser.add_argument('--weight-decay', type=float, default=2e-3, help='Weight decay for regularization (default 2e-3)')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 3.0)')
-parser.add_argument('--max-omega', default=0.40, type=float, help='Maximum curriculum omega ceiling (default 0.40 for SM-ASPM v2)')
+parser.add_argument('--max-omega', default=0.25, type=float, help='Maximum curriculum omega ceiling (default 0.25 for SM-ASPM v2)')
 parser.add_argument('--topk-ratio', type=int, default=8, help='Base divisor for variance-adaptive top-k (VAT-K) selection (default 8 -> ~12.5%% frames)')
 parser.add_argument('--topk-ratio-clasm', type=int, default=8, help='Top-k divisor for snippet multi-class classification (default 8)')
 parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0; AT-BCE + OHNM prevents collapse)')
@@ -82,15 +82,15 @@ parser.add_argument('--lambda-entropy', default=0.02, type=float, help='Soft max
 parser.add_argument('--lambda-ohnm', default=0.2, type=float, help='Online hard negative mining weight for normal bags (default 0.2)')
 
 # Loss Weighting (Pareto optimal weighting for simultaneous Detector and RUPA performance)
-parser.add_argument('--lambda-aux', type=float, default=0.30, help='Weight for auxiliary multimodal MIL loss (default 0.30)')
+parser.add_argument('--lambda-aux', type=float, default=0.18, help='Weight for auxiliary multimodal MIL loss (default 0.18)')
 parser.add_argument('--lambda-tasl', type=float, default=0.25, help='Weight for TASL audio-visual semantic alignment loss (default 0.25)')
 parser.add_argument('--lambda-smooth', type=float, default=0.08, help='Weight for SA-EPTS edge-preserving smoothness & halo expansion loss (default 0.08)')
 parser.add_argument('--lambda-orth', type=float, default=0.05, help='Weight for active-slot prototype orthogonality & repulsion loss (default 0.05)')
 parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight for DNP subspace gather loss (default 0.12)')
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate KL regularization loss (default 0.01)')
-parser.add_argument('--loss2_weight', type=float, default=0.8, help='Weight for snippet classification loss (default 0.8)')
-parser.add_argument('--lambda-consistency', type=float, default=0.35, help='Weight for confidence-gated consistency loss between detector and reconstruction (default 0.35)')
+parser.add_argument('--loss2_weight', type=float, default=3.5, help='Weight for VLM snippet classification loss (default 3.5)')
+parser.add_argument('--lambda-consistency', type=float, default=0.10, help='Weight for confidence-gated consistency loss between detector and reconstruction (default 0.10)')
 parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss (default 0.5)')
 
 # Data & Paths

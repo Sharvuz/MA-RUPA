@@ -45,18 +45,12 @@ def train(args):
         args.max_epoch = 10
     if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
         args.curriculum_epochs = 3.0
-    if getattr(args, 'use_aspm', True):
-        if getattr(args, 'max_omega', 0.40) > 0.45:
-            args.max_omega = 0.45
-        elif getattr(args, 'max_omega', 0.40) <= 0.26:
-            args.max_omega = 0.38
-    else:
-        if getattr(args, 'max_omega', 0.25) > 0.25:
-            args.max_omega = 0.25
-    if getattr(args, 'lambda_aux', 0.25) > 0.30:
-        args.lambda_aux = 0.28
-    if getattr(args, 'routing_aux_weight', 0.18) > 0.22:
-        args.routing_aux_weight = 0.20
+    if getattr(args, 'max_omega', 0.25) > 0.35:
+        args.max_omega = 0.25
+    if getattr(args, 'lambda_aux', 0.18) > 0.25:
+        args.lambda_aux = 0.18
+    if getattr(args, 'routing_aux_weight', 0.12) > 0.18:
+        args.routing_aux_weight = 0.12
     if getattr(args, 'lambda_smooth', 0.08) > 0.15 or getattr(args, 'lambda_smooth', 0.08) < 0.02:
         args.lambda_smooth = 0.08
     if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 1.0) > 1.25:
@@ -66,8 +60,10 @@ def train(args):
             args.lambda_gather = 0.12
         if getattr(args, 'lambda_orth', 0.05) < 0.04:
             args.lambda_orth = 0.05
-        if getattr(args, 'lambda_consistency', 0.35) < 0.15:
-            args.lambda_consistency = 0.35
+        if getattr(args, 'lambda_consistency', 0.10) > 0.25:
+            args.lambda_consistency = 0.10
+        if getattr(args, 'loss2_weight', 3.5) < 1.5:
+            args.loss2_weight = 3.5
         if getattr(args, 'temp', 1.0) > 1.2:
             args.temp = 1.0
 

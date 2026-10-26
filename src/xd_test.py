@@ -232,7 +232,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         'sem': 1.0,
         'det': 0.95,
         'sem_rupa': 0.25,
-        'aux': 0.85,
+        'aux': 0.30,
         'rec': 0.05
     }
 

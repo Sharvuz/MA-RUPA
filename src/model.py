@@ -213,6 +213,60 @@ class GlobalLinearContextAggregator(nn.Module):
         return out
 
 
+class HyperbolicPoincareScorer(nn.Module):
+    """Dual-Space Euclidean + Hyperbolic Poincaré Ball Hierarchical Anomaly Scorer.
+    
+    Projects tangent features v in R^D onto the negative-curvature Poincaré ball B_c^D
+    via the Riemannian Exponential Map at the origin:
+        exp_0^c(v) = tanh(sqrt(c) * ||v||_2) * (v / (sqrt(c) * ||v||_2 + eps))
+    Captures the tree-like hierarchical severity of violent events (Normal root near 0 ->
+    Dispute/Motion at intermediate geodesic radius -> Severe Violence near boundary).
+    100% DataParallel & FP16/FP32 safe (norm-clipped, zero cuSOLVER calls).
+    """
+    def __init__(self, embed_dim: int = 512, hyp_dim: int = 128, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.hyp_dim = hyp_dim
+        self.tangent_proj = nn.Sequential(
+            LayerNormFP32(embed_dim),
+            nn.Linear(embed_dim, hyp_dim),
+            QuickGELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hyp_dim, hyp_dim)
+        )
+        # Learnable curvature c in [0.02, 0.25], initialized near c = 0.08
+        self.curv_logit = nn.Parameter(torch.tensor(-2.45))
+        # Hyperbolic hyperplane decision direction & geodesic radius weight
+        self.hyp_dir = nn.Linear(hyp_dim, 1)
+        self.radius_scale = nn.Parameter(torch.tensor(0.35))
+        self.radius_bias = nn.Parameter(torch.tensor(-1.50))
+
+    @staticmethod
+    def exp_map_zero(v: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Numerically stable exponential map exp_0^c(v) onto Poincaré ball B_c^d."""
+        v_f = v.float()
+        v_norm = torch.norm(v_f, p=2, dim=-1, keepdim=True).clamp(min=1e-6)
+        # Clip tangent norm so tanh never saturates to 1.0
+        v_clipped = v_f * (torch.clamp(v_norm, max=10.0) / v_norm)
+        sqrt_c = torch.sqrt(c.float().clamp(0.02, 0.25))
+        scaled_norm = (sqrt_c * torch.norm(v_clipped, p=2, dim=-1, keepdim=True)).clamp(min=1e-6, max=6.0)
+        z = torch.tanh(scaled_norm) * (v_clipped / scaled_norm)
+        return z.to(v.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns hyperbolic anomaly logits [B, T, 1]."""
+        c = F.softplus(self.curv_logit).clamp(0.02, 0.25)
+        v_tan = self.tangent_proj(x)
+        z_hyp = self.exp_map_zero(v_tan, c)  # [B, T, hyp_dim]
+        # Geodesic distance from normal origin: d_B(0, z) = (2/sqrt(c)) * atanh(sqrt(c)*||z||)
+        sqrt_c = torch.sqrt(c.float())
+        z_norm = (sqrt_c * torch.norm(z_hyp.float(), p=2, dim=-1, keepdim=True)).clamp(min=1e-6, max=0.98)
+        geodesic_rad = (2.0 / sqrt_c) * torch.atanh(z_norm)
+        logits_dir = self.hyp_dir(z_hyp)
+        logits_rad = self.radius_scale.to(x.dtype) * geodesic_rad.to(x.dtype) + self.radius_bias.to(x.dtype)
+        return logits_dir + logits_rad
+
+
 class MDTBackbone(nn.Module):
     """Multi-Scale Dilated Temporal & Local Attention Backbone.
     
@@ -270,7 +324,7 @@ class MDTBackbone(nn.Module):
         self.alpha_backbone = nn.Parameter(torch.tensor(0.15))
         self.out_norm = LayerNormFP32(embed_dim)
 
-        # Base Anomaly Classifier Head
+        # Base Anomaly Classifier Head (Dual-Space: Euclidean + Hyperbolic Poincaré Ball)
         self.mlp_det = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(embed_dim, embed_dim * 4)),
             ("gelu", QuickGELU()),
@@ -279,6 +333,8 @@ class MDTBackbone(nn.Module):
             ("dropout2", nn.Dropout(mlp_dropout))
         ]))
         self.classifier_det = nn.Linear(embed_dim, 1)
+        self.hyp_scorer = HyperbolicPoincareScorer(embed_dim=embed_dim, hyp_dim=128, dropout=mlp_dropout)
+        self.alpha_hyp_det = nn.Parameter(torch.tensor(0.25))
 
     def build_window_attention_mask(self, length: int, window: int, device: torch.device):
         """Construct block-diagonal window attention mask.
@@ -350,9 +406,12 @@ class MDTBackbone(nn.Module):
         # Crucial CLIP Anchor Skip Connection: F_base = LayerNorm(X_clip + alpha * FusedContext)
         f_base = self.out_norm(visual_features + self.alpha_backbone * fused_context)
 
-        # Base Anomaly Classifier
+        # Dual-Space Base Anomaly Classifier (Euclidean + Hyperbolic Poincaré Ball)
         det_features = f_base + self.mlp_det(f_base)
-        logits_det = self.classifier_det(det_features)  # [B, T, 1]
+        logits_euc = self.classifier_det(det_features)  # [B, T, 1]
+        logits_hyp = self.hyp_scorer(det_features)      # [B, T, 1]
+        w_hyp = self.alpha_hyp_det.clamp(0.05, 0.45)
+        logits_det = (1.0 - w_hyp) * logits_euc + w_hyp * logits_hyp
         s_det = torch.sigmoid(logits_det)
 
         return f_base, s_det, logits_det
@@ -474,6 +533,12 @@ class ModalityAdaptiveBranch(nn.Module):
         self.alpha_tasl = nn.Parameter(torch.tensor(0.30))
         self.tasl_log_temp = nn.Parameter(torch.tensor(math.log(0.08)))
 
+        # MAVD-Style Sparse Feature Matching Subspace (Aligning First before Multi-Head Fusion)
+        self.subspace_v = nn.Linear(embed_dim, embed_dim // 2, bias=False)
+        self.subspace_a = nn.Linear(embed_dim, embed_dim // 2, bias=False)
+        self.ln_sparse_align = LayerNormFP32(embed_dim)
+        self.alpha_sparse_align = nn.Parameter(torch.tensor(0.45))
+
         # Cross-Modal Attention: Query=F_base (Visual), Key=F_a (Auxiliary), Value=F_a
         self.cross_attn = nn.MultiheadAttention(
             embed_dim, num_heads, dropout=dropout, batch_first=True
@@ -558,6 +623,37 @@ class ModalityAdaptiveBranch(nn.Module):
         snip_keep = (torch.rand(B, T, 1, device=device) >= self.drop_audio_snip_p).to(f_audio.dtype)
         keep_mask = bag_keep * snip_keep
         return keep_mask * f_audio + (1.0 - keep_mask) * f_motion
+
+    def align_sparse_audio_subspace(self, f_vis: torch.Tensor, f_aud: torch.Tensor,
+                                    key_pad_mask: torch.Tensor = None, topk_sparse: int = 3) -> torch.Tensor:
+        """MAVD-Style Sparse Semantic Subspace Alignment (Aligning First).
+        
+        Projects visual and audio into a shared Feature Matching Subspace and performs
+        Top-k Sparse Cross-Time Alignment within local temporal window |t - t'| <= delay_window.
+        Resolves temporal asynchrony (e.g. gunshot preceding visual smoke) and filters out
+        uncorrelated background noise before Multi-Head Attention.
+        """
+        B, T, _ = f_vis.shape
+        device = f_vis.device
+        q_sub = F.normalize(self.subspace_v(f_vis.detach()), dim=-1)  # [B, T, D/2]
+        k_sub = F.normalize(self.subspace_a(f_aud), dim=-1)           # [B, T, D/2]
+
+        sim = torch.bmm(q_sub, k_sub.transpose(1, 2)) / 0.10          # [B, T, T]
+        idx = torch.arange(T, device=device)
+        valid_band = (idx[:, None] - idx[None, :]).abs() <= self.delay_window
+        sim = sim.masked_fill(~valid_band.unsqueeze(0), -1e4)
+        if key_pad_mask is not None:
+            sim = sim.masked_fill(key_pad_mask.unsqueeze(1), -1e4)
+
+        k_sel = max(1, min(topk_sparse, T, 2 * self.delay_window + 1))
+        topk_vals, topk_idx = torch.topk(sim, k=k_sel, dim=-1)        # [B, T, k_sel]
+        sparse_weights = F.softmax(topk_vals, dim=-1)                 # [B, T, k_sel]
+
+        sparse_attn = torch.zeros_like(sim)
+        sparse_attn.scatter_(-1, topk_idx, sparse_weights.to(sim.dtype))
+        f_aud_aligned = torch.bmm(sparse_attn, f_aud)                 # [B, T, D]
+        w_align = self.alpha_sparse_align.clamp(0.10, 0.80)
+        return self.ln_sparse_align((1.0 - w_align) * f_aud + w_align * f_aud_aligned)
 
     def forward(self, f_base: torch.Tensor, visual_raw: torch.Tensor,
                 audio_features: torch.Tensor = None, lengths: torch.Tensor = None,
@@ -698,12 +794,21 @@ class ModalityAdaptiveBranch(nn.Module):
                 num_c_aud = max(2, audio_semantic_logits.shape[-1])
                 s_aux_sem = ((1.0 - p0_aud) / (1.0 + (num_c_aud - 2.0) * p0_aud)).clamp(0.0, 1.0)
 
+        # Pillar 1: Sparse Cross-Time Feature Matching Subspace Alignment (Aligning First)
+        f_a_aligned = self.align_sparse_audio_subspace(
+            f_base_q, f_a, key_pad_mask=cross_pad_mask, topk_sparse=3
+        )
+        if s_aux_sem is not None:
+            # VLM-Semantic Relevance Gate: suppress normal background audio noise before attention
+            sem_rel_gate = (0.35 + 0.65 * s_aux_sem.detach()).to(f_a_aligned.dtype)
+            f_a_aligned = f_a_aligned * sem_rel_gate
+
         delay_attn_mask = self.build_delay_attention_mask(
             B, T, device, f_base.dtype, key_pad_mask=cross_pad_mask
         )
 
         attn_out, _ = self.cross_attn(
-            query=f_base_q, key=f_a, value=f_a,
+            query=f_base_q, key=f_a_aligned, value=f_a_aligned,
             attn_mask=delay_attn_mask,
             need_weights=False
         )
@@ -732,7 +837,7 @@ class ModalityAdaptiveBranch(nn.Module):
         logits_aux = self.classifier_aux(aux_features)  # [B, T, 1]
         s_aux_cls = torch.sigmoid(logits_aux)
         if s_aux_sem is not None:
-            s_aux = (0.75 * s_aux_cls + 0.25 * s_aux_sem).clamp(1e-5, 1.0 - 1e-5)
+            s_aux = (0.55 * s_aux_cls + 0.45 * s_aux_sem).clamp(1e-5, 1.0 - 1e-5)
         else:
             s_aux = s_aux_cls
 
@@ -1587,6 +1692,10 @@ class MARUPA(nn.Module):
         ]))
         self.alpha_prompt_ctx = nn.Parameter(torch.tensor(0.15))
 
+        # Dual-Space (Euclidean + Hyperbolic Poincaré Ball) Semantic Alignment Parameters
+        self.hyp_sem_curv_logit = nn.Parameter(torch.tensor(-2.45))
+        self.alpha_hyp_sem = nn.Parameter(torch.tensor(0.25))
+
         self._text_features_cache = None
         self._init_trainable_parameters()
 
@@ -1741,10 +1850,18 @@ class MARUPA(nn.Module):
         else:
             f_main, f_rupa_in = f_fused, f_fused
 
-        # Backbone CLIP Category Logits & Prior-Balanced Backbone Semantic Score S_sem_bb
+        # Dual-Space (Euclidean + Hyperbolic Poincaré Ball) Category Logits & Semantic Score S_sem_bb
         text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
         f_norm = F.normalize(f_main, dim=-1)
-        logits2 = (f_norm @ text_mat) / 0.07  # [B, T, C]
+        logits2_euc = (f_norm @ text_mat) / 0.07  # [B, T, C]
+
+        c_sem = F.softplus(self.hyp_sem_curv_logit).clamp(0.02, 0.25)
+        f_hyp = HyperbolicPoincareScorer.exp_map_zero(f_main, c_sem)  # [B, T, D]
+        t_hyp = HyperbolicPoincareScorer.exp_map_zero(text_features_ori, c_sem).t().to(visual.dtype)  # [D, C]
+        # Hyperbolic conformal similarity in Poincaré ball B_c^D
+        logits2_hyp = (F.normalize(f_hyp, dim=-1) @ F.normalize(t_hyp, dim=0)) / 0.07
+        w_hyp_sem = self.alpha_hyp_sem.clamp(0.05, 0.45)
+        logits2 = (1.0 - w_hyp_sem) * logits2_euc + w_hyp_sem * logits2_hyp
 
         p0_bb = F.softmax(logits2, dim=-1)[:, :, :1]
         num_c_bb = max(2, logits2.shape[-1])
