@@ -36,7 +36,7 @@ parser.add_argument('--DNP_use', default=True, type=str2bool, help='Whether to u
 
 # Adapter & Temperature
 parser.add_argument('--text_adapt_until', default=3, type=int, help='CLIP text adapter depth (default 3)')
-parser.add_argument('--t_w', default=0.10, type=float, help='Text adapter residual interpolation weight (default 0.10 matches DSANet)')
+parser.add_argument('--t_w', default=0.15, type=float, help='Text adapter residual interpolation weight (default 0.15 for UCF)')
 parser.add_argument('--temp', default=5.0, type=float, help='Logit scaling temperature for evaluation refinement (default 5.0 matches DSANet)')
 
 # Ablation & MA-RUPA v2 Breakthrough Flags

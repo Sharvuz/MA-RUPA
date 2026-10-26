@@ -492,5 +492,10 @@ if __name__ == '__main__':
     if args.model_path:
         checkpoint = safe_load_checkpoint(args.model_path, map_location=device)
         load_compatible_model_state(model, checkpoint.get('model_state_dict', checkpoint), strict=False)
+        if isinstance(checkpoint, dict) and 'args' in checkpoint and isinstance(checkpoint['args'], dict):
+            cp_args = checkpoint['args']
+            if 't_w' in cp_args and hasattr(model, 'clip_adapter'):
+                model.clip_adapter.t_w = float(cp_args['t_w'])
+                print(f"[Auto-Detect] Restored checkpoint text adapter t_w = {model.clip_adapter.t_w}", flush=True)
 
     test(model, testdataloader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, device, args)

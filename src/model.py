@@ -409,9 +409,12 @@ class MDTBackbone(nn.Module):
         # Dual-Space Base Anomaly Classifier (Euclidean + Hyperbolic Poincaré Ball)
         det_features = f_base + self.mlp_det(f_base)
         logits_euc = self.classifier_det(det_features)  # [B, T, 1]
-        logits_hyp = self.hyp_scorer(det_features)      # [B, T, 1]
-        w_hyp = self.alpha_hyp_det.clamp(0.05, 0.45)
-        logits_det = (1.0 - w_hyp) * logits_euc + w_hyp * logits_hyp
+        if getattr(self, 'use_hyp', True):
+            logits_hyp = self.hyp_scorer(det_features)      # [B, T, 1]
+            w_hyp = self.alpha_hyp_det.clamp(0.0, 0.45)
+            logits_det = (1.0 - w_hyp) * logits_euc + w_hyp * logits_hyp
+        else:
+            logits_det = logits_euc
         s_det = torch.sigmoid(logits_det)
 
         return f_base, s_det, logits_det
@@ -1855,13 +1858,16 @@ class MARUPA(nn.Module):
         f_norm = F.normalize(f_main, dim=-1)
         logits2_euc = (f_norm @ text_mat) / 0.07  # [B, T, C]
 
-        c_sem = F.softplus(self.hyp_sem_curv_logit).clamp(0.02, 0.25)
-        f_hyp = HyperbolicPoincareScorer.exp_map_zero(f_main, c_sem)  # [B, T, D]
-        t_hyp = HyperbolicPoincareScorer.exp_map_zero(text_features_ori, c_sem).t().to(visual.dtype)  # [D, C]
-        # Hyperbolic conformal similarity in Poincaré ball B_c^D
-        logits2_hyp = (F.normalize(f_hyp, dim=-1) @ F.normalize(t_hyp, dim=0)) / 0.07
-        w_hyp_sem = self.alpha_hyp_sem.clamp(0.05, 0.45)
-        logits2 = (1.0 - w_hyp_sem) * logits2_euc + w_hyp_sem * logits2_hyp
+        if getattr(self, 'use_hyp', True):
+            c_sem = F.softplus(self.hyp_sem_curv_logit).clamp(0.02, 0.25)
+            f_hyp = HyperbolicPoincareScorer.exp_map_zero(f_main, c_sem)  # [B, T, D]
+            t_hyp = HyperbolicPoincareScorer.exp_map_zero(text_features_ori, c_sem).t().to(visual.dtype)  # [D, C]
+            # Hyperbolic conformal similarity in Poincaré ball B_c^D
+            logits2_hyp = (F.normalize(f_hyp, dim=-1) @ F.normalize(t_hyp, dim=0)) / 0.07
+            w_hyp_sem = self.alpha_hyp_sem.clamp(0.0, 0.45)
+            logits2 = (1.0 - w_hyp_sem) * logits2_euc + w_hyp_sem * logits2_hyp
+        else:
+            logits2 = logits2_euc
 
         p0_bb = F.softmax(logits2, dim=-1)[:, :, :1]
         num_c_bb = max(2, logits2.shape[-1])
@@ -1968,6 +1974,14 @@ DSANet = MARUPA
 
 
 def load_compatible_model_state(model, state_dict, strict=False):
-    """Safely loads model checkpoint."""
+    """Safely loads model checkpoint and auto-detects architecture capabilities."""
     target_model = model.module if hasattr(model, 'module') else model
+    # Detect if checkpoint has trained Hyperbolic Poincare weights
+    has_hyp = any('hyp_scorer' in k or 'alpha_hyp' in k for k in state_dict.keys())
+    if not has_hyp:
+        print("[Auto-Detect] Legacy checkpoint without Hyperbolic weights detected. Setting hyperbolic branch to Pure Euclidean mode to eliminate uninitialized weight noise!", flush=True)
+        if hasattr(target_model, 'use_hyp'):
+            target_model.use_hyp = False
+        if hasattr(target_model, 'backbone') and hasattr(target_model.backbone, 'use_hyp'):
+            target_model.backbone.use_hyp = False
     return target_model.load_state_dict(state_dict, strict=strict)
