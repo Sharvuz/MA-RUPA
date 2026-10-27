@@ -263,7 +263,7 @@ subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=Fa
 
 UCF_BATCH_SIZE = 64
 UCF_EPOCHS = 10
-UCF_LR = 7e-5
+UCF_LR = 2.5e-5
 SEED = 234
 
 ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
@@ -430,7 +430,7 @@ Các cờ dòng lệnh cho phép bạn thử nghiệm và tái tạo đầy đ�
 """))
 
     # Write notebook file
-    out_path = Path("rupa_final.ipynb")
+    out_path = Path("MA-RUPA.ipynb")
     out_path.write_text(json.dumps(nb, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"Generated {out_path} successfully!")
 

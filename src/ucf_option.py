@@ -61,7 +61,7 @@ parser.add_argument('--routing-aux-weight', default=0.07, type=float, help='Prio
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for optimal convergence)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size (32 normal + 32 anomaly)')
-parser.add_argument('--lr', type=float, default=7e-5, help='Learning rate for End-to-End AdamW optimizer (default 7e-5)')
+parser.add_argument('--lr', type=float, default=2.5e-5, help='Learning rate for End-to-End AdamW optimizer (default 2.5e-5)')
 parser.add_argument('--weight-decay', type=float, default=2e-3, help='Weight decay for regularization (default 2e-3)')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 3.0)')
 parser.add_argument('--max-omega', default=0.20, type=float, help='Maximum curriculum omega ceiling (default 0.20 to prevent over-regularization)')

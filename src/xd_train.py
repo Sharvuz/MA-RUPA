@@ -244,7 +244,7 @@ def train(args):
 
         loss_accum = {
             'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'tasl': 0.0, 'bkg': 0.0, 'consist': 0.0,
-            'smooth': 0.0, 'gather': 0.0, 'orth': 0.0, 'residual': 0.0, 'gate': 0.0, 'total': 0.0
+            'smooth': 0.0, 'gather': 0.0, 'orth': 0.0, 'residual': 0.0, 'gate': 0.0, 'guide': 0.0, 'total': 0.0
         }
 
         normal_iter = iter(normal_loader)
@@ -385,11 +385,19 @@ def train(args):
                 text_features, num_classes=len(prompt_text)
             )
 
+            # Semantic-Guided Dense Supervision (Knowledge Distillation from CLIP Semantics to Detector)
+            # Solves Top-K single-spike collapse: forces S_det to cover the true temporal duration of the crime
+            p0_teacher = F.softmax(logits2.detach(), dim=-1)[:, :, 0:1]
+            s_sem_teacher = (1.0 - p0_teacher).clamp(0.0, 1.0)
+            loss_sem_guide = F.mse_loss(s_det, s_sem_teacher)
+
             # 6-Pillar SOTA Total Loss (Eliminates 17-term gradient cancellation)
             loss_clasm = loss_clasm_bb + 0.35 * loss_clasm_rupa
             total_loss = (
                 # Pillar 1: Primary Binary MIL (anchored on S_det + master consensus)
                 loss_mil_det + 0.35 * loss_mil_routing + 0.05 * loss_mil_aux
+                # Semantic Distillation Guidance: keeps S_det densely anchored on crime events
+                + 0.15 * loss_sem_guide
                 # Pillar 2: Fine-Grained Category Alignment (CLASM + TASL)
                 + getattr(args, 'loss2_weight', 1.4) * loss_clasm_bb
                 + 0.35 * loss_clasm_rupa
@@ -446,6 +454,7 @@ def train(args):
             loss_accum['orth'] += loss_orth.item()
             loss_accum['residual'] += loss_event.item()
             loss_accum['gate'] += loss_gate.item()
+            loss_accum['guide'] += loss_sem_guide.item()
             loss_accum['total'] += total_loss.item()
 
             if (step_idx + 1) % 20 == 0 or (step_idx + 1) == iters_per_epoch:
@@ -453,7 +462,7 @@ def train(args):
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}/{iters_per_epoch * args.batch_size} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
-                      f"CLASM: {loss_clasm.item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"CLASM: {loss_clasm.item():.4f} | Guide: {loss_sem_guide.item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
 
         # End of Epoch Reporting
         avg_total = loss_accum['total'] / iters_per_epoch
@@ -486,7 +495,7 @@ def train(args):
 
         is_best = False
         saved_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-        if ap_val > best_ap:
+        if ap_val > best_ap or (abs(ap_val - best_ap) < 1e-4 and auc_val > best_auc):
             best_ap = ap_val
             best_auc = auc_val
             is_best = True

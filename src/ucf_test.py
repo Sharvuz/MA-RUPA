@@ -168,16 +168,15 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             else:
                 prob_det = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
 
-            # Stream 3: Prior-Calibrated Zero-Shot / Adapted Semantic Alignment (Backbone F_fused)
+            # Stream 3: Zero-Shot / Adapted Semantic Alignment (DSANet Eq. 8: P(Anomaly) = 1.0 - P(Normal))
             p_align = F.softmax(logits2[0:len_cur] / eff_temp, dim=-1)
             p0_bb = p_align[:, 0]
-            num_c = max(2, logits2.shape[-1])
-            prob_sem = ((1.0 - p0_bb) / (1.0 + (num_c - 2.0) * p0_bb)).clamp(0.0, 1.0)
+            prob_sem = (1.0 - p0_bb).clamp(0.0, 1.0)
 
-            # Stream 4: Prior-Calibrated RUPA Counterfactual Semantic Logits
+            # Stream 4: RUPA Counterfactual Semantic Logits
             p_align_rupa = F.softmax(semantic_logits[0:len_cur] / eff_temp, dim=-1)
             p0_rupa = p_align_rupa[:, 0]
-            prob_sem_rupa_raw = ((1.0 - p0_rupa) / (1.0 + (num_c - 2.0) * p0_rupa)).clamp(0.0, 1.0)
+            prob_sem_rupa_raw = (1.0 - p0_rupa).clamp(0.0, 1.0)
             if 'semantic_scores' in dnp_dict:
                 s_sem_direct = dnp_dict['semantic_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
                 prob_sem_rupa = 0.5 * prob_sem_rupa_raw + 0.5 * s_sem_direct
@@ -436,8 +435,6 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_tri,
         ap_weighted, ap_geom, ap_opt, ap_harmonic, ap_master, ap_hier, ap_uccf, ap_dodo
     )
-    print(f"  ==> [BEST METRIC] Frame-level AUC: {best_auc * 100:.2f}% | AP: {best_ap * 100:.2f}%", flush=True)
-    return best_auc, best_ap
     print(f"  ==> [BEST METRIC] Frame-level AUC: {best_auc * 100:.2f}% | AP: {best_ap * 100:.2f}%", flush=True)
     return best_auc, best_ap
 

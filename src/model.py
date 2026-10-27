@@ -800,8 +800,7 @@ class ModalityAdaptiveBranch(nn.Module):
                 audio_semantic_logits = audio_semantic_logits.masked_fill(cross_pad_mask.unsqueeze(-1), 0.0)
             if has_real_audio:
                 p0_aud = F.softmax(audio_semantic_logits, dim=-1)[:, :, :1]
-                num_c_aud = max(2, audio_semantic_logits.shape[-1])
-                s_aux_sem = ((1.0 - p0_aud) / (1.0 + (num_c_aud - 2.0) * p0_aud)).clamp(0.0, 1.0)
+                s_aux_sem = (1.0 - p0_aud).clamp(1e-5, 1.0 - 1e-5)
 
         # Pillar 1: Sparse Cross-Time Feature Matching Subspace Alignment (Aligning First)
         f_a_aligned = self.align_sparse_audio_subspace(
@@ -1355,10 +1354,9 @@ class GradientSafeRUPA(nn.Module):
         semantic_logits = res_sem_logits  # [B, T, C]
         scaled_sem_logits = semantic_logits
 
-        # Prior-Balanced Semantic Anomaly Score: calibrates out the (C-1):1 class-count prior offset
+        # Multi-class Semantic Anomaly Score (DSANet Eq. 8): P(Anomaly) = 1.0 - P(Normal)
         p0_rupa = F.softmax(scaled_sem_logits, dim=-1)[:, :, :1]
-        num_c = max(2, scaled_sem_logits.shape[-1])
-        s_sem = ((1.0 - p0_rupa) / (1.0 + (num_c - 2.0) * p0_rupa)).clamp(0.0, 1.0)
+        s_sem = (1.0 - p0_rupa).clamp(1e-5, 1.0 - 1e-5)
 
         # Grassmannian Subspace Containment Loss: 1 - ||P_g t_0||_2^2 in [0, 1]
         # Satisfies Bessel's inequality: aligns span(U_norm) to contain normal prompt t_0
@@ -1419,8 +1417,8 @@ class QuadSafeGate(nn.Module):
             # XD-Violence: Detector + Semantics primary anchor
             init_w = torch.tensor([0.45, 0.05, 0.42, 0.08], dtype=torch.float32)
         else:
-            # UCF-Crime: Detector + Semantics primary anchor
-            init_w = torch.tensor([0.50, 0.05, 0.38, 0.07], dtype=torch.float32)
+            # UCF-Crime: Detector + Semantics balanced anchor (Aux/Motion decoupled)
+            init_w = torch.tensor([0.45, 0.05, 0.45, 0.05], dtype=torch.float32)
 
         init_w = init_w / init_w.sum().clamp_min(1e-6)
         self.register_buffer('target_prior', init_w)
@@ -1441,7 +1439,7 @@ class QuadSafeGate(nn.Module):
             self.mlp_gate[-1].bias.zero_()
             self.mlp_gate[-1].bias[4] = -2.0
 
-        init_gamma = 0.45 if 'xd' in self.dataset_type else 0.35
+        init_gamma = 0.50 if 'xd' in self.dataset_type else 0.50
         self.anchor_gamma_logit = nn.Parameter(torch.tensor(math.log(init_gamma / (1.0 - init_gamma))))
 
     def forward(self, s_det: torch.Tensor, s_rec: torch.Tensor,
@@ -1510,7 +1508,7 @@ class QuadSafeGate(nn.Module):
             return s_fixed, torch.zeros_like(s_det), s_fixed
 
         # 4. Master Semantic-Detector Consensus Anchor Routing
-        gamma_sem = torch.sigmoid(self.anchor_gamma_logit).clamp(0.30, 0.48)
+        gamma_sem = torch.sigmoid(self.anchor_gamma_logit).clamp(0.35, 0.65)
         s_anchor = (1.0 - gamma_sem) * s_det + gamma_sem * s_sem
 
         p_routing = (s_anchor + 0.12 * residual_gate * (s_fixed - s_anchor)).clamp(1e-5, 1.0 - 1e-5)
@@ -1856,9 +1854,12 @@ class MARUPA(nn.Module):
             return_suppress_loss=True, category_text_features=text_features_ori, return_tasl=True
         )
 
-        # Unified Anomaly Detector on F_base + F_fused so S_det directly benefits from
-        # cross-modal audio-visual / motion fusion AND shares the DCSA/CLASM feature space
-        f_det_in = 0.5 * f_base + 0.5 * f_fused
+        # Unified Anomaly Detector: Anchor S_det on visual F_base for UCF-Crime (no audio)
+        # to avoid motion residual false alarms; use 50/50 fusion for XD-Violence (with audio)
+        if audio is None:
+            f_det_in = f_base
+        else:
+            f_det_in = 0.5 * f_base + 0.5 * f_fused
         s_det, logits_det = self.backbone.classify_anomaly(f_det_in)
 
         # Per-snippet Multi-Objective PCGrad Junction between Main CLIP Semantics & RUPA Subspace
@@ -1884,9 +1885,10 @@ class MARUPA(nn.Module):
         ctx_offset = alpha_ctx * self.mlp_event(vid_cue)  # [B, 1, D]
 
         text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
-        text_enh = F.normalize(
-            text_features_ori.unsqueeze(0) + 0.35 * ctx_offset, dim=-1
-        ).to(visual.dtype)  # [B, C, D]
+        text_enh = text_features_ori.unsqueeze(0).repeat(B, 1, 1)  # [B, C, D]
+        # DSANet Eq. 2: Enhance category embeddings strictly for anomaly classes (1..C-1), keeping Normal (0) pure!
+        text_enh[:, 1:] = text_enh[:, 1:] + 0.35 * ctx_offset
+        text_enh = F.normalize(text_enh, dim=-1).to(visual.dtype)  # [B, C, D]
         f_norm = F.normalize(f_main, dim=-1)  # [B, T, D]
         logits2_euc = torch.bmm(f_norm, text_enh.transpose(1, 2)) / 0.07  # [B, T, C]
 
@@ -1900,9 +1902,9 @@ class MARUPA(nn.Module):
         else:
             logits2 = logits2_euc
 
+        # Multi-class Semantic Anomaly Score (DSANet Eq. 8): P(Anomaly) = 1.0 - P(Normal)
         p0_bb = F.softmax(logits2, dim=-1)[:, :, :1]
-        num_c_bb = max(2, logits2.shape[-1])
-        s_sem_bb = ((1.0 - p0_bb) / (1.0 + (num_c_bb - 2.0) * p0_bb)).clamp(1e-5, 1.0 - 1e-5)
+        s_sem_bb = (1.0 - p0_bb).clamp(1e-5, 1.0 - 1e-5)
 
         # Step 3 & 4: SM-ASPM RUPA & QuadSafeGate
         dnp_dict = {}
