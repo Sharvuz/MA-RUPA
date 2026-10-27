@@ -22,6 +22,8 @@ from utils.losses import (
     get_curriculum_omega,
     compute_at_bce_topk_mil_loss,
     compute_topk_mil_loss,
+    compute_dats_mil_loss,
+    compute_ogdp_geometry_loss,
     compute_fg_tv_smoothness_loss,
     compute_temporal_smoothness_loss,
     compute_confidence_gated_consistency_loss,
@@ -46,10 +48,10 @@ def train(args):
     except Exception:
         pass
 
-    # Enforce 10-epoch SOTA schedule & sanitize legacy notebook CLI flags
-    if getattr(args, 'max_epoch', 10) > 10:
-        print(f"[Auto-Config] Overriding legacy --max-epoch {args.max_epoch} -> 10 epochs (SOTA 10-epoch schedule).", flush=True)
-        args.max_epoch = 10
+    # Enforce 15-epoch DPSS schedule for UCF-Crime
+    if getattr(args, 'max_epoch', 15) > 15:
+        print(f"[Auto-Config] Setting --max-epoch {args.max_epoch} -> 15 epochs (DPSS 15-epoch schedule).", flush=True)
+        args.max_epoch = 15
     if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
         args.curriculum_epochs = 3.0
     if getattr(args, 'max_omega', 0.20) > 0.25:
@@ -96,8 +98,8 @@ def train(args):
         'Vandalism': 'Vandalism'
     }
 
-    # Data loaders: default to full 10 crops per video (16,000 steps/epoch, 250 iters/epoch)
-    sample_one_crop = getattr(args, 'sample_one_crop_per_video', getattr(args, 'enable_crop_reduction', False))
+    # Data loaders: default to DPSS (Diversity-Preserving Stratified Sampling, 1 random crop/video/epoch)
+    sample_one_crop = getattr(args, 'sample_one_crop_per_video', True)
     normal_dataset = UCFDataset(
         args.visual_length, args.train_list, False, label_map, normal=True,
         data_dir=args.data_dir, sample_one_crop_per_video=sample_one_crop
@@ -275,115 +277,49 @@ def train(args):
             use_epts_flag = getattr(args, 'use_epts', True)
             use_tasl_flag = getattr(args, 'use_tasl', True)
 
-            loss_mil_routing = compute_at_bce_topk_mil_loss(
-                p_routing, binary_labels, lengths_batch, device=device,
-                topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
-                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True,
-                peak_drop_prob=0.25, use_epts=use_epts_flag
-            )
-            loss_mil_det = compute_at_bce_topk_mil_loss(
-                s_det, binary_labels, lengths_batch, device=device,
-                topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
-                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True,
-                peak_drop_prob=0.25, use_epts=use_epts_flag
-            )
-            loss_mil_aux = compute_at_bce_topk_mil_loss(
-                s_aux, binary_labels, lengths_batch, device=device,
-                topk_ratio=topk_r, vat_k=True, snippet_dropout=snip_drop,
-                lambda_ent=0.02, lambda_ohnm=0.2, target_loss=0.15, is_training=True,
-                peak_drop_prob=0.15, use_epts=use_epts_flag
-            )
-
-            # 2. Multi-class Semantic Alignment, TASL Cross-Modal & Consistency Losses
-            loss_clasm_bb = compute_clasm_loss(
-                logits2, one_hot_labels, lengths_batch,
-                k_ratio=topk_r_clasm, is_training=use_epts_flag, peak_drop_prob=0.20
-            )
-            if 'semantic_logits' in dnp_dict:
-                loss_clasm_rupa = compute_clasm_loss(
-                    dnp_dict['semantic_logits'], one_hot_labels, lengths_batch,
-                    k_ratio=topk_r_clasm, is_training=use_epts_flag, peak_drop_prob=0.20
-                )
-            else:
-                loss_clasm_rupa = torch.tensor(0.0, device=device)
-
-            if use_tasl_flag and 'audio_semantic_logits' in dnp_dict:
-                loss_tasl = compute_tasl_cross_modal_loss(
-                    dnp_dict['audio_semantic_logits'], logits2, one_hot_labels, lengths_batch,
-                    device=device, k_ratio=topk_r_clasm, is_training=True
-                )
-            else:
-                loss_tasl = torch.tensor(0.0, device=device)
-
-            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
-
-            # Confidence-Gated Asymmetric Consistency
-            if 'reconstruction_scores' in dnp_dict:
-                loss_consistency = compute_confidence_gated_consistency_loss(
-                    s_det=s_det, s_rupa=dnp_dict['reconstruction_scores'], lengths=lengths_batch, device=device
-                )
-            elif 'original_features' in dnp_dict and 'reconstructed_features' in dnp_dict:
-                loss_consistency = compute_consistency_loss(
-                    p_routing, dnp_dict['original_features'], dnp_dict['reconstructed_features'], lengths_batch, s_det=s_det
-                )
-            else:
-                loss_consistency = torch.tensor(0.0, device=device)
-
-            loss_event = compute_event_loss(logits3, one_hot_labels)
-            loss_dnp_normal = dnp_dict.get('dnp_normal_loss', torch.tensor(0.0, device=device)).mean()
-
-            # 3. SA-EPTS: Semantic-Affinity Edge-Preserving Charbonnier Smoothness & Halo Expansion
-            loss_smooth = compute_fg_tv_smoothness_loss(
-                scores=s_det,
-                visual_features=visual_batch,
-                lengths=lengths_batch,
-                gamma_edge=getattr(args, 'gamma_edge', 5.0),
-                lambda_compact=0.1,
-                binary_labels=binary_labels,
-                device=device,
-                use_epts=use_epts_flag
-            )
-
-            # 4. RUPA Prototype Losses (modulated by smooth cosine curriculum omega(e))
-            loss_gather = compute_gather_loss(dnp_dict)
-            loss_orth = compute_orthogonality_loss(dnp_dict)
-            loss_residual = torch.tensor(0.0, device=device)
-            loss_gate = torch.tensor(0.0, device=device)
-
-            # Text Separation Regularization (DSANet Eq. 6)
-            loss_text_orth = compute_normal_contrastive_loss(
-                text_features, num_classes=len(prompt_text)
-            )
-
-            # Semantic-Guided Dense Supervision (Knowledge Distillation from CLIP Semantics to Detector)
-            # Solves Top-K single-spike collapse: forces S_det to cover the true temporal duration of the crime
+            # Semantic-Guided Teacher for Guidance & DATS-MIL Active Mask
             p0_teacher = F.softmax(logits2.detach(), dim=-1)[:, :, 0:1]
             s_sem_teacher = (1.0 - p0_teacher).clamp(0.0, 1.0)
             loss_sem_guide = F.mse_loss(s_det, s_sem_teacher)
 
-            # 6-Pillar SOTA Total Loss (Eliminates 17-term gradient cancellation)
-            loss_clasm = loss_clasm_bb + 0.35 * loss_clasm_rupa
+            # Pillar 1: DATS-MIL (Density-Adaptive Temporal Support MIL)
+            loss_mil_dats = compute_dats_mil_loss(
+                scores=s_det,
+                teacher=s_sem_teacher,
+                binary_labels=binary_labels,
+                lengths=lengths_batch,
+                current_epoch=epoch,
+                max_epoch=args.max_epoch,
+                device=device
+            )
+            loss_mil_det = loss_mil_dats
+            loss_mil_routing = loss_mil_dats
+            loss_mil_aux = torch.tensor(0.0, device=device)
+
+            # Pillar 2: Compact Decoupled Contrastive Alignment (DCS = Event + Background)
+            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
+            loss_event = compute_event_loss(logits3, one_hot_labels)
+            loss_dcs = loss_event + loss_bkg
+
+            # Pillar 4: Subspace Geometry (OGDP)
+            loss_geo = compute_ogdp_geometry_loss(dnp_dict, device=device)
+
+            # Backward-compatible dummy logs
+            loss_clasm = torch.tensor(0.0, device=device)
+            loss_tasl = torch.tensor(0.0, device=device)
+            loss_consistency = torch.tensor(0.0, device=device)
+            loss_smooth = torch.tensor(0.0, device=device)
+            loss_gather = dnp_dict.get('g_loss', torch.tensor(0.0, device=device)).mean()
+            loss_orth = dnp_dict.get('orth_loss', torch.tensor(0.0, device=device)).mean()
+            loss_gate = torch.tensor(0.0, device=device)
+
+            # 4-Pillar Unified Loss Engine:
+            # 1.0 * DATS-MIL + 0.5 * DCS + 0.25 * Guidance + 0.1 * Geometry
             total_loss = (
-                # Pillar 1: Primary Binary MIL (anchored on S_det + master consensus)
-                loss_mil_det + 0.35 * loss_mil_routing + 0.05 * loss_mil_aux
-                # Semantic Distillation Guidance: keeps S_det densely anchored on crime events
-                + 0.15 * loss_sem_guide
-                # Pillar 2: Fine-Grained Category Alignment (CLASM + TASL)
-                + getattr(args, 'loss2_weight', 1.2) * loss_clasm_bb
-                + 0.35 * loss_clasm_rupa
-                + 0.08 * loss_tasl
-                # Pillar 3: Self-Guided Normality Distillation (DSANet Eq. 4)
-                + getattr(args, 'lambda_consistency', 0.15) * loss_consistency
-                # Pillar 4: Edge-Preserving Temporal Smoothness
-                + getattr(args, 'lambda_smooth', 0.06) * loss_smooth
-                # Pillar 5: Decoupled Event/Background Contrastive Alignment (DCSA Eq. 7 + Eq. 6)
-                + 0.35 * (loss_event + loss_bkg)
-                + 0.05 * loss_text_orth
-                # Pillar 6: Compact & Orthogonal Normal Prototypes
-                + omega * (
-                    getattr(args, 'lambda_gather', 0.10) * loss_gather
-                    + getattr(args, 'lambda_orth', 0.05) * loss_orth
-                )
+                1.00 * loss_mil_dats
+                + 0.50 * loss_dcs
+                + 0.25 * loss_sem_guide
+                + 0.10 * loss_geo
             )
 
             optimizer.zero_grad()

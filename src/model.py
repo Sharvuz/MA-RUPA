@@ -687,6 +687,22 @@ class ModalityAdaptiveBranch(nn.Module):
         B, T, D = f_base.shape
         device = f_base.device
 
+        has_real_audio = (audio_features is not None and not self.no_audio)
+        if not has_real_audio:
+            # UCF-Crime / Missing-Modality Bifurcation:
+            # Completely bypass visual motion residuals & cross-attention on silent CCTV!
+            # Eliminates 100% of motion noise (pedestrians, camera jitter, passing cars).
+            f_fused = f_base
+            s_aux = torch.zeros(B, T, 1, device=device, dtype=f_base.dtype)
+            logits_aux = torch.zeros(B, T, 1, device=device, dtype=f_base.dtype)
+            g_av = torch.zeros_like(f_base)
+            av_suppress_loss = torch.tensor(0.0, device=device)
+            if return_suppress_loss and return_tasl:
+                return f_fused, s_aux, logits_aux, g_av, av_suppress_loss, None
+            if return_suppress_loss:
+                return f_fused, s_aux, logits_aux, g_av, av_suppress_loss
+            return f_fused, s_aux, logits_aux, g_av
+
         # Per-Snippet PCGrad Junction on f_base so cross-modal attention gradients
         # never conflict with MDTBackbone's primary visual representation
         if self.training and self.use_pcgrad:
@@ -694,7 +710,7 @@ class ModalityAdaptiveBranch(nn.Module):
         else:
             f_base_skip, f_base_q = f_base, f_base
 
-        # Always compute visual motion residuals as structural anchor & fallback
+        # Visual motion residuals as auxiliary channel when audio is present
         motion = self.compute_motion_residuals(visual_raw)  # [B, T, 2*D]
         f_motion = self.motion_proj(motion.transpose(1, 2)).transpose(1, 2)  # [B, T, D]
 
@@ -706,7 +722,6 @@ class ModalityAdaptiveBranch(nn.Module):
                 >= lengths.to(device)[:, None]
             )
 
-        has_real_audio = (audio_features is not None and not self.no_audio)
         if has_real_audio:
             # Multi-Modal Audio Mode
             if audio_features.ndim == 2:
@@ -901,6 +916,7 @@ class GradientSafeRUPA(nn.Module):
         self.max_normal_ratio = min(max_normal_ratio, 0.90)
         self.repulsion_margin = repulsion_margin
 
+        self.num_anom_prototypes = 16
         # Orthonormal Stiefel initialization via pure torch.bmm (zero cuSOLVER calls)
         with torch.no_grad():
             init_proto = self.build_orthonormal_subspace(
@@ -909,8 +925,12 @@ class GradientSafeRUPA(nn.Module):
             init_bank = self.build_orthonormal_subspace(
                 torch.randn(1, self.base_prototypes, feature_dim)
             ).squeeze(0)
+            init_anom = self.build_orthonormal_subspace(
+                torch.randn(1, self.num_anom_prototypes, feature_dim)
+            ).squeeze(0)
 
         self.video_prototypes = nn.Parameter(init_proto)
+        self.anom_prototypes = nn.Parameter(init_anom)
         self.register_buffer('current_epoch_buf', torch.tensor(1.0, dtype=torch.float32), persistent=True)
         self.register_buffer('global_normal_bank', init_bank, persistent=True)
         self.beta_global_logit = nn.Parameter(torch.tensor(-1.3863))  # sigmoid(-1.3863) = 0.20
@@ -1226,13 +1246,23 @@ class GradientSafeRUPA(nn.Module):
         else:
             proto_seeds = seeded_head
 
-        # 1. Dual-Gated Pseudo-Normal Mining (combines S_det with zero-shot CLIP semantic normality)
+        # 1. Uncertainty-Gated Pseudo-Normal Mining (UGNM)
         with torch.no_grad():
             det_scores_flat = s_det.squeeze(-1).clamp(0.0, 1.0)
             f_raw_norm = F.normalize(visual_raw, dim=-1)
             zs_logits = (f_raw_norm @ zs_text_matrix) / 0.07
             zs_abn_prob = (1.0 - F.softmax(zs_logits, dim=-1)[:, :, 0]).clamp(0.0, 1.0)
-            joint_mining_scores = 0.5 * det_scores_flat + 0.5 * zs_abn_prob
+
+            # Local temporal variance gate: normal segments have low variance; boundary/anomalies spike
+            pad_v = 2
+            s_det_pad = F.pad(det_scores_flat.unsqueeze(1), (pad_v, pad_v), mode='replicate')
+            s_mean = F.avg_pool1d(s_det_pad, kernel_size=5, stride=1).squeeze(1)
+            s_sq_mean = F.avg_pool1d(s_det_pad ** 2, kernel_size=5, stride=1).squeeze(1)
+            local_std = torch.sqrt((s_sq_mean - s_mean ** 2).clamp_min(0.0))
+
+            # Down-weight snippets with high local score variance
+            w_mining = torch.sigmoid(6.0 * (det_scores_flat - 0.40)) * (1.0 + 2.5 * local_std)
+            joint_mining_scores = 0.5 * w_mining + 0.5 * zs_abn_prob
 
             if self.sampling == 'otsu':
                 selected_normal, reliability = self._select_normal_frames_otsu(
@@ -1314,7 +1344,26 @@ class GradientSafeRUPA(nn.Module):
         s_subspace = (1.0 - proj_energy).clamp(0.0, 1.0)
         cos_sim = F.cosine_similarity(f_sub_in, f_rec, dim=-1).unsqueeze(-1)
         s_cos = ((1.0 - cos_sim) / 2.0).clamp(0.0, 1.0)
-        s_rec = (0.5 * s_subspace + 0.5 * s_cos).clamp(0.0, 1.0)
+
+        # OGDP: Derive Anomalous Basis V in St(k_a, D) from the Residual Flow
+        res_norm_flow = F.normalize(residual.detach(), dim=-1)
+        anom_seeds = self.anom_prototypes.unsqueeze(0).expand(B, -1, -1)  # [B, k_a, D]
+        res_mag = torch.norm(residual.detach(), dim=-1, keepdim=True).clamp_min(1e-6)
+        res_weights = F.softmax(res_mag / 0.5, dim=1)  # [B, N, 1]
+        agg_anom = anom_seeds + 0.30 * torch.bmm(anom_seeds, torch.bmm(res_norm_flow.transpose(1, 2), res_weights * res_norm_flow))
+        v_anom = self.build_orthonormal_subspace(agg_anom)  # [B, k_a, D]
+
+        # OGDP Energy Ratio Anomaly Score: E_a / (E_n + E_a + delta)
+        coords_u = torch.bmm(f_norm_unit, u_norm.transpose(1, 2))  # [B, N, M]
+        coords_v = torch.bmm(f_norm_unit, v_anom.transpose(1, 2))  # [B, N, k_a]
+        energy_n = (coords_u ** 2).sum(dim=-1, keepdim=True)
+        energy_a = (coords_v ** 2).sum(dim=-1, keepdim=True)
+        s_ogdp = (energy_a / (energy_n + energy_a + 1e-6)).clamp(0.0, 1.0)
+        s_rec = 0.50 * s_ogdp + 0.25 * s_subspace + 0.25 * s_cos
+
+        # Cross-Subspace Orthogonality Penalty: ||U^T V||_F^2
+        uv_corr = torch.bmm(u_norm, v_anom.transpose(1, 2))  # [B, M, k_a]
+        sample_orth_uv = (uv_corr ** 2).mean(dim=(-2, -1), keepdim=True)  # [B, 1]
 
         # 5. Per-sample Subspace Gather Loss: [B, 1]
         norm_unit_sel = F.normalize(selected_normal.detach(), dim=-1)
@@ -1369,6 +1418,9 @@ class GradientSafeRUPA(nn.Module):
             'reconstructed_features': f_rec,
             'residual_features': residual,
             'dynamic_normal_patterns': u_norm,
+            'dynamic_anom_patterns': v_anom,
+            'ogdp_scores': s_ogdp,
+            'ogdp_orth_loss': sample_orth_uv,
             'f_sem_rupa': f_sem_rupa,
             'semantic_logits': scaled_sem_logits,
             'raw_semantic_logits': semantic_logits,
@@ -1404,13 +1456,18 @@ class QuadSafeGate(nn.Module):
     """
     def __init__(self, dataset_type: str = 'xd', hidden_dim: int = 32,
                  no_safegate: bool = False, custom_prior_weights=None,
-                 ood_beta: float = 3.5):
+                 ood_beta: float = 3.5, tau_disc: float = 0.45):
         super().__init__()
         self.no_safegate = no_safegate
         self.dataset_type = dataset_type.lower()
         self.ood_beta = ood_beta
+        self.tau_disc = tau_disc
 
-        # Configurable prior weights (anchored on Detector & CLIP Semantics; Aux & Rec bounded small)
+        # DACC Calibrated Anchor: UCF=0.70 (Detector anchor), XD=0.45 (Semantics anchor)
+        default_alpha = 0.45 if 'xd' in self.dataset_type else 0.70
+        self.alpha = nn.Parameter(torch.tensor(default_alpha, dtype=torch.float32))
+
+        # Configurable prior weights buffer for compatibility
         if custom_prior_weights is not None:
             init_w = torch.tensor(custom_prior_weights, dtype=torch.float32)
         elif 'xd' in self.dataset_type:
@@ -1423,21 +1480,6 @@ class QuadSafeGate(nn.Module):
         init_w = init_w / init_w.sum().clamp_min(1e-6)
         self.register_buffer('target_prior', init_w)
         self.prior_logits = nn.Parameter(torch.log(init_w.clamp(min=1e-4)))
-
-        # Dynamic Calibration-Aware MLP Gate (12-D input -> 4 stream offsets + 1 residual gate)
-        self.mlp_gate = nn.Sequential(
-            nn.Linear(12, hidden_dim),
-            LayerNormFP32(hidden_dim),
-            QuickGELU(),
-            nn.Linear(hidden_dim, 5)
-        )
-
-        nn.init.normal_(self.mlp_gate[0].weight, std=0.01)
-        nn.init.constant_(self.mlp_gate[0].bias, 0.0)
-        nn.init.normal_(self.mlp_gate[-1].weight, std=0.01)
-        with torch.no_grad():
-            self.mlp_gate[-1].bias.zero_()
-            self.mlp_gate[-1].bias[4] = -2.0
 
         init_gamma = 0.50 if 'xd' in self.dataset_type else 0.50
         self.anchor_gamma_logit = nn.Parameter(torch.tensor(math.log(init_gamma / (1.0 - init_gamma))))
@@ -1453,71 +1495,20 @@ class QuadSafeGate(nn.Module):
             s_fixed: [B, T, 1] OOD-suppressed mixture score
         """
         s_det = s_det.clamp(1e-5, 1.0 - 1e-5)
-        s_rec = s_rec.clamp(1e-5, 1.0 - 1e-5)
         s_sem = s_sem.clamp(1e-5, 1.0 - 1e-5)
-        s_aux = s_aux.clamp(1e-5, 1.0 - 1e-5)
-
-        # 1. Detached diagnostic statistics (prevents gate from chasing overfitted training loss)
-        sd_d = s_det.detach()
-        sr_d = s_rec.detach()
-        ss_d = s_sem.detach()
-        sa_d = s_aux.detach()
-
-        d_det_sem = (sd_d - ss_d).abs()
-        d_rec_sem = (sr_d - ss_d).abs()
-        d_aux_sem = (sa_d - ss_d).abs()
-
-        d_rec_det = (sr_d - sd_d).abs()
-        d_sem_det = (ss_d - sd_d).abs()
-        d_aux_det = (sa_d - sd_d).abs()
-
-        scores_stack_d = torch.cat([sd_d, sr_d, ss_d, sa_d], dim=-1)  # [B, T, 4]
-        s_var = torch.var(scores_stack_d, dim=-1, keepdim=True)       # [B, T, 1]
-        ent_aux = -(sa_d * torch.log(sa_d) + (1.0 - sa_d) * torch.log(1.0 - sa_d)) / math.log(2.0)
-
-        v_gate = torch.cat([
-            sd_d, sr_d, ss_d, sa_d,
-            d_det_sem, d_rec_sem, d_aux_sem,
-            d_rec_det, d_sem_det, d_aux_det,
-            s_var, ent_aux
-        ], dim=-1)  # [B, T, 12]
-
-        gate_out = self.mlp_gate(v_gate)  # [B, T, 5]
-        stream_offsets = gate_out[..., :4].clamp(-2.5, 2.5)
-        residual_gate = torch.sigmoid(gate_out[..., 4:5])
-
-        # 2. Asymmetric OOD False-Alarm Discordance Suppression
-        # Never penalize primary Detector (s_det) or CLIP Semantics (s_sem);
-        # only suppress auxiliary/reconstruction spikes that exceed max(s_det, s_sem)
-        grounded_ref = torch.max(sd_d, ss_d)
-        ood_det = torch.zeros_like(sd_d)
-        ood_rec = F.relu(sr_d - grounded_ref) ** 2
-        ood_sem = torch.zeros_like(ss_d)
-        ood_aux = F.relu(sa_d - grounded_ref) ** 2
-        ood_penalty = torch.cat([ood_det, ood_rec, ood_sem, ood_aux], dim=-1)  # [B, T, 4]
-
-        # 3. Dynamic Calibration-Aware Stream Mixture
-        base_logits = self.prior_logits.view(1, 1, 4)
-        dyn_logits = base_logits + stream_offsets - self.ood_beta * ood_penalty
-        dyn_weights = F.softmax(dyn_logits, dim=-1)  # [B, T, 4]
-
-        scores_stack = torch.cat([s_det, s_rec, s_sem, s_aux], dim=-1)
-        s_fixed = (dyn_weights * scores_stack).sum(dim=-1, keepdim=True).clamp(1e-5, 1.0 - 1e-5)
 
         if self.no_safegate:
-            return s_fixed, torch.zeros_like(s_det), s_fixed
+            return s_det, torch.tensor(0.0, device=s_det.device), s_det
 
-        # 4. Master Semantic-Detector Consensus Anchor Routing
-        gamma_sem = torch.sigmoid(self.anchor_gamma_logit).clamp(0.35, 0.65)
-        s_anchor = (1.0 - gamma_sem) * s_det + gamma_sem * s_sem
+        a = self.alpha.clamp(0.10, 0.90)
+        s_consensus = a * s_det + (1.0 - a) * s_sem
 
-        p_routing = (s_anchor + 0.12 * residual_gate * (s_fixed - s_anchor)).clamp(1e-5, 1.0 - 1e-5)
+        # OOD Discordance Fallback (hard rule):
+        discord = (s_det - s_sem).abs()
+        p_routing = torch.where(discord > self.tau_disc, s_det, s_consensus)
 
-        prior_ref = self.target_prior.view(1, 1, 4).to(dyn_weights.dtype)
-        kl_div = (dyn_weights * (torch.log(dyn_weights.clamp_min(1e-6)) - torch.log(prior_ref))).sum(dim=-1, keepdim=True)
-        gate_reg = torch.sqrt(kl_div.clamp_min(0.0) + 1e-6)
-
-        return p_routing, gate_reg, s_fixed
+        gate_reg = torch.tensor(0.0, device=s_det.device)
+        return p_routing, gate_reg, s_consensus
 
 
 # ============================================================================

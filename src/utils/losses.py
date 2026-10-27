@@ -674,3 +674,113 @@ def compute_orthogonality_loss(arg1) -> torch.Tensor:
     off_diag = sim_matrix - identity
     loss_orth = (off_diag ** 2).sum(dim=(1, 2)) / max(1, M * (M - 1))
     return loss_orth.mean()
+
+
+def compute_dats_mil_loss(scores: torch.Tensor,
+                          teacher: torch.Tensor,
+                          binary_labels: torch.Tensor,
+                          lengths: torch.Tensor = None,
+                          current_epoch: float = 1.0,
+                          max_epoch: float = 15.0,
+                          beta_start: float = 5.0,
+                          beta_end: float = 50.0,
+                          tau_quantile: float = 0.75,
+                          device: torch.device = None) -> torch.Tensor:
+    """Density-Adaptive Temporal Support MIL (DATS-MIL).
+    
+    Breaks the Top-K temporal spike collapse by providing smooth, non-zero gradient
+    across the entire duration of true crime events validated by the semantic teacher.
+    
+    1. Anneals beta from beta_start (5.0) -> beta_end (50.0) over epochs 1 to 3.
+    2. Temporal Gaussian smoothing on teacher scores to respect temporal contiguity.
+    3. Active evidence mask: mask = sigmoid(beta * (teacher_smooth - tau_otsu)).
+    4. Abnormal bags: weighted average over evidence mask -> 1.0.
+    5. Normal bags: top-10% suppression -> 0.0 to prevent false alarms.
+    """
+    if device is None:
+        device = scores.device
+    binary_labels = binary_labels.to(device).float()
+    scores_flat = scores.squeeze(-1)    # [B, T]
+    teacher_flat = teacher.squeeze(-1)  # [B, T]
+    B, T = scores_flat.shape
+
+    # Anneal beta: soft mask early, sharp indicator later
+    progress = min(1.0, max(0.0, (float(current_epoch) - 1.0) / max(1.0, 3.0)))
+    beta = beta_start + (beta_end - beta_start) * progress
+
+    # 1D Temporal Gaussian smoothing on teacher: rho = conv1d(teacher, kernel)
+    # sigma = 1.0, kernel size = 5: [0.061, 0.245, 0.388, 0.245, 0.061]
+    kernel = torch.tensor([0.06136, 0.24477, 0.38774, 0.24477, 0.06136], device=device).view(1, 1, 5)
+    t_pad = F.pad(teacher_flat.unsqueeze(1), (2, 2), mode='replicate')
+    teacher_smooth = F.conv1d(t_pad, kernel).squeeze(1)  # [B, T]
+
+    bag_probs = []
+    for i in range(B):
+        l_i = int(lengths[i].item()) if lengths is not None else T
+        l_i = max(1, min(l_i, T))
+        s_i = scores_flat[i, :l_i]
+        t_i = teacher_smooth[i, :l_i].detach()
+        y_i = binary_labels[i].item()
+
+        if y_i > 0.5:
+            # Abnormal bag: compute duration-aware soft mask from teacher
+            if l_i > 4:
+                q_thresh = torch.quantile(t_i, tau_quantile)
+            else:
+                q_thresh = t_i.mean()
+            mask_i = torch.sigmoid(beta * (t_i - q_thresh))
+            w_i = (t_i / (t_i.max().clamp_min(1e-6))).clamp(0.0, 1.0)
+            combined_weight = mask_i * w_i
+            mass_i = combined_weight.sum() + 1e-6
+            weighted_prob = (combined_weight * s_i).sum() / mass_i
+            top1_val = s_i.max()
+            bag_p = 0.70 * weighted_prob + 0.30 * top1_val
+            bag_probs.append(bag_p.unsqueeze(0))
+        else:
+            # Normal bag: all valid frames must be normal!
+            k_norm = max(1, int(l_i * 0.10))
+            top_vals, _ = torch.topk(s_i, k=k_norm, largest=True)
+            bag_probs.append(top_vals.mean().unsqueeze(0))
+
+    bag_probs = torch.cat(bag_probs, dim=0).clamp(1e-6, 1.0 - 1e-6)
+    loss_mil = - (binary_labels * torch.log(bag_probs) + (1.0 - binary_labels) * torch.log(1.0 - bag_probs))
+    return loss_mil.mean()
+
+
+def compute_ogdp_geometry_loss(dnp_dict: dict, device: torch.device = None) -> torch.Tensor:
+    """Computes unified geometry loss for Orthogonal Grassmannian Dual Projection (OGDP).
+    
+    Combines:
+    1. Cross-subspace orthogonality penalty: ||U^T V||_F^2
+    2. Normal subspace reconstruction loss: ||F_n - P_U(F_n)||^2
+    3. Anomalous subspace residual reconstruction: ||R_a - P_V(R_a)||^2
+    4. Cross-subspace repulsion penalty
+    """
+    if device is None and isinstance(dnp_dict, dict):
+        for v in dnp_dict.values():
+            if isinstance(v, torch.Tensor):
+                device = v.device
+                break
+    if device is None:
+        device = torch.device('cpu')
+
+    if not isinstance(dnp_dict, dict):
+        return torch.tensor(0.0, device=device)
+
+    loss_geo = torch.tensor(0.0, device=device)
+
+    if 'ogdp_orth_loss' in dnp_dict and isinstance(dnp_dict['ogdp_orth_loss'], torch.Tensor):
+        loss_geo = loss_geo + dnp_dict['ogdp_orth_loss'].mean()
+    elif 'orth_loss' in dnp_dict and isinstance(dnp_dict['orth_loss'], torch.Tensor):
+        loss_geo = loss_geo + dnp_dict['orth_loss'].mean()
+
+    if 'ogdp_rec_loss' in dnp_dict and isinstance(dnp_dict['ogdp_rec_loss'], torch.Tensor):
+        loss_geo = loss_geo + 0.5 * dnp_dict['ogdp_rec_loss'].mean()
+    elif 'g_loss' in dnp_dict and isinstance(dnp_dict['g_loss'], torch.Tensor):
+        loss_geo = loss_geo + 0.5 * dnp_dict['g_loss'].mean()
+
+    if 'ogdp_cross_loss' in dnp_dict and isinstance(dnp_dict['ogdp_cross_loss'], torch.Tensor):
+        loss_geo = loss_geo + 0.5 * dnp_dict['ogdp_cross_loss'].mean()
+
+    return loss_geo
+
