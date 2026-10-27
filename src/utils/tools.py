@@ -303,7 +303,7 @@ def compute_single_pass_uccf(prob_dict: dict, priors: dict, delta_dis: float = 0
     anchor_t = (core_w * stacked).sum(dim=0, keepdim=True)  # [1, T]
 
     # Suppress uncorroborated noise spikes in secondary streams without suppressing core streams
-    dev_sq = F.relu(stacked - anchor_t) ** 2  # [S, T]
+    dev_sq = torch.relu(stacked - anchor_t) ** 2  # [S, T]
     local_gate = torch.where(core_mask > 0.5, torch.ones_like(dev_sq), torch.exp(-4.0 * dev_sq))
 
     eff_w = stream_w * (0.75 + 0.25 * local_gate)

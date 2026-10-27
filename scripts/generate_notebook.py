@@ -257,6 +257,10 @@ if sample_p.exists():
     nb["cells"].append(code("""# ========================= 3. TRAIN UCF-CRIME (GPU T4 x 2) =========================
 import subprocess, sys
 
+# Tự động đồng bộ commit mới nhất từ GitHub
+subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
+subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
+
 UCF_BATCH_SIZE = 64
 UCF_EPOCHS = 10
 UCF_LR = 7e-5

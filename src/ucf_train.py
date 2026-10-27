@@ -39,6 +39,13 @@ import ucf_option
 
 
 def train(args):
+    try:
+        import subprocess
+        commit_id = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
+        print(f"[MA-RUPA Codebase] Git Commit: {commit_id}", flush=True)
+    except Exception:
+        pass
+
     # Enforce 10-epoch SOTA schedule & sanitize legacy notebook CLI flags
     if getattr(args, 'max_epoch', 10) > 10:
         print(f"[Auto-Config] Overriding legacy --max-epoch {args.max_epoch} -> 10 epochs (SOTA 10-epoch schedule).", flush=True)
