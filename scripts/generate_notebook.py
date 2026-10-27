@@ -262,7 +262,8 @@ subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
 UCF_BATCH_SIZE = 64
-UCF_EPOCHS = 15
+UCF_EPOCHS = 25
+UCF_CROPS_PER_VIDEO = 2  # DPSS: 2 distinct crops/video/epoch -> 50 iters/epoch -> 1,250 gradient steps!
 UCF_LR = 2.5e-5
 SEED = 234
 
@@ -280,6 +281,7 @@ cmd_train_ucf = [
     "--lr", str(UCF_LR),
     "--max-epoch", str(UCF_EPOCHS),
     "--sample-one-crop-per-video", "True",
+    "--crops-per-video", str(UCF_CROPS_PER_VIDEO),
     "--curriculum-epochs", "3.0",
     "--sampling", "topk",
     "--topk-ratio", "8",          # L / 8 (~12.5% frames) bao quát trọn vẹn diễn biến tội phạm nhiều phút
@@ -345,7 +347,8 @@ subprocess.run(cmd_eval_ucf, cwd=REPO_DIR, check=True)
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 5. TRAIN XD-VIOLENCE (GPU T4 x 2) =========================
 XD_BATCH_SIZE = 64
-XD_EPOCHS = 20
+XD_EPOCHS = 25
+XD_CROPS_PER_VIDEO = 2  # DPSS: 2 distinct crops/video/epoch -> ~59 iters/epoch -> 1,475 gradient steps!
 XD_LR = 1.5e-5
 SEED = 234
 
@@ -364,6 +367,7 @@ cmd_train_xd = [
     "--lr", str(XD_LR),
     "--max-epoch", str(XD_EPOCHS),
     "--sample-one-crop-per-video", "True",
+    "--crops-per-video", str(XD_CROPS_PER_VIDEO),
     "--curriculum-epochs", "3.0",
     "--sampling", "topk",
     "--seed", str(SEED),

@@ -696,7 +696,7 @@ class ModalityAdaptiveBranch(nn.Module):
             s_aux = torch.zeros(B, T, 1, device=device, dtype=f_base.dtype)
             logits_aux = torch.zeros(B, T, 1, device=device, dtype=f_base.dtype)
             g_av = torch.zeros_like(f_base)
-            av_suppress_loss = torch.tensor(0.0, device=device)
+            av_suppress_loss = torch.zeros(B, 1, device=device, dtype=f_base.dtype)
             if return_suppress_loss and return_tasl:
                 return f_fused, s_aux, logits_aux, g_av, av_suppress_loss, None
             if return_suppress_loss:
@@ -1498,7 +1498,7 @@ class QuadSafeGate(nn.Module):
         s_sem = s_sem.clamp(1e-5, 1.0 - 1e-5)
 
         if self.no_safegate:
-            return s_det, torch.tensor(0.0, device=s_det.device), s_det
+            return s_det, torch.zeros(s_det.shape[0], 1, device=s_det.device, dtype=s_det.dtype), s_det
 
         a = self.alpha.clamp(0.10, 0.90)
         s_consensus = a * s_det + (1.0 - a) * s_sem
@@ -1507,7 +1507,7 @@ class QuadSafeGate(nn.Module):
         discord = (s_det - s_sem).abs()
         p_routing = torch.where(discord > self.tau_disc, s_det, s_consensus)
 
-        gate_reg = torch.tensor(0.0, device=s_det.device)
+        gate_reg = torch.zeros(s_det.shape[0], 1, device=s_det.device, dtype=s_det.dtype)
         return p_routing, gate_reg, s_consensus
 
 

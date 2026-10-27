@@ -99,19 +99,22 @@ def train(args):
         'B4': 'riot', 'B5': 'abuse', 'B6': 'car accident', 'G': 'explosion'
     }
 
-    # Datasets & Balanced Paired Loaders: default to DPSS (1 random crop/video/epoch)
+    # Datasets & Balanced Paired Loaders: default to DPSS (random crop selection per epoch)
     sample_one_crop = getattr(args, 'sample_one_crop_per_video', True)
+    crops_per_video = getattr(args, 'crops_per_video', 2)
     normal_dataset = XDDataset(
         args.visual_length, args.train_list, False, label_map,
         audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
         data_dir=args.data_dir, no_audio=args.no_audio,
-        normal=True, sample_one_crop_per_video=sample_one_crop
+        normal=True, sample_one_crop_per_video=sample_one_crop,
+        crops_per_video=crops_per_video
     )
     anomaly_dataset = XDDataset(
         args.visual_length, args.train_list, False, label_map,
         audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
         data_dir=args.data_dir, no_audio=args.no_audio,
-        normal=False, sample_one_crop_per_video=sample_one_crop
+        normal=False, sample_one_crop_per_video=sample_one_crop,
+        crops_per_video=crops_per_video
     )
 
     batch_half = max(1, args.batch_size // 2)
@@ -223,7 +226,7 @@ def train(args):
     print("\n" + "=" * 70)
     print(f"[START] STARTING END-TO-END TRAINING FOR XD-VIOLENCE: {args.max_epoch} EPOCHS")
     print(f"  Batch size: {args.batch_size} ({batch_half} Normal + {batch_half} Abnormal per batch, Interleaved)")
-    print(f"  Iters per epoch: {iters_per_epoch} | Sample 1 crop per video: {sample_one_crop}")
+    print(f"  Iters per epoch: {iters_per_epoch} | Crops per video: {crops_per_video} | Samples/epoch: {iters_per_epoch * args.batch_size}")
     print("=" * 70, flush=True)
 
     for epoch in range(start_epoch, args.max_epoch):
@@ -401,10 +404,10 @@ def train(args):
             loss_accum['guide'] += loss_sem_guide.item()
             loss_accum['total'] += total_loss.item()
 
-            if (step_idx + 1) % 20 == 0 or (step_idx + 1) == iters_per_epoch:
-                current_step = (step_idx + 1) * args.batch_size
+            log_interval = max(1, iters_per_epoch // 5)
+            if (step_idx + 1) % log_interval == 0 or (step_idx + 1) == iters_per_epoch:
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
-                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}/{iters_per_epoch * args.batch_size} ({percent:.1f}%)] "
+                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
                       f"CLASM: {loss_clasm.item():.4f} | Guide: {loss_sem_guide.item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
 

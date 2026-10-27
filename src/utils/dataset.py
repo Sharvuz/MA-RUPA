@@ -246,7 +246,8 @@ class UCFDataset(data.Dataset):
     Supports random single-crop selection per video per epoch to prevent overfitting/memorization.
     """
     def __init__(self, clip_dim: int, file_path: str, test_mode: bool, label_map: dict,
-                 normal: bool = False, data_dir: str = None, sample_one_crop_per_video: bool = False):
+                 normal: bool = False, data_dir: str = None, sample_one_crop_per_video: bool = False,
+                 crops_per_video: int = 1):
         self.df = pd.read_csv(file_path)
         self.clip_dim = clip_dim
         self.test_mode = test_mode
@@ -254,6 +255,7 @@ class UCFDataset(data.Dataset):
         self.normal = normal
         self.data_dir = data_dir
         self.sample_one_crop_per_video = sample_one_crop_per_video
+        self.crops_per_video = max(1, crops_per_video)
 
         if not test_mode:
             if normal:
@@ -276,12 +278,13 @@ class UCFDataset(data.Dataset):
 
     def __len__(self):
         if self.sample_one_crop_per_video and not self.test_mode and self.video_groups:
-            return len(self.video_groups)
+            return len(self.video_groups) * self.crops_per_video
         return len(self.raw_paths)
 
     def __getitem__(self, index):
         if self.sample_one_crop_per_video and not self.test_mode and self.video_groups:
-            crops = self.video_groups[index]
+            vid_idx = index % len(self.video_groups)
+            crops = self.video_groups[vid_idx]
             raw_path, label = crops[np.random.randint(len(crops))]
         else:
             raw_path = self.raw_paths[index]
@@ -319,7 +322,8 @@ class XDDataset(data.Dataset):
     def __init__(self, clip_dim: int, file_path: str, test_mode: bool, label_map: dict,
                  audio_file_path: str = None, audio_dir: str = None,
                  data_dir: str = None, no_audio: bool = False,
-                 normal: bool = None, sample_one_crop_per_video: bool = False):
+                 normal: bool = None, sample_one_crop_per_video: bool = False,
+                 crops_per_video: int = 1):
         self.df = pd.read_csv(file_path)
         self.clip_dim = clip_dim
         self.test_mode = test_mode
@@ -329,6 +333,7 @@ class XDDataset(data.Dataset):
         self.no_audio = no_audio
         self.normal = normal
         self.sample_one_crop_per_video = sample_one_crop_per_video
+        self.crops_per_video = max(1, crops_per_video)
 
         # Filter normal / anomaly bags if requested
         if not test_mode and normal is not None:
@@ -392,12 +397,13 @@ class XDDataset(data.Dataset):
 
     def __len__(self):
         if self.sample_one_crop_per_video and not self.test_mode and self.video_groups:
-            return len(self.video_groups)
+            return len(self.video_groups) * self.crops_per_video
         return len(self.raw_paths)
 
     def __getitem__(self, index):
         if self.sample_one_crop_per_video and not self.test_mode and self.video_groups:
-            crops = self.video_groups[index]
+            vid_idx = index % len(self.video_groups)
+            crops = self.video_groups[vid_idx]
             raw_path, label = crops[np.random.randint(len(crops))]
         else:
             raw_path = self.raw_paths[index]

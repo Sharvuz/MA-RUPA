@@ -59,7 +59,7 @@ parser.add_argument('--routing-sem-weight', default=0.38, type=float, help='Prio
 parser.add_argument('--routing-aux-weight', default=0.07, type=float, help='Prior weight for auxiliary motion stream')
 
 # Training & Optimization
-parser.add_argument('--max-epoch', default=15, type=int, help='Total training epochs (default 15 for DPSS 1-crop schedule)')
+parser.add_argument('--max-epoch', default=25, type=int, help='Total training epochs (default 25 for ~1250 gradient steps)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size (32 normal + 32 anomaly)')
 parser.add_argument('--lr', type=float, default=2.5e-5, help='Learning rate for End-to-End AdamW optimizer (default 2.5e-5)')
 parser.add_argument('--weight-decay', type=float, default=2e-3, help='Weight decay for regularization (default 2e-3)')
@@ -69,7 +69,8 @@ parser.add_argument('--topk-ratio', type=int, default=16, help='Base divisor for
 parser.add_argument('--topk-ratio-clasm', type=int, default=16, help='Top-k divisor for snippet multi-class classification (default 16)')
 parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0; AT-BCE + OHNM prevents collapse)')
 parser.add_argument('--snippet-dropout', type=float, default=0.15, help='Snippet dropout rate during training to prevent 1-frame spike collapse (default 0.15)')
-parser.add_argument('--sample-one-crop-per-video', default=True, type=str2bool, help='DPSS: Randomly sample 1 distinct crop per video per epoch (default True)')
+parser.add_argument('--sample-one-crop-per-video', default=True, type=str2bool, help='DPSS: Randomly sample distinct crop(s) per video per epoch (default True)')
+parser.add_argument('--crops-per-video', default=2, type=int, help='DPSS: Number of random crops sampled per video per epoch (default 2 for 50 iters/epoch)')
 parser.add_argument('--vatk', default=True, type=str2bool, help='Whether to use Variance-Adaptive Top-K selection (default True)')
 parser.add_argument('--gamma-edge', default=5.0, type=float, help='Edge-preserving sensitivity for SA-EPTS smoothness loss (default 5.0)')
 parser.add_argument('--lambda-entropy', default=0.02, type=float, help='Soft maximum entropy regularization weight (default 0.02)')
