@@ -1,5 +1,6 @@
 import math
 import torch
+import torch.nn.functional as F
 import numpy as np
 
 def get_batch_label(texts, prompt_text, label_map: dict):
