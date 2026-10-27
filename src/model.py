@@ -335,6 +335,20 @@ class MDTBackbone(nn.Module):
         self.classifier_det = nn.Linear(embed_dim, 1)
         self.hyp_scorer = HyperbolicPoincareScorer(embed_dim=embed_dim, hyp_dim=128, dropout=mlp_dropout)
         self.alpha_hyp_det = nn.Parameter(torch.tensor(0.25))
+        self.use_hyp = False
+
+    def classify_anomaly(self, feat: torch.Tensor):
+        """Applies the anomaly detection head to a feature tensor [B, T, D]."""
+        det_features = feat + self.mlp_det(feat)
+        logits_euc = self.classifier_det(det_features)  # [B, T, 1]
+        if getattr(self, 'use_hyp', False):
+            logits_hyp = self.hyp_scorer(det_features)      # [B, T, 1]
+            w_hyp = self.alpha_hyp_det.clamp(0.0, 0.45)
+            logits_det = (1.0 - w_hyp) * logits_euc + w_hyp * logits_hyp
+        else:
+            logits_det = logits_euc
+        s_det = torch.sigmoid(logits_det)
+        return s_det, logits_det
 
     def build_window_attention_mask(self, length: int, window: int, device: torch.device):
         """Construct block-diagonal window attention mask.
@@ -406,16 +420,8 @@ class MDTBackbone(nn.Module):
         # Crucial CLIP Anchor Skip Connection: F_base = LayerNorm(X_clip + alpha * FusedContext)
         f_base = self.out_norm(visual_features + self.alpha_backbone * fused_context)
 
-        # Dual-Space Base Anomaly Classifier (Euclidean + Hyperbolic Poincaré Ball)
-        det_features = f_base + self.mlp_det(f_base)
-        logits_euc = self.classifier_det(det_features)  # [B, T, 1]
-        if getattr(self, 'use_hyp', True):
-            logits_hyp = self.hyp_scorer(det_features)      # [B, T, 1]
-            w_hyp = self.alpha_hyp_det.clamp(0.0, 0.45)
-            logits_det = (1.0 - w_hyp) * logits_euc + w_hyp * logits_hyp
-        else:
-            logits_det = logits_euc
-        s_det = torch.sigmoid(logits_det)
+        # Base Anomaly Classifier Head
+        s_det, logits_det = self.classify_anomaly(f_base)
 
         return f_base, s_det, logits_det
 
@@ -1135,7 +1141,8 @@ class GradientSafeRUPA(nn.Module):
         ep = float(self.current_epoch_buf.item())
         if self.use_aspm:
             sig_e = 1.0 / (1.0 + math.exp(-1.1 * (ep - 3.5)))
-            m_sched = float(self.base_prototypes) + float(self.num_prototypes - self.base_prototypes) * sig_e
+            eff_max_rank = min(float(self.num_prototypes), 24.0)
+            m_sched = float(self.base_prototypes) + max(0.0, eff_max_rank - float(self.base_prototypes)) * sig_e
         else:
             m_sched = float(self.base_prototypes)
 
@@ -1147,7 +1154,7 @@ class GradientSafeRUPA(nn.Module):
             eff_n = float(N if self.training else B * N)
             l_vec = torch.full((B,), eff_n, device=device, dtype=torch.float32)
 
-        l_cap = (0.35 * l_vec).clamp(min=8.0, max=float(self.num_prototypes))
+        l_cap = (0.30 * l_vec).clamp(min=8.0, max=24.0)
         m_eff = torch.clamp(l_cap, max=m_sched)  # [B]
 
         slot_idx = torch.arange(self.num_prototypes, device=device, dtype=torch.float32).unsqueeze(0) + 0.5
@@ -1284,31 +1291,34 @@ class GradientSafeRUPA(nn.Module):
             u_norm = self.build_orthonormal_subspace(dynamic_normal_patterns)  # [B, M, D]
 
         # 4. Soft-Masked Latent Manifold Orthogonal Subspace Projection (SM-ASPM)
-        raw_coords = torch.bmm(f_fused, u_norm.transpose(1, 2))               # [B, N, M]
+        # Detach f_fused when projecting onto low-rank U_norm so prototype/consistency losses
+        # train the normal subspace & decoder without crushing 512-D CLIP backbone features
+        f_sub_in = f_fused.detach()
+        raw_coords = torch.bmm(f_sub_in, u_norm.transpose(1, 2))              # [B, N, M]
         subspace_coords = raw_coords * rank_mask.unsqueeze(1)                 # [B, N, M]
         f_proj = torch.bmm(subspace_coords, u_norm)                           # [B, N, D]
 
-        # Subspace-constrained decoder refinement (operates strictly on f_proj and active slots)
+        # Subspace-constrained decoder refinement (operates on f_proj and active slots)
         f_dec = self.bottleneck(f_proj)
         for blk in self.decoder:
             f_dec = blk(f_dec, u_norm, slot_mask=rank_mask)
-        alpha_dec = torch.sigmoid(self.alpha_subspace_dec) * 0.35
+        alpha_dec = torch.sigmoid(self.alpha_subspace_dec)
         f_rec = (1.0 - alpha_dec) * f_proj + alpha_dec * f_dec
 
         # Counterfactual Orthogonal Residual: R = F_fused - F_rec
-        residual = f_fused - f_rec
+        residual = f_fused - f_rec.detach()
 
         # Grassmannian Subspace Reconstruction Score + Cosine Hybrid
-        f_norm_unit = F.normalize(f_fused, dim=-1)
+        f_norm_unit = F.normalize(f_sub_in, dim=-1)
         unit_coords_sq = torch.bmm(f_norm_unit, u_norm.transpose(1, 2)) ** 2
         proj_energy = (unit_coords_sq * mask_sq.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
         s_subspace = (1.0 - proj_energy).clamp(0.0, 1.0)
-        cos_sim = F.cosine_similarity(f_fused, f_rec, dim=-1).unsqueeze(-1)
+        cos_sim = F.cosine_similarity(f_sub_in, f_rec, dim=-1).unsqueeze(-1)
         s_cos = ((1.0 - cos_sim) / 2.0).clamp(0.0, 1.0)
-        s_rec = (0.6 * s_subspace + 0.4 * s_cos).clamp(0.0, 1.0)
+        s_rec = (0.5 * s_subspace + 0.5 * s_cos).clamp(0.0, 1.0)
 
         # 5. Per-sample Subspace Gather Loss: [B, 1]
-        norm_unit_sel = F.normalize(selected_normal, dim=-1)
+        norm_unit_sel = F.normalize(selected_normal.detach(), dim=-1)
         norm_coords_sq = torch.bmm(norm_unit_sel, u_norm.transpose(1, 2)) ** 2
         norm_proj_energy = (norm_coords_sq * mask_sq.unsqueeze(1)).sum(dim=-1).clamp(0.0, 1.0)
         subspace_dist = 1.0 - norm_proj_energy
@@ -1330,24 +1340,20 @@ class GradientSafeRUPA(nn.Module):
         repulsion_loss = (F.relu(abn_proj_energy - self.repulsion_margin) * abn_gate).mean(dim=1, keepdim=True)
         sample_orth_loss = raw_orth_loss + 0.5 * repulsion_loss  # [B, 1]
 
-        # 7. Counterfactual Subspace-Split Semantic Alignment (Semantic-Anchored Residual)
-        # Anchoring residual with 0.40 * F_fused prevents near-zero normal residuals from magnifying
-        # background noise through LayerNorm while amplifying true orthogonal anomaly excursions.
-        temp = self.log_temp.exp().clamp(min=0.02, max=0.5)
+        # 7. CLIP-Anchored Residual Semantic Alignment
+        # Preserves 100% of F_fused CLIP geometry while adding bounded orthogonal residual refinement.
+        # Evaluates all C classes (including Class 0 Normal) on the same feature vector res_norm.
+        temp = self.log_temp.exp().clamp(min=0.04, max=0.20)
         rec_norm = F.normalize(f_rec + 0.25 * visual_raw, dim=-1)
-        f_sem_rupa = self.ln_sem_rupa(0.40 * f_fused + residual + self.gamma_rupa * self.mlp_res(residual))
+        f_sem_rupa = self.ln_sem_rupa(
+            f_fused + self.gamma_rupa.clamp(0.01, 0.25) * self.mlp_res(residual.detach())
+        )
         res_norm = F.normalize(f_sem_rupa, dim=-1)
 
         rec_sem_logits = rec_norm @ text_matrix / temp
         res_sem_logits = res_norm @ text_matrix / temp
-        semantic_logits = torch.cat(
-            [rec_sem_logits[:, :, :1], res_sem_logits[:, :, 1:]], dim=-1
-        )  # [B, T, C]
-
-        # Variance scaling factor: damps noisy semantic logits in blurry CCTV videos
-        r_var = torch.var(residual, dim=-1, keepdim=True)  # [B, T, 1]
-        var_scale = 1.0 + F.softplus(self.var_scale_param) * r_var
-        scaled_sem_logits = semantic_logits / var_scale
+        semantic_logits = res_sem_logits  # [B, T, C]
+        scaled_sem_logits = semantic_logits
 
         # Prior-Balanced Semantic Anomaly Score: calibrates out the (C-1):1 class-count prior offset
         p0_rupa = F.softmax(scaled_sem_logits, dim=-1)[:, :, :1]
@@ -1406,15 +1412,15 @@ class QuadSafeGate(nn.Module):
         self.dataset_type = dataset_type.lower()
         self.ood_beta = ood_beta
 
-        # Configurable prior weights
+        # Configurable prior weights (anchored on Detector & CLIP Semantics; Aux & Rec bounded small)
         if custom_prior_weights is not None:
             init_w = torch.tensor(custom_prior_weights, dtype=torch.float32)
         elif 'xd' in self.dataset_type:
-            # XD-Violence: balanced prior with elevated CLIP-semantic anchor
-            init_w = torch.tensor([0.30, 0.20, 0.30, 0.20], dtype=torch.float32)
+            # XD-Violence: Detector + Semantics primary anchor
+            init_w = torch.tensor([0.45, 0.05, 0.42, 0.08], dtype=torch.float32)
         else:
-            # UCF-Crime: Visual + Motion + LM-OSP + Semantics
-            init_w = torch.tensor([0.35, 0.25, 0.25, 0.15], dtype=torch.float32)
+            # UCF-Crime: Detector + Semantics primary anchor
+            init_w = torch.tensor([0.50, 0.05, 0.38, 0.07], dtype=torch.float32)
 
         init_w = init_w / init_w.sum().clamp_min(1e-6)
         self.register_buffer('target_prior', init_w)
@@ -1483,9 +1489,11 @@ class QuadSafeGate(nn.Module):
         residual_gate = torch.sigmoid(gate_out[..., 4:5])
 
         # 2. Asymmetric OOD False-Alarm Discordance Suppression
-        grounded_ref = torch.max(ss_d, sr_d)
-        ood_det = F.relu(sd_d - grounded_ref) ** 2
-        ood_rec = F.relu(sr_d - ss_d) ** 2
+        # Never penalize primary Detector (s_det) or CLIP Semantics (s_sem);
+        # only suppress auxiliary/reconstruction spikes that exceed max(s_det, s_sem)
+        grounded_ref = torch.max(sd_d, ss_d)
+        ood_det = torch.zeros_like(sd_d)
+        ood_rec = F.relu(sr_d - grounded_ref) ** 2
         ood_sem = torch.zeros_like(ss_d)
         ood_aux = F.relu(sa_d - grounded_ref) ** 2
         ood_penalty = torch.cat([ood_det, ood_rec, ood_sem, ood_aux], dim=-1)  # [B, T, 4]
@@ -1501,11 +1509,11 @@ class QuadSafeGate(nn.Module):
         if self.no_safegate:
             return s_fixed, torch.zeros_like(s_det), s_fixed
 
-        # 4. Semantic-Detector Consensus Anchor Routing
-        gamma_sem = torch.sigmoid(self.anchor_gamma_logit).clamp(0.30, 0.65)
+        # 4. Master Semantic-Detector Consensus Anchor Routing
+        gamma_sem = torch.sigmoid(self.anchor_gamma_logit).clamp(0.30, 0.48)
         s_anchor = (1.0 - gamma_sem) * s_det + gamma_sem * s_sem
 
-        p_routing = (s_anchor + residual_gate * (s_fixed - s_anchor)).clamp(1e-5, 1.0 - 1e-5)
+        p_routing = (s_anchor + 0.12 * residual_gate * (s_fixed - s_anchor)).clamp(1e-5, 1.0 - 1e-5)
 
         prior_ref = self.target_prior.view(1, 1, 4).to(dyn_weights.dtype)
         kl_div = (dyn_weights * (torch.log(dyn_weights.clamp_min(1e-6)) - torch.log(prior_ref))).sum(dim=-1, keepdim=True)
@@ -1698,6 +1706,7 @@ class MARUPA(nn.Module):
         # Dual-Space (Euclidean + Hyperbolic Poincaré Ball) Semantic Alignment Parameters
         self.hyp_sem_curv_logit = nn.Parameter(torch.tensor(-2.45))
         self.alpha_hyp_sem = nn.Parameter(torch.tensor(0.25))
+        self.use_hyp = False
 
         self._text_features_cache = None
         self._init_trainable_parameters()
@@ -1834,8 +1843,8 @@ class MARUPA(nn.Module):
         B, T, D = visual.shape
         target_device = visual.device
 
-        # Step 1: MDTBackbone -> F_base, S_det
-        f_base, s_det, logits_det = self.backbone(visual, padding_mask, lengths)
+        # Step 1: MDTBackbone -> F_base, initial S_det
+        f_base, s_det_base, logits_det_base = self.backbone(visual, padding_mask, lengths)
 
         # Text features for semantic alignment & TASL audio lifting (adapted & pure zero-shot anchor)
         text_features_ori = self.get_text_features(text, target_device=target_device)
@@ -1847,22 +1856,44 @@ class MARUPA(nn.Module):
             return_suppress_loss=True, category_text_features=text_features_ori, return_tasl=True
         )
 
+        # Unified Anomaly Detector on F_base + F_fused so S_det directly benefits from
+        # cross-modal audio-visual / motion fusion AND shares the DCSA/CLASM feature space
+        f_det_in = 0.5 * f_base + 0.5 * f_fused
+        s_det, logits_det = self.backbone.classify_anomaly(f_det_in)
+
         # Per-snippet Multi-Objective PCGrad Junction between Main CLIP Semantics & RUPA Subspace
         if DNP_use and not self.no_rupa and self.training and self.use_pcgrad:
             f_main, f_rupa_in = GradientProjectionJunction.apply(f_fused)
         else:
             f_main, f_rupa_in = f_fused, f_fused
 
-        # Dual-Space (Euclidean + Hyperbolic Poincaré Ball) Category Logits & Semantic Score S_sem_bb
-        text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
-        f_norm = F.normalize(f_main, dim=-1)
-        logits2_euc = (f_norm @ text_mat) / 0.07  # [B, T, C]
+        # Valid sequence mask for temporal pooling [B, T, 1]
+        if lengths is not None:
+            valid_mask = (
+                torch.arange(T, device=target_device)[None, :]
+                < lengths.to(target_device)[:, None]
+            ).unsqueeze(-1).to(visual.dtype)
+        else:
+            valid_mask = torch.ones(B, T, 1, device=target_device, dtype=visual.dtype)
 
-        if getattr(self, 'use_hyp', True):
+        # Vision-Text Enhance (DSANet Eq. 2): aggregate video cue with S_det and enhance category embeddings
+        det_weights = ((scale * s_det.detach()).exp() - 1.0) * valid_mask
+        det_weights = F.normalize(det_weights, p=1, dim=1)
+        vid_cue = F.normalize(torch.matmul(det_weights.permute(0, 2, 1), f_main.detach()), dim=-1)  # [B, 1, D]
+        alpha_ctx = self.alpha_prompt_ctx.clamp(0.01, 0.20)
+        ctx_offset = alpha_ctx * self.mlp_event(vid_cue)  # [B, 1, D]
+
+        text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
+        text_enh = F.normalize(
+            text_features_ori.unsqueeze(0) + 0.35 * ctx_offset, dim=-1
+        ).to(visual.dtype)  # [B, C, D]
+        f_norm = F.normalize(f_main, dim=-1)  # [B, T, D]
+        logits2_euc = torch.bmm(f_norm, text_enh.transpose(1, 2)) / 0.07  # [B, T, C]
+
+        if getattr(self, 'use_hyp', False):
             c_sem = F.softplus(self.hyp_sem_curv_logit).clamp(0.02, 0.25)
             f_hyp = HyperbolicPoincareScorer.exp_map_zero(f_main, c_sem)  # [B, T, D]
             t_hyp = HyperbolicPoincareScorer.exp_map_zero(text_features_ori, c_sem).t().to(visual.dtype)  # [D, C]
-            # Hyperbolic conformal similarity in Poincaré ball B_c^D
             logits2_hyp = (F.normalize(f_hyp, dim=-1) @ F.normalize(t_hyp, dim=0)) / 0.07
             w_hyp_sem = self.alpha_hyp_sem.clamp(0.0, 0.45)
             logits2 = (1.0 - w_hyp_sem) * logits2_euc + w_hyp_sem * logits2_hyp
@@ -1880,7 +1911,7 @@ class MARUPA(nn.Module):
                 f_rupa_in, s_det, text_features_ori, lengths=lengths,
                 visual_raw=visual, text_features_zs=text_features_zs
             )
-            w_bb = torch.sigmoid(self.sem_bb_weight_logit).clamp(0.25, 0.75)
+            w_bb = torch.sigmoid(self.sem_bb_weight_logit).clamp(0.40, 0.75)
             s_sem_joint = (w_bb * s_sem_bb + (1.0 - w_bb) * s_sem).clamp(1e-5, 1.0 - 1e-5)
             p_routing, gate, s_fixed = self.safegate(s_det, s_rec, s_sem_joint, s_aux)
             dnp_dict.update(rupa_dict)
@@ -1905,14 +1936,10 @@ class MARUPA(nn.Module):
             if audio_sem_logits is not None:
                 dnp_dict['audio_semantic_logits'] = audio_sem_logits
             logits1 = logits_det
-            event_features = residual
-            background_features = f_rec
         else:
             # Fallback when RUPA is disabled (Ablation mode)
             p_routing, gate, s_fixed = self.safegate(s_det, s_det, s_sem_bb, s_aux)
             logits1 = logits_det
-            event_features = f_fused
-            background_features = f_fused
             dnp_dict.update({
                 'routing_scores': p_routing,
                 'routing_logits': torch.logit(p_routing.clamp(1e-6, 1.0 - 1e-6)),
@@ -1937,27 +1964,18 @@ class MARUPA(nn.Module):
             if audio_sem_logits is not None:
                 dnp_dict['audio_semantic_logits'] = audio_sem_logits
 
-        # Event-centric & Background-centric attention pooling
-        if lengths is not None:
-            valid_mask = (
-                torch.arange(T, device=target_device)[None, :]
-                < lengths.to(target_device)[:, None]
-            ).unsqueeze(-1).to(visual.dtype)
-        else:
-            valid_mask = torch.ones(B, T, 1, device=target_device, dtype=visual.dtype)
-
-        prob_abn = p_routing
+        # Decoupled Contrastive Semantic Alignment (DCSA - DSANet Eq. 5):
+        # Pool unified video representation f_main into F_event and F_bkg using S_det weights
+        prob_abn = 0.65 * s_det + 0.35 * s_sem_bb.detach()
         abn_weights = ((scale * prob_abn).exp() - 1.0) * valid_mask
         abn_weights = F.normalize(abn_weights, p=1, dim=1)
 
         nor_weights = ((scale * (1.0 - prob_abn)).exp() - 1.0) * valid_mask
         nor_weights = F.normalize(nor_weights, p=1, dim=1)
 
-        # Video-level event & background representations with Event MLP calibration
-        abn_feat = torch.matmul(abn_weights.permute(0, 2, 1), event_features)  # [B, 1, D]
-        alpha_ctx = self.alpha_prompt_ctx.clamp(0.01, 0.25)
+        abn_feat = torch.matmul(abn_weights.permute(0, 2, 1), f_main)  # [B, 1, D]
         abn_feat = abn_feat + alpha_ctx * self.mlp_event(abn_feat)
-        nor_feat = torch.matmul(nor_weights.permute(0, 2, 1), background_features)  # [B, 1, D]
+        nor_feat = torch.matmul(nor_weights.permute(0, 2, 1), f_main)  # [B, 1, D]
 
         abn_feat_norm = F.normalize(abn_feat, dim=-1)
         nor_feat_norm = F.normalize(nor_feat, dim=-1)

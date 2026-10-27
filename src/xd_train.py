@@ -43,27 +43,32 @@ def train(args):
     if getattr(args, 'max_epoch', 10) > 10:
         print(f"[Auto-Config] Overriding legacy --max-epoch {args.max_epoch} -> 10 epochs (SOTA 10-epoch schedule).", flush=True)
         args.max_epoch = 10
+    if getattr(args, 'lr', 1.5e-5) > 2.2e-5:
+        print(f"[Auto-Config] Stabilizing XD-Violence --lr {args.lr} -> 1.5e-5 to prevent Epoch 4 catastrophic forgetting.", flush=True)
+        args.lr = 1.5e-5
     if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
         args.curriculum_epochs = 3.0
-    if getattr(args, 'max_omega', 0.25) > 0.35:
-        args.max_omega = 0.25
-    if getattr(args, 'lambda_aux', 0.18) > 0.25:
-        args.lambda_aux = 0.18
-    if getattr(args, 'routing_aux_weight', 0.12) > 0.18:
-        args.routing_aux_weight = 0.12
-    if getattr(args, 'lambda_smooth', 0.08) > 0.15 or getattr(args, 'lambda_smooth', 0.08) < 0.02:
-        args.lambda_smooth = 0.08
-    if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 1.0) > 1.25:
-        args.smooth_sigma = 1.0
+    if getattr(args, 'max_omega', 0.20) > 0.25:
+        args.max_omega = 0.20
+    if getattr(args, 'lambda_aux', 0.05) > 0.10:
+        args.lambda_aux = 0.05
+    if getattr(args, 'routing_aux_weight', 0.08) > 0.12:
+        args.routing_aux_weight = 0.08
+    if getattr(args, 'routing_rec_weight', 0.05) > 0.10:
+        args.routing_rec_weight = 0.05
+    if getattr(args, 'lambda_smooth', 0.06) > 0.12 or getattr(args, 'lambda_smooth', 0.06) < 0.02:
+        args.lambda_smooth = 0.06
+    if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 0.50) > 0.75:
+        args.smooth_sigma = 0.50
     if getattr(args, 'use_aspm', True):
-        if getattr(args, 'lambda_gather', 0.12) < 0.08:
-            args.lambda_gather = 0.12
-        if getattr(args, 'lambda_orth', 0.05) < 0.04:
+        if getattr(args, 'lambda_gather', 0.10) < 0.05:
+            args.lambda_gather = 0.10
+        if getattr(args, 'lambda_orth', 0.05) < 0.03:
             args.lambda_orth = 0.05
-        if getattr(args, 'lambda_consistency', 0.10) > 0.25:
-            args.lambda_consistency = 0.10
-        if getattr(args, 'loss2_weight', 1.8) < 0.5:
-            args.loss2_weight = 1.8
+        if getattr(args, 'lambda_consistency', 0.15) > 0.25:
+            args.lambda_consistency = 0.15
+        if getattr(args, 'loss2_weight', 1.4) > 1.6 or getattr(args, 'loss2_weight', 1.4) < 0.8:
+            args.loss2_weight = 1.4
         if getattr(args, 'temp', 1.0) > 1.2:
             args.temp = 1.0
 
@@ -352,7 +357,7 @@ def train(args):
 
             # 3. SA-EPTS: Semantic-Affinity Edge-Preserving Charbonnier Smoothness & Halo Expansion
             loss_smooth = compute_fg_tv_smoothness_loss(
-                scores=p_routing,
+                scores=s_det,
                 visual_features=visual_batch,
                 lengths=lengths_batch,
                 gamma_edge=getattr(args, 'gamma_edge', 5.0),
@@ -365,48 +370,34 @@ def train(args):
             # 4. RUPA Prototype Losses (modulated by smooth cosine curriculum omega(e))
             loss_gather = compute_gather_loss(dnp_dict)
             loss_orth = compute_orthogonality_loss(dnp_dict)
+            loss_residual = torch.tensor(0.0, device=device)
+            loss_gate = torch.tensor(0.0, device=device)
 
-            if 'residual_semantic_logits' in dnp_dict:
-                loss_residual = compute_residual_event_loss(
-                    dnp_dict['residual_semantic_logits'], one_hot_labels, lengths_batch, k_ratio=topk_r_clasm
-                )
-            else:
-                loss_residual = torch.tensor(0.0, device=device)
-
-            gate_val = dnp_dict.get('gate', torch.tensor(0.0, device=device))
-            loss_gate = (gate_val ** 2).mean()
-
-            # Text Orthogonality Regularization & Audio-Visual Loud-Normal Suppression
+            # Text Separation Regularization (DSANet Eq. 6)
             loss_text_orth = compute_normal_contrastive_loss(
                 text_features, num_classes=len(prompt_text)
             )
-            loss_av_sup = dnp_dict.get('av_suppress_loss', torch.tensor(0.0, device=device)).mean()
 
-            # Total Loss Computation with Pareto Optimal Weighting & Cosine Aux Annealing
-            max_om = max(0.25, getattr(args, 'max_omega', 0.40))
-            rupa_clasm_w = 0.8 * (0.30 + 0.70 * min(1.0, omega / max_om))
-            loss_clasm = loss_clasm_bb + rupa_clasm_w * loss_clasm_rupa
-            lambda_aux_base = getattr(args, 'lambda_aux', 0.28)
-            lambda_aux_eff = lambda_aux_base * (0.45 + 0.55 * math.cos(0.5 * math.pi * min(1.0, epoch / max(1, args.max_epoch))))
+            # 6-Pillar SOTA Total Loss (Eliminates 17-term gradient cancellation)
+            loss_clasm = loss_clasm_bb + 0.35 * loss_clasm_rupa
             total_loss = (
-                loss_mil_routing
-                + 0.8 * loss_mil_det
-                + lambda_aux_eff * loss_mil_aux
-                + getattr(args, 'lambda_tasl', 0.25) * loss_tasl
-                + 0.15 * loss_av_sup
-                + getattr(args, 'loss2_weight', 0.8) * loss_clasm_bb
-                + rupa_clasm_w * loss_clasm_rupa
-                + getattr(args, 'lambda_bkg', 0.5) * loss_bkg
-                + getattr(args, 'lambda_consistency', 0.35) * loss_consistency
-                + getattr(args, 'lambda_smooth', 0.08) * loss_smooth
-                + 0.1 * loss_text_orth
+                # Pillar 1: Primary Binary MIL (anchored on S_det + master consensus)
+                loss_mil_det + 0.35 * loss_mil_routing + 0.05 * loss_mil_aux
+                # Pillar 2: Fine-Grained Category Alignment (CLASM + TASL)
+                + getattr(args, 'loss2_weight', 1.4) * loss_clasm_bb
+                + 0.35 * loss_clasm_rupa
+                + 0.12 * loss_tasl
+                # Pillar 3: Self-Guided Normality Distillation (DSANet Eq. 4)
+                + getattr(args, 'lambda_consistency', 0.15) * loss_consistency
+                # Pillar 4: Edge-Preserving Temporal Smoothness
+                + getattr(args, 'lambda_smooth', 0.06) * loss_smooth
+                # Pillar 5: Decoupled Event/Background Contrastive Alignment (DCSA Eq. 7 + Eq. 6)
+                + 0.35 * (loss_event + loss_bkg)
+                + 0.05 * loss_text_orth
+                # Pillar 6: Compact & Orthogonal Normal Prototypes
                 + omega * (
-                    getattr(args, 'lambda_gather', 0.12) * loss_gather
+                    getattr(args, 'lambda_gather', 0.10) * loss_gather
                     + getattr(args, 'lambda_orth', 0.05) * loss_orth
-                    + getattr(args, 'lambda_residual', 0.05) * loss_residual
-                    + 0.15 * loss_event
-                    + 0.2 * loss_dnp_normal
-                    + getattr(args, 'lambda_gate', 0.01) * loss_gate
                 )
             )
 
@@ -437,7 +428,7 @@ def train(args):
                                 ema_shadow[n].mul_(ema_decay).add_(p.detach(), alpha=1.0 - ema_decay)
 
             # Accumulate logs
-            loss_accum['mil'] += loss_mil_routing.item()
+            loss_accum['mil'] += loss_mil_det.item()
             loss_accum['aux'] += loss_mil_aux.item()
             loss_accum['clasm'] += loss_clasm.item()
             loss_accum['tasl'] += loss_tasl.item()
@@ -446,7 +437,7 @@ def train(args):
             loss_accum['smooth'] += loss_smooth.item()
             loss_accum['gather'] += loss_gather.item()
             loss_accum['orth'] += loss_orth.item()
-            loss_accum['residual'] += loss_residual.item()
+            loss_accum['residual'] += loss_event.item()
             loss_accum['gate'] += loss_gate.item()
             loss_accum['total'] += total_loss.item()
 
@@ -454,8 +445,8 @@ def train(args):
                 current_step = (step_idx + 1) * args.batch_size
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Step {current_step}/{iters_per_epoch * args.batch_size} ({percent:.1f}%)] "
-                      f"Total: {total_loss.item():.4f} | MIL: {loss_mil_routing.item():.4f} "
-                      f"CLASM: {loss_clasm.item():.4f} | Consist: {loss_consistency.item():.4f} | Aux: {loss_mil_aux.item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
+                      f"CLASM: {loss_clasm.item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
 
         # End of Epoch Reporting
         avg_total = loss_accum['total'] / iters_per_epoch
@@ -469,14 +460,14 @@ def train(args):
         avg_smooth = loss_accum['smooth'] / iters_per_epoch
 
         print(f"\n--- Epoch {epoch_idx}/{args.max_epoch} Summary ---")
-        print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Orth: {avg_orth:.4f} | Res: {avg_residual:.4f} | Smooth: {avg_smooth:.4f} | Omega: {omega:.2f}")
+        print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Orth: {avg_orth:.4f} | Event: {avg_residual:.4f} | Smooth: {avg_smooth:.4f} | Omega: {omega:.2f}")
 
-        # Lookahead Polyak-EMA stabilization before evaluation
+        # Gentle Lookahead Polyak-EMA stabilization (5% blend preserves AdamW momentum across epochs)
         if ema_shadow is not None:
             with torch.no_grad():
                 for n, p in base_model.named_parameters():
                     if p.requires_grad and n in ema_shadow:
-                        p.data.mul_(0.80).add_(ema_shadow[n], alpha=0.20)
+                        p.data.mul_(0.95).add_(ema_shadow[n], alpha=0.05)
 
         # Evaluate on Test Set
         eval_model = model.module if hasattr(model, 'module') else model

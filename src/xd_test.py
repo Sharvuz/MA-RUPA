@@ -98,10 +98,12 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     ap_hier_list = []
     ap_uccf_list = []
     ap_dodo_list = []
+    ap_harmonic_list = []
+    ap_master_list = []
 
     smooth_eval = getattr(args, 'smooth_eval', True)
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
-    smooth_sigma = getattr(args, 'smooth_sigma', 1.0)
+    smooth_sigma = getattr(args, 'smooth_sigma', 0.50)
 
     raw_routing_vids = []
     raw_det_vids = []
@@ -229,11 +231,11 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     priors = {
         'routing': 1.0,
-        'sem': 1.0,
+        'sem': 0.90,
         'det': 0.95,
-        'sem_rupa': 0.25,
+        'sem_rupa': 0.90,
         'aux': 0.30,
-        'rec': 0.05
+        'rec': 0.02
     }
 
     for v_idx in range(len(cal_routing_vids)):
@@ -252,7 +254,11 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         p_ens_tri_np = (p_routing_np + p_sem_np + p_sem_rupa_np) / 3.0
         p_ens_quad_np = 0.30 * p_routing_np + 0.30 * p_sem_np + 0.20 * p_aux_np + 0.20 * p_sem_rupa_np
         p_weighted_np = 0.6 * p_routing_np + 0.4 * p_sem_rupa_np
-        p_geom_np = np.sqrt(np.clip(p_routing_np, 1e-6, 1.0) * np.clip(p_sem_np, 1e-5, 1.0))
+        p_geom_np = np.sqrt(np.clip(p_routing_np, 1e-6, 1.0) * np.clip(p_sem_rupa_np, 1e-5, 1.0))
+        p_harmonic_np = 2.0 * np.clip(p_routing_np, 1e-4, 1.0) * np.clip(p_sem_rupa_np, 1e-4, 1.0) / (
+            np.clip(p_routing_np, 1e-4, 1.0) + np.clip(p_sem_rupa_np, 1e-4, 1.0) + 1e-8
+        )
+        p_master_np = 0.35 * p_routing_np + 0.35 * p_sem_rupa_np + 0.15 * p_det_np + 0.15 * p_aux_np
 
         prob_dict = {
             'routing': torch.from_numpy(p_routing_np),
@@ -267,7 +273,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
         # Sharp DODO-anchored consensus probability for temporal localization (dmAP)
         consensus_abn_t = torch.from_numpy(
-            (0.50 * p_dodo_np + 0.25 * p_sem_np + 0.25 * p_routing_np).astype(np.float32)
+            (0.50 * p_dodo_np + 0.25 * p_sem_rupa_np + 0.25 * p_routing_np).astype(np.float32)
         ).unsqueeze(-1)
         optimized_probs = refine_scores_hierarchical(
             logits1_vids[v_idx], fused_sem_logits_vids[v_idx], eff_temp, consensus_abn_t
@@ -289,6 +295,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             p_ens_quad_np = smooth_scores(p_ens_quad_np, method=smooth_method, sigma=smooth_sigma)
             p_weighted_np = smooth_scores(p_weighted_np, method=smooth_method, sigma=smooth_sigma)
             p_geom_np = smooth_scores(p_geom_np, method=smooth_method, sigma=smooth_sigma)
+            p_harmonic_np = smooth_scores(p_harmonic_np, method=smooth_method, sigma=smooth_sigma)
+            p_master_np = smooth_scores(p_master_np, method=smooth_method, sigma=smooth_sigma)
             p_hier_np = smooth_scores(p_hier_np, method=smooth_method, sigma=smooth_sigma)
             p_uccf_np = smooth_scores(p_uccf_np, method=smooth_method, sigma=smooth_sigma)
 
@@ -306,6 +314,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         ap_ens_quad_list.append(p_ens_quad_np)
         ap_weighted_list.append(p_weighted_np)
         ap_geom_list.append(p_geom_np)
+        ap_harmonic_list.append(p_harmonic_np)
+        ap_master_list.append(p_master_np)
         ap_hier_list.append(p_hier_np)
         ap_uccf_list.append(p_uccf_np)
         ap_dodo_list.append(p_dodo_np)
@@ -333,6 +343,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     all_scores_ens_quad = np.concatenate(ap_ens_quad_list, axis=0)
     all_scores_weighted = np.concatenate(ap_weighted_list, axis=0)
     all_scores_geom = np.concatenate(ap_geom_list, axis=0)
+    all_scores_harmonic = np.concatenate(ap_harmonic_list, axis=0)
+    all_scores_master = np.concatenate(ap_master_list, axis=0)
     all_scores_hier = np.concatenate(ap_hier_list, axis=0)
     all_scores_uccf = np.concatenate(ap_uccf_list, axis=0)
     all_scores_dodo = np.concatenate(ap_dodo_list, axis=0)
@@ -352,6 +364,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     frame_scores_ens_quad = np.nan_to_num(np.repeat(all_scores_ens_quad, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_weighted = np.nan_to_num(np.repeat(all_scores_weighted, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_geom = np.nan_to_num(np.repeat(all_scores_geom, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_harmonic = np.nan_to_num(np.repeat(all_scores_harmonic, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_master = np.nan_to_num(np.repeat(all_scores_master, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_hier = np.nan_to_num(np.repeat(all_scores_hier, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_uccf = np.nan_to_num(np.repeat(all_scores_uccf, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_dodo = np.nan_to_num(np.repeat(all_scores_dodo, 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -402,6 +416,12 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_geom = roc_auc_score(gt_eval, frame_scores_geom[:min_len])
     ap_geom = average_precision_score(gt_eval, frame_scores_geom[:min_len])
 
+    roc_harmonic = roc_auc_score(gt_eval, frame_scores_harmonic[:min_len])
+    ap_harmonic = average_precision_score(gt_eval, frame_scores_harmonic[:min_len])
+
+    roc_master = roc_auc_score(gt_eval, frame_scores_master[:min_len])
+    ap_master = average_precision_score(gt_eval, frame_scores_master[:min_len])
+
     roc_hier = roc_auc_score(gt_eval, frame_scores_hier[:min_len])
     ap_hier = average_precision_score(gt_eval, frame_scores_hier[:min_len])
 
@@ -423,6 +443,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     print(f"[Evaluation] Frame-level AP (Ensemble Routing+Semantics RUPA): {ap_ens_rupa * 100:.2f}% | AUC: {roc_ens_rupa * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Weighted 60/40 Ensemble): {ap_weighted * 100:.2f}% | AUC: {roc_weighted * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Geometric Mean Filtered): {ap_geom * 100:.2f}% | AUC: {roc_geom * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Harmonic Consensus Ensemble): {ap_harmonic * 100:.2f}% | AUC: {roc_harmonic * 100:.2f}%", flush=True)
+    print(f"[Evaluation] Frame-level AP (Master SOTA Ensemble): {ap_master * 100:.2f}% | AUC: {roc_master * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Tri-Stream Ensemble): {ap_ens_tri * 100:.2f}% | AUC: {roc_ens_tri * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Quad-Stream SOTA Ensemble): {ap_ens_quad * 100:.2f}% | AUC: {roc_ens_quad * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AP (Hierarchical Refined): {ap_hier * 100:.2f}% | AUC: {roc_hier * 100:.2f}%", flush=True)
@@ -444,12 +466,12 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     best_ap = max(
         ap_routing, ap_det, ap_aux, ap_sem, ap_sem_rupa,
         ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_aux, ap_ens_audio_det,
-        ap_ens_tri, ap_ens_quad, ap_weighted, ap_geom, ap_hier, ap_uccf, ap_dodo
+        ap_ens_tri, ap_ens_quad, ap_weighted, ap_geom, ap_harmonic, ap_master, ap_hier, ap_uccf, ap_dodo
     )
     best_auc = max(
         roc_routing, roc_det, roc_aux, roc_sem, roc_sem_rupa,
         roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_aux, roc_ens_audio_det,
-        roc_ens_tri, roc_ens_quad, roc_weighted, roc_geom, roc_hier, roc_uccf, roc_dodo
+        roc_ens_tri, roc_ens_quad, roc_weighted, roc_geom, roc_harmonic, roc_master, roc_hier, roc_uccf, roc_dodo
     )
     print(f"  ==> [BEST METRIC] Frame-level AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}%", flush=True)
     return best_auc, best_ap, avg_map

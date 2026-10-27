@@ -260,16 +260,13 @@ def calibrate_stream_global(scores_np: np.ndarray,
 
 
 def compute_single_pass_uccf(prob_dict: dict, priors: dict, delta_dis: float = 0.35) -> torch.Tensor:
-    """Contrast-Aware Calibrated Fusion (CA-UCCF v2).
+    """Master-Anchored Contrast-Aware Calibrated Fusion (CA-UCCF v2).
 
-    Replaces inverse-entropy weighting (which assigned near-100% weight to flat/missed
-    near-zero streams where binary entropy -> 0) with:
-    1. Peak-to-Background Discriminative SNR Weighting:
-       SNR_j = (Q_0.95(s_j) - Q_0.50(s_j))_+ / (IQR(s_j) + 0.05)
-       Dead/flat streams get SNR_j -> 0 and fall back smoothly without poisoning active streams.
-    2. Local Consensus Outlier Suppression:
-       Damps isolated single-stream false spikes or single-stream dropouts that deviate
-       strongly from the multi-stream consensus anchor.
+    Immunized against late-epoch auxiliary/reconstruction stream hijacking:
+    1. Primary Consensus Anchor is formed strictly by core discriminative/semantic streams
+       (prior >= 0.25: routing, det, sem, sem_rupa).
+    2. Auxiliary streams (rec, aux) are exponentially gated if they deviate from the
+       primary consensus anchor, while core streams are never suppressed by noisy aux spikes.
     """
     stream_keys = list(prob_dict.keys())
     probs = [prob_dict[k].float().clamp(1e-6, 1.0 - 1e-6) for k in stream_keys]
@@ -289,23 +286,26 @@ def compute_single_pass_uccf(prob_dict: dict, priors: dict, delta_dis: float = 0
     quants = torch.quantile(stacked, q_levels, dim=-1)  # [4, S]
     q25, q50, q75, q95 = quants[0], quants[1], quants[2], quants[3]
 
-    iqr = (q75 - q25).clamp_min(0.04)
-    snr = ((q95 - q50).clamp_min(0.0) / (iqr + 0.05)).clamp(0.0, 4.0).unsqueeze(-1)  # [S, 1]
+    iqr = (q75 - q25).clamp_min(0.05)
+    snr = ((q95 - q50).clamp_min(0.0) / (iqr + 0.08)).clamp(0.0, 2.5).unsqueeze(-1)  # [S, 1]
 
-    # Active contrast-aware stream weights (smoothly reduces to prior pi on flat normal videos)
-    stream_w = pi * (1.0 + 1.20 * snr)
+    # Gentle contrast modulation bounded by prior pi
+    stream_w = pi * (1.0 + 0.20 * snr)
     stream_w = stream_w / stream_w.sum(dim=0, keepdim=True).clamp_min(1e-6)  # [S, 1]
 
-    # Multi-stream consensus anchor at each snippet t
-    anchor_t = (stream_w * stacked).sum(dim=0, keepdim=True)  # [1, T]
+    # Primary consensus anchor computed strictly from core streams (pi >= 0.25)
+    core_mask = (pi >= 0.25).float()
+    if core_mask.sum().item() > 0:
+        core_w = (stream_w * core_mask) / (stream_w * core_mask).sum(dim=0, keepdim=True).clamp_min(1e-6)
+    else:
+        core_w = stream_w
+    anchor_t = (core_w * stacked).sum(dim=0, keepdim=True)  # [1, T]
 
-    # Suppress isolated single-stream dropouts or uncorroborated noise spikes
-    dev_sq = (stacked - anchor_t) ** 2  # [S, T]
-    disagreement = stacked.max(dim=0, keepdim=True).values - stacked.min(dim=0, keepdim=True).values
-    gate_strength = torch.where(disagreement > delta_dis, 3.0, 1.5)
-    local_gate = torch.exp(-gate_strength * dev_sq)  # [S, T]
+    # Suppress uncorroborated noise spikes in secondary streams without suppressing core streams
+    dev_sq = F.relu(stacked - anchor_t) ** 2  # [S, T]
+    local_gate = torch.where(core_mask > 0.5, torch.ones_like(dev_sq), torch.exp(-4.0 * dev_sq))
 
-    eff_w = stream_w * (0.45 + 0.55 * local_gate)
+    eff_w = stream_w * (0.75 + 0.25 * local_gate)
     eff_w = eff_w / eff_w.sum(dim=0, keepdim=True).clamp_min(1e-6)
 
     fused_prob = (eff_w * stacked).sum(dim=0)

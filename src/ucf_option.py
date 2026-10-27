@@ -53,10 +53,10 @@ parser.add_argument('--routing-mode', choices=['fixed', 'safe_gate'], default='s
 parser.add_argument('--routing-gate-hidden', default=32, type=int, help='Hidden dimension of dynamic safe gate MLP')
 
 # Prior weights for UCF-Crime
-parser.add_argument('--routing-det-weight', default=0.35, type=float, help='Prior weight for detector stream')
-parser.add_argument('--routing-rec-weight', default=0.25, type=float, help='Prior weight for reconstruction stream')
-parser.add_argument('--routing-sem-weight', default=0.25, type=float, help='Prior weight for semantic stream')
-parser.add_argument('--routing-aux-weight', default=0.15, type=float, help='Prior weight for auxiliary motion stream')
+parser.add_argument('--routing-det-weight', default=0.50, type=float, help='Prior weight for detector stream')
+parser.add_argument('--routing-rec-weight', default=0.05, type=float, help='Prior weight for reconstruction stream')
+parser.add_argument('--routing-sem-weight', default=0.38, type=float, help='Prior weight for semantic stream')
+parser.add_argument('--routing-aux-weight', default=0.07, type=float, help='Prior weight for auxiliary motion stream')
 
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for optimal convergence)')
@@ -78,13 +78,13 @@ parser.add_argument('--lambda-ohnm', default=0.2, type=float, help='Online hard 
 # Loss Weighting (Pareto optimal weighting for simultaneous Detector and RUPA performance)
 parser.add_argument('--lambda-aux', type=float, default=0.20, help='Weight for auxiliary branch MIL loss (default 0.20 for UCF-Crime)')
 parser.add_argument('--lambda-tasl', type=float, default=0.10, help='Weight for TASL cross-modal semantic alignment loss (default 0.10 for UCF-Crime)')
-parser.add_argument('--lambda-smooth', type=float, default=0.08, help='Weight for SA-EPTS edge-preserving smoothness & halo expansion loss (default 0.08)')
+parser.add_argument('--lambda-smooth', type=float, default=0.06, help='Weight for SA-EPTS edge-preserving smoothness & halo expansion loss (default 0.06)')
 parser.add_argument('--lambda-orth', type=float, default=0.05, help='Weight for active-slot prototype orthogonality & repulsion loss (default 0.05)')
 parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight for DNP subspace gather loss (default 0.12)')
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate KL regularization loss (default 0.01)')
 parser.add_argument('--loss2_weight', type=float, default=1.2, help='Weight for snippet multi-class classification loss (default 1.2)')
-parser.add_argument('--lambda-consistency', type=float, default=0.10, help='Weight for confidence-gated consistency loss between detector and RUPA (default 0.10)')
+parser.add_argument('--lambda-consistency', type=float, default=0.15, help='Weight for confidence-gated consistency loss between detector and RUPA (default 0.15)')
 parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss (default 0.5)')
 
 # Data & Paths
@@ -101,7 +101,7 @@ parser.add_argument('--use-checkpoint', default=False, type=str2bool, help='Resu
 # Post-processing & Multi-crop Test Evaluation
 parser.add_argument('--smooth-eval', default=True, type=str2bool, help='Apply temporal score smoothing during evaluation')
 parser.add_argument('--smooth-method', choices=['gaussian', 'savgol'], default='gaussian', help='Temporal smoothing filter method')
-parser.add_argument('--smooth-sigma', default=0.75, type=float, help='Gaussian filter sigma for score smoothing (default 0.75 preserves sharp CCTV event peaks)')
+parser.add_argument('--smooth-sigma', default=0.50, type=float, help='Gaussian filter sigma for score smoothing (default 0.50 preserves sharp CCTV event peaks)')
 parser.add_argument('--eval-interval', default=1280, type=int, help='Step interval for mid-epoch evaluation')
 parser.add_argument('--num-workers', default=2, type=int, help='DataLoader workers')
 parser.add_argument('--grad-clip', default=1.0, type=float, help='Max gradient norm for clipping')

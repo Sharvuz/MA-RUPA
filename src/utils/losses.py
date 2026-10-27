@@ -395,11 +395,12 @@ def compute_confidence_gated_consistency_loss(s_det: torch.Tensor,
                                               s_rupa: torch.Tensor,
                                               lengths: torch.Tensor,
                                               device: torch.device = None) -> torch.Tensor:
-    """Confidence-Gated Asymmetric Consistency Loss.
+    """Self-Guided Normality Distillation Consistency Loss (DSANet Eq. 4).
     
-    Weight consistency by point-wise certainty (1 - normalized binary entropy).
-    The more certain stream acts as the detached teacher, while the less certain stream is the student.
-    L_cons = w_cert * SmoothL1(S_student, S_teacher.detach()).
+    Eliminates entropy teacher-inversion (where near-zero S_rec on anomalies had lower
+    Shannon entropy than S_det and pulled S_det down to 0).
+    1. S_det (supervised by primary MIL) guides S_rec across all valid snippets.
+    2. S_rec gently regularizes S_det on background snippets without suppressing anomaly peaks.
     """
     if device is None:
         device = s_det.device
@@ -407,26 +408,15 @@ def compute_confidence_gated_consistency_loss(s_det: torch.Tensor,
     s_r = s_rupa.squeeze(-1).clamp(1e-6, 1.0 - 1e-6)
     B, T = s_d.shape
 
-    # Binary Shannon entropy normalized to [0, 1]
-    log2 = math.log(2.0)
-    h_d = -(s_d * torch.log(s_d) + (1.0 - s_d) * torch.log(1.0 - s_d)) / log2
-    h_r = -(s_r * torch.log(s_r) + (1.0 - s_r) * torch.log(1.0 - s_r)) / log2
-
-    cert_d = (1.0 - h_d).clamp(0.0, 1.0)
-    cert_r = (1.0 - h_r).clamp(0.0, 1.0)
-
-    # Detach the more confident stream as teacher
-    d_is_teacher = (cert_d >= cert_r).float()
-    teacher = d_is_teacher * s_d.detach() + (1.0 - d_is_teacher) * s_r.detach()
-    student = d_is_teacher * s_r + (1.0 - d_is_teacher) * s_d
-    w_cert = torch.max(cert_d, cert_r)
-
     mask = torch.arange(T, device=device)[None, :] < lengths.to(device)[:, None]
     if not torch.any(mask):
         return torch.tensor(0.0, device=device)
 
-    loss_per_snippet = w_cert * F.smooth_l1_loss(student, teacher, reduction='none')
-    return loss_per_snippet[mask].mean()
+    # S_det guides reconstruction score S_rec; S_rec provides gentle normality regularization to S_det
+    loss_r_from_d = F.mse_loss(s_r[mask], s_d.detach()[mask], reduction='none')
+    bkg_gate = (1.0 - s_d.detach()[mask]).clamp(0.15, 1.0)
+    loss_d_from_r = bkg_gate * F.mse_loss(s_d[mask], s_r.detach()[mask], reduction='none')
+    return (0.70 * loss_r_from_d + 0.30 * loss_d_from_r).mean()
 
 
 def compute_consistency_loss(p_routing: torch.Tensor,

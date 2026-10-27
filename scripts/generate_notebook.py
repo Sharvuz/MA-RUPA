@@ -258,8 +258,8 @@ if sample_p.exists():
 import subprocess, sys
 
 UCF_BATCH_SIZE = 64
-UCF_EPOCHS = 12
-UCF_LR = 1e-4  # Tinh chỉnh từ 2e-4 -> 1e-4 giúp hội tụ đều đặn, không bị bão hòa sớm
+UCF_EPOCHS = 10
+UCF_LR = 7e-5
 SEED = 234
 
 ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
@@ -280,12 +280,12 @@ cmd_train_ucf = [
     "--topk-ratio", "8",          # L / 8 (~12.5% frames) bao quát trọn vẹn diễn biến tội phạm nhiều phút
     "--label-smoothing", "0.02",  # Ngăn BCE loss tụt về 0, giữ gradient sống qua các epoch sau
     "--lambda-aux", "0.15",       # Giảm trọng số nhánh Aux (Motion Residual) chống overfit sớm
-    "--lambda-smooth", "0.4",     # Tăng làm phẳng biến thiên cục bộ giữa frame t và t-1, giảm False Positives
+    "--lambda-smooth", "0.06",     # Tăng làm phẳng biến thiên cục bộ giữa frame t và t-1, giảm False Positives
     "--seed", str(SEED),
     "--model-path", str(ucf_model_path),
     "--checkpoint-path", str(ucf_checkpoint_path),
     "--smooth-eval", "True",
-    "--smooth-sigma", "2.0"
+    "--smooth-sigma", "0.50"
 ]
 
 print("🚀 Bắt đầu huấn luyện End-to-End MA-RUPA trên UCF-Crime (Tối ưu SOTA 88-90% AUC) với GPU T4x2...\\n", flush=True)
@@ -318,7 +318,7 @@ cmd_eval_ucf = [
     "--gt-label-path", "list/gt_label_ucf.npy",
     "--model-path", str(ucf_model_path),
     "--smooth-eval", "True",
-    "--smooth-sigma", "2.0"
+    "--smooth-sigma", "0.50"
 ]
 
 print("🔍 Đang đánh giá model UCF-Crime tốt nhất với Multi-Stream Evaluation & Gaussian Smoothing (sigma=2.0)...", flush=True)
@@ -340,8 +340,8 @@ subprocess.run(cmd_eval_ucf, cwd=REPO_DIR, check=True)
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 5. TRAIN XD-VIOLENCE (GPU T4 x 2) =========================
 XD_BATCH_SIZE = 64
-XD_EPOCHS = 15
-XD_LR = 2e-4
+XD_EPOCHS = 10
+XD_LR = 1.5e-5
 SEED = 234
 
 xd_model_path = ARTIFACTS / "model_xd_best.pth"
@@ -364,7 +364,7 @@ cmd_train_xd = [
     "--model-path", str(xd_model_path),
     "--checkpoint-path", str(xd_checkpoint_path),
     "--smooth-eval", "True",
-    "--smooth-sigma", "1.5"
+    "--smooth-sigma", "0.50"
 ]
 
 print("🚀 Bắt đầu huấn luyện End-to-End MA-RUPA trên XD-Violence với GPU T4x2...\\n", flush=True)
@@ -397,7 +397,7 @@ cmd_eval_xd = [
     "--gt-label-path", "list/gt_label.npy",
     "--model-path", str(xd_model_path),
     "--smooth-eval", "True",
-    "--smooth-sigma", "1.5"
+    "--smooth-sigma", "0.50"
 ]
 
 print("🔍 Đang đánh giá model XD-Violence tốt nhất...", flush=True)
