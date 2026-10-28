@@ -150,6 +150,12 @@ import pandas as pd
 
 print("🔍 Đang kiểm tra và thiết lập bản đồ dữ liệu feature (.npy)...")
 
+# Luôn khởi tạo sẵn biến đường dẫn mặc định trong mọi trường hợp
+ucf_train_csv = ARTIFACTS / "ucf_train.csv"
+ucf_test_csv = ARTIFACTS / "ucf_test.csv"
+xd_train_csv = ARTIFACTS / "xd_train.csv"
+xd_test_csv = ARTIFACTS / "xd_test.csv"
+
 # Kiểm tra nếu đã đồng bộ và các file tồn tại thì tái sử dụng ngay lập tức
 artifacts_ready = all(
     (ARTIFACTS / f).exists() and (ARTIFACTS / f).stat().st_size > 0
@@ -290,11 +296,20 @@ if not skip_scan:
     # Cell 4: Train UCF
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 3. TRAIN UCF-CRIME (GPU T4 x 2) =========================
-import subprocess, sys
+import os, sys, subprocess
+from pathlib import Path
+
+WORK = Path("/kaggle/working")
+REPO_DIR = WORK / "MA-RUPA"
+ARTIFACTS = WORK / "rupa_artifacts"
 
 # Tự động đồng bộ commit mới nhất từ GitHub
 subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
+
+# Đảm bảo biến dataset luôn sẵn sàng kể cả khi chạy trực tiếp Cell này
+ucf_train_csv = ARTIFACTS / "ucf_train.csv" if (ARTIFACTS / "ucf_train.csv").exists() else REPO_DIR / "list/ucf_CLIP_rgb.csv"
+ucf_test_csv = ARTIFACTS / "ucf_test.csv" if (ARTIFACTS / "ucf_test.csv").exists() else REPO_DIR / "list/ucf_CLIP_rgbtest.csv"
 
 UCF_BATCH_SIZE = 64
 UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps SOTA)
@@ -358,6 +373,16 @@ else:
     # Cell 5: Eval UCF
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 4. EVALUATE UCF-CRIME =========================
+import os, sys, subprocess
+from pathlib import Path
+
+WORK = Path("/kaggle/working")
+REPO_DIR = WORK / "MA-RUPA"
+ARTIFACTS = WORK / "rupa_artifacts"
+
+ucf_test_csv = ARTIFACTS / "ucf_test.csv" if (ARTIFACTS / "ucf_test.csv").exists() else REPO_DIR / "list/ucf_CLIP_rgbtest.csv"
+ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
+
 cmd_eval_ucf = [
     sys.executable, "-u", "src/ucf_test.py",
     "--test-list", str(ucf_test_csv),
@@ -388,11 +413,20 @@ subprocess.run(cmd_eval_ucf, cwd=REPO_DIR, check=True)
     # Cell 7: Train XD
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 5. TRAIN XD-VIOLENCE (GPU T4 x 2) =========================
-import subprocess, sys
+import os, sys, subprocess
+from pathlib import Path
+
+WORK = Path("/kaggle/working")
+REPO_DIR = WORK / "MA-RUPA"
+ARTIFACTS = WORK / "rupa_artifacts"
 
 # Tự động đồng bộ commit mới nhất từ GitHub
 subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
+
+# Đảm bảo biến dataset luôn sẵn sàng kể cả khi chạy trực tiếp Cell này
+xd_train_csv = ARTIFACTS / "xd_train.csv" if (ARTIFACTS / "xd_train.csv").exists() else REPO_DIR / "list/xd_CLIP_rgb.csv"
+xd_test_csv = ARTIFACTS / "xd_test.csv" if (ARTIFACTS / "xd_test.csv").exists() else REPO_DIR / "list/xd_CLIP_rgbtest.csv"
 
 XD_BATCH_SIZE = 96
 XD_EPOCHS = 10  # 10-epoch schedule with mid-epoch peak-catching
@@ -458,6 +492,16 @@ else:
     # Cell 8: Eval XD
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 6. EVALUATE XD-VIOLENCE =========================
+import os, sys, subprocess
+from pathlib import Path
+
+WORK = Path("/kaggle/working")
+REPO_DIR = WORK / "MA-RUPA"
+ARTIFACTS = WORK / "rupa_artifacts"
+
+xd_test_csv = ARTIFACTS / "xd_test.csv" if (ARTIFACTS / "xd_test.csv").exists() else REPO_DIR / "list/xd_CLIP_rgbtest.csv"
+xd_model_path = ARTIFACTS / "model_xd_best.pth"
+
 cmd_eval_xd = [
     sys.executable, "-u", "src/xd_test.py",
     "--test-list", str(xd_test_csv),
