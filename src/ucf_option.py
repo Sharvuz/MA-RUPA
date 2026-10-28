@@ -70,7 +70,7 @@ parser.add_argument('--margin-gamma', type=float, default=0.30, help='Margin gam
 parser.add_argument('--gamma-min', type=float, default=0.15, help='Minimum annealed intra-bag margin (default 0.15)')
 parser.add_argument('--gamma-max', type=float, default=0.35, help='Maximum annealed intra-bag margin (default 0.35)')
 parser.add_argument('--focal-alpha', type=float, default=0.0, help='Focal loss focusing parameter alpha (default 0.0 for steady top-k BCE gradient)')
-parser.add_argument('--lambda-mar', type=float, default=0.20, help='Weight for intra-bag margin loss (default 0.20)')
+parser.add_argument('--lambda-mar', type=float, default=0.0, help='Weight for intra-bag margin loss (default 0.0 for steady non-vanishing gradients)')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 3.0)')
 parser.add_argument('--max-omega', default=0.20, type=float, help='Maximum curriculum omega ceiling (default 0.20 to prevent over-regularization)')
 parser.add_argument('--topk-ratio', type=int, default=16, help='Base divisor for variance-adaptive top-k (VAT-K) selection (default 16 -> ~6.25%% frames for sparse CCTV crimes)')
@@ -93,7 +93,7 @@ parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight fo
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate KL regularization loss (default 0.01)')
 parser.add_argument('--loss2_weight', type=float, default=1.2, help='Weight for snippet multi-class classification loss (default 1.2)')
-parser.add_argument('--lambda-consistency', type=float, default=0.15, help='Weight for confidence-gated consistency loss between detector and RUPA (default 0.15)')
+parser.add_argument('--lambda-consistency', type=float, default=0.10, help='Weight for consistency loss between detector and RUPA (default 0.10, matching DSANet benchmark)')
 parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss (default 0.5)')
 
 # Data & Paths
