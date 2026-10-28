@@ -331,7 +331,17 @@ def train(args):
             )
             loss_mil_det = loss_mil_dats
             loss_mil_routing = loss_mil_dats
-            loss_mil_aux = torch.tensor(0.0, device=device)
+
+            # Train Multimodal Audio-Visual Stream (S_aux) with DATS-MIL on XD-Violence!
+            loss_mil_aux = compute_dats_mil_loss(
+                scores=s_aux,
+                teacher=s_sem_teacher,
+                binary_labels=binary_labels,
+                lengths=lengths_batch,
+                current_epoch=epoch,
+                max_epoch=args.max_epoch,
+                device=device
+            )
 
             # Pillar 2: Compact Decoupled Contrastive Alignment (DCS) + TASL Audio-Visual Semantic Alignment
             loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
@@ -358,9 +368,10 @@ def train(args):
             loss_gate = torch.tensor(0.0, device=device)
 
             # 4-Pillar Unified Loss Engine for XD-Violence:
-            # 1.0 * DATS-MIL + 0.5 * DCS + 0.15 * TASL + w_guide * Guidance + 0.1 * Geometry
+            # 1.0 * DATS-MIL (Det) + 0.20 * DATS-MIL (Audio Aux) + 0.5 * DCS + 0.15 * TASL + w_guide * Guidance + 0.1 * Geometry
             total_loss = (
-                1.00 * loss_mil_dats
+                1.00 * loss_mil_det
+                + 0.20 * loss_mil_aux
                 + 0.50 * loss_dcs
                 + 0.15 * loss_tasl
                 + w_guide * loss_sem_guide
@@ -413,7 +424,7 @@ def train(args):
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
-                      f"CLASM: {loss_clasm.item():.4f} | Guide: {(w_guide * loss_sem_guide).item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"Aux: {loss_mil_aux.item():.4f} | Guide: {(w_guide * loss_sem_guide).item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
 
         # End of Epoch Reporting
         avg_total = loss_accum['total'] / iters_per_epoch

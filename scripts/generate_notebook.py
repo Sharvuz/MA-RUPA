@@ -354,6 +354,12 @@ subprocess.run(cmd_eval_ucf, cwd=REPO_DIR, check=True)
     # Cell 7: Train XD
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 5. TRAIN XD-VIOLENCE (GPU T4 x 2) =========================
+import subprocess, sys
+
+# Tự động đồng bộ commit mới nhất từ GitHub
+subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
+subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
+
 XD_BATCH_SIZE = 64
 XD_EPOCHS = 25
 XD_CROPS_PER_VIDEO = 2  # DPSS: 2 distinct crops/video/epoch -> ~59 iters/epoch -> 1,475 gradient steps!
