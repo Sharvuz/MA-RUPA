@@ -21,7 +21,7 @@ parser.add_argument('--visual-length', default=256, type=int, help='Maximum temp
 parser.add_argument('--visual-width', default=512, type=int, help='Visual feature width')
 parser.add_argument('--visual-head', default=4, type=int, help='Attention heads in backbone & cross-attention')
 parser.add_argument('--visual-layers', default=2, type=int, help='Number of transformer layers in Branch A')
-parser.add_argument('--attn-window', default=64, type=int, help='Window size for local windowed attention (Branch A)')
+parser.add_argument('--attn-window', default=0, type=int, help='Window size for transformer self-attention (0 = Full Global Temporal Attention)')
 parser.add_argument('--classes-num', default=7, type=int, help='Number of classes for XD-Violence (6 anomalies + 1 normal)')
 parser.add_argument('--mlp-dropout', default=0.1, type=float, help='Dropout rate for MLPs')
 

@@ -289,6 +289,7 @@ cmd_train_ucf = [
     "--max-epoch", str(UCF_EPOCHS),
     "--sample-one-crop-per-video", "True",
     "--crops-per-video", str(UCF_CROPS_PER_VIDEO),
+    "--attn-window", "0",          # 0 = Full Global Temporal Attention (256x256 all-pairs relational reasoning)
     "--curriculum-epochs", "3.0",
     "--sampling", "topk",
     "--topk-ratio", "8",          # L / 8 (~12.5% frames) bao quát trọn vẹn diễn biến tội phạm nhiều phút
@@ -375,6 +376,7 @@ cmd_train_xd = [
     "--max-epoch", str(XD_EPOCHS),
     "--sample-one-crop-per-video", "True",
     "--crops-per-video", str(XD_CROPS_PER_VIDEO),
+    "--attn-window", "0",          # 0 = Full Global Temporal Attention
     "--curriculum-epochs", "3.0",
     "--sampling", "topk",
     "--seed", str(SEED),

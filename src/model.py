@@ -279,7 +279,7 @@ class MDTBackbone(nn.Module):
     - Base anomaly detector classifier S_det
     """
     def __init__(self, visual_length: int = 256, embed_dim: int = 512,
-                 attn_window: int = 8, visual_layers: int = 2, visual_heads: int = 4,
+                 attn_window: int = 0, visual_layers: int = 2, visual_heads: int = 4,
                  mlp_dropout: float = 0.1, no_mdtp: bool = False):
         super().__init__()
         self.visual_length = visual_length
@@ -351,10 +351,9 @@ class MDTBackbone(nn.Module):
         return s_det, logits_det
 
     def build_window_attention_mask(self, length: int, window: int, device: torch.device):
-        """Construct block-diagonal window attention mask.
-        
-        True means position is masked out (cannot attend); False means attend.
-        """
+        """Construct window attention mask. Returns None for full 256-snippet global temporal attention."""
+        if window <= 0 or window >= length:
+            return None
         mask = torch.ones(length, length, dtype=torch.bool, device=device)
         for i in range(math.ceil(length / window)):
             start = i * window
@@ -398,11 +397,13 @@ class MDTBackbone(nn.Module):
         if padding_mask is not None:
             x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
-        # Branch 1: Windowed Self-Attention
-        attn_mask = self.build_window_attention_mask(T, self.attn_window, visual_features.device)
+        # Branch 1: Global Temporal Self-Attention
+        # By default (attn_window <= 0 or layer >= 1), captures all-pairs long-range semantic correlations
+        # across the full 256-snippet video, complementing Branch B's local MDTP convolutions.
         f_a = x
-        for layer in self.branch_a_layers:
-            f_a = layer(f_a, attn_mask=attn_mask, key_padding_mask=padding_mask)
+        for l_idx, layer in enumerate(self.branch_a_layers):
+            layer_mask = self.build_window_attention_mask(T, self.attn_window, visual_features.device) if (self.attn_window > 0 and l_idx == 0 and self.attn_window < T) else None
+            f_a = layer(f_a, attn_mask=layer_mask, key_padding_mask=padding_mask)
 
         # Branch 3: Global Linear Context Aggregator
         f_c = self.branch_c(x, padding_mask=padding_mask)
@@ -1501,7 +1502,10 @@ class QuadSafeGate(nn.Module):
             return s_det, torch.zeros(s_det.shape[0], 1, device=s_det.device, dtype=s_det.dtype), s_det
 
         a = self.alpha.clamp(0.10, 0.90)
-        s_consensus = a * s_det + (1.0 - a) * s_sem
+        # Calibrated Consensus: blend harmonic consensus (false-alarm suppressor) with linear consensus
+        s_harmonic = 2.0 * s_det * s_sem / (s_det + s_sem + 1e-6)
+        s_linear = a * s_det + (1.0 - a) * s_sem
+        s_consensus = 0.50 * s_harmonic + 0.50 * s_linear
 
         # OOD Discordance Fallback (hard rule):
         discord = (s_det - s_sem).abs()
@@ -1592,7 +1596,7 @@ class MARUPA(nn.Module):
                  visual_width: int = 512,
                  visual_head: int = 4,
                  visual_layers: int = 2,
-                 attn_window: int = 8,
+                 attn_window: int = 0,
                  prompt_prefix: int = 10,
                  prompt_postfix: int = 10,
                  args = None,

@@ -283,7 +283,11 @@ def train(args):
             # Semantic-Guided Teacher for Guidance & DATS-MIL Active Mask
             p0_teacher = F.softmax(logits2.detach(), dim=-1)[:, :, 0:1]
             s_sem_teacher = (1.0 - p0_teacher).clamp(0.0, 1.0)
-            loss_sem_guide = F.mse_loss(s_det, s_sem_teacher)
+            # Confidence-Weighted Semantic Guidance: only guide detector when teacher is confident
+            teacher_conf = ((s_sem_teacher - 0.5).abs() * 2.0).clamp(0.0, 1.0)
+            loss_sem_guide = (teacher_conf * ((s_det - s_sem_teacher) ** 2)).mean()
+            # Dynamic Guidance Annealing: 0.25 in early epochs down to 0.03 in late epochs to unchain detector
+            w_guide = max(0.03, 0.25 * (1.0 - float(epoch_idx - 1) / max(1.0, args.max_epoch * 0.55)))
 
             # Pillar 1: DATS-MIL (Density-Adaptive Temporal Support MIL)
             loss_mil_dats = compute_dats_mil_loss(
@@ -317,11 +321,11 @@ def train(args):
             loss_gate = torch.tensor(0.0, device=device)
 
             # 4-Pillar Unified Loss Engine:
-            # 1.0 * DATS-MIL + 0.5 * DCS + 0.25 * Guidance + 0.1 * Geometry
+            # 1.0 * DATS-MIL + 0.5 * DCS + w_guide * Guidance + 0.1 * Geometry
             total_loss = (
                 1.00 * loss_mil_dats
                 + 0.50 * loss_dcs
-                + 0.25 * loss_sem_guide
+                + w_guide * loss_sem_guide
                 + 0.10 * loss_geo
             )
 
@@ -363,7 +367,7 @@ def train(args):
             loss_accum['orth'] += loss_orth.item()
             loss_accum['residual'] += loss_event.item()
             loss_accum['gate'] += loss_gate.item()
-            loss_accum['guide'] += loss_sem_guide.item()
+            loss_accum['guide'] += (w_guide * loss_sem_guide).item()
             loss_accum['total'] += total_loss.item()
 
             log_interval = max(1, iters_per_epoch // 5)
@@ -371,7 +375,7 @@ def train(args):
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
-                      f"CLASM: {loss_clasm.item():.4f} | Guide: {loss_sem_guide.item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"CLASM: {loss_clasm.item():.4f} | Guide: {(w_guide * loss_sem_guide).item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
 
         # End of Epoch Reporting
         avg_total = loss_accum['total'] / iters_per_epoch
