@@ -1276,9 +1276,9 @@ class AdaptiveStiefelPrototypeManifold(nn.Module):
             f_norm_cand = f_video[batch_idx, norm_idx]  # [B, k_norm, D]
             p_n = torch.matmul(f_norm_cand, u_norm.t())
             rec_n = torch.matmul(p_n, u_norm)
-            l_compact = F.mse_loss(rec_n, f_norm_cand)
+            l_compact = F.mse_loss(rec_n, f_norm_cand, reduction='none').mean(dim=[1, 2]).unsqueeze(-1)  # [B, 1]
         else:
-            l_compact = torch.tensor(0.0, device=f_video.device)
+            l_compact = torch.zeros(B, 1, device=f_video.device, dtype=f_video.dtype)
 
         return f_rec, r_anom, s_rec, l_compact
 
@@ -2254,7 +2254,7 @@ class MARUPA(nn.Module):
             s_det, logits_det = self.backbone.classify_anomaly(f_det_in)
             p_routing = 0.65 * s_det + 0.35 * s_aux
             audio_sem_logits = None
-            av_suppress_loss = torch.tensor(0.0, device=target_device)
+            av_suppress_loss = torch.zeros(B, 1, device=target_device, dtype=visual.dtype)
         else:
             f_fused = f_base
             s_det, logits_det = s_det_base, logits_det_base
@@ -2263,7 +2263,7 @@ class MARUPA(nn.Module):
             g_av = torch.zeros(B, T, 1, device=target_device)
             p_routing = s_det
             audio_sem_logits = None
-            av_suppress_loss = torch.tensor(0.0, device=target_device)
+            av_suppress_loss = torch.zeros(B, 1, device=target_device, dtype=visual.dtype)
 
         f_main = f_fused
 
@@ -2312,7 +2312,7 @@ class MARUPA(nn.Module):
             f_rec = f_main
             r_anom = torch.zeros_like(f_main)
             s_rec = torch.zeros_like(s_det)
-            l_compact = torch.tensor(0.0, device=target_device)
+            l_compact = torch.zeros(B, 1, device=target_device, dtype=visual.dtype)
 
         logits1 = logits_det
         dnp_dict = {

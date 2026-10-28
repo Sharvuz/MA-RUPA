@@ -364,7 +364,7 @@ def train(args):
 
             # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency & Compactness
             loss_consistency = F.mse_loss(s_det, dnp_dict['reconstruction_scores'])
-            loss_compact = dnp_dict.get('l_compact', torch.tensor(0.0, device=device))
+            loss_compact = dnp_dict.get('l_compact', torch.tensor(0.0, device=device)).mean()
 
             # Pillar 5: Edge-Preserving Temporal Sharpening (EPTS - Zero Peak Clipping)
             if w_smooth > 0.0:
@@ -392,7 +392,7 @@ def train(args):
                 + 0.20 * loss_sep
                 + w_smooth * loss_smooth
                 + w_guide * loss_sem_guide
-            )
+            ).mean()
 
             optimizer.zero_grad()
             total_loss.backward()
