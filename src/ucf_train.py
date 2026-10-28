@@ -224,7 +224,9 @@ def train(args):
     print("\n" + "=" * 70)
     print(f"[START] STARTING END-TO-END TRAINING FOR UCF-CRIME: {args.max_epoch} EPOCHS")
     print(f"  Batch size: {args.batch_size} ({batch_half} Normal + {batch_half} Abnormal per batch, Interleaved)")
-    print(f"  Iters per epoch: {iters_per_epoch} | Crops per video: {crops_per_video} | Samples/epoch: {iters_per_epoch * args.batch_size}")
+    crop_mode_str = "Full 10 Crops/video (100% Data, Zero Sampling)" if not sample_one_crop else f"{crops_per_video} random crops/video (DPSS)"
+    print(f"  Iters per epoch: {iters_per_epoch} | Dataset: {crop_mode_str} | Samples/epoch: {iters_per_epoch * args.batch_size}")
+    print(f"  Total Gradient Steps: {total_iters} steps (Học sâu 100% chuẩn DSANet SOTA)")
     print("=" * 70, flush=True)
 
     for epoch in range(start_epoch, args.max_epoch):
