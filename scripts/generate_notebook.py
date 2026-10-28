@@ -268,8 +268,8 @@ subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
 UCF_BATCH_SIZE = 64
-UCF_EPOCHS = 10  # 10-epoch schedule with mid-epoch peak-catching (eval every 20 iters = 1280 samples matches DSANet)
-UCF_LR = 4e-5
+UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps matches DSANet SOTA)
+UCF_LR = 5e-5
 SEED = 234
 
 ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
@@ -295,11 +295,10 @@ cmd_train_ucf = [
     "--focal-alpha", "0.0",                  # Pure top-k BCE matches DSANet (prevents loss collapse)
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.08",
-    "--sample-one-crop-per-video", "True",   # Dynamic crop diversity sampling prevents memorization
-    "--crops-per-video", "4",                 # 4 random crops per video each epoch (~100 iters/epoch)
+    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (16,000 samples/epoch, 250 iters/epoch like DSANet)
     "--eval-interval", "20",                  # Mid-epoch test & peak-catching every 20 iters (1280 samples) matches DSANet
-    "--snippet-dropout", "0.20",
-    "--weight-decay", "1e-3",
+    "--snippet-dropout", "0.15",
+    "--weight-decay", "1e-4",
     "--attn-window", "8",                    # BR-STB: Window size W=8 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(ucf_model_path),
@@ -396,11 +395,10 @@ cmd_train_xd = [
     "--focal-alpha", "0.0",                  # Pure top-k BCE matches DSANet (prevents loss collapse)
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.05",
-    "--sample-one-crop-per-video", "True",   # Dynamic crop diversity sampling prevents memorization
-    "--crops-per-video", "4",                 # 4 random crops per video each epoch (~120 iters/epoch)
+    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (~593 iters/epoch like DSANet)
     "--eval-interval", "30",                  # Mid-epoch test & peak-catching every 30 iters
-    "--snippet-dropout", "0.20",
-    "--weight-decay", "1e-3",
+    "--snippet-dropout", "0.15",
+    "--weight-decay", "1e-4",
     "--attn-window", "64",                   # BR-STB: Window size W=64 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(xd_model_path),
