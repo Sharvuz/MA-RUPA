@@ -189,20 +189,20 @@ def train(args):
     # Single-stage End-to-End AdamW optimizer with Differential Parameter Groups
     base_model = model.module if hasattr(model, 'module') else model
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    backbone_params, rupa_adapter_params, aux_gate_params = [], [], []
+    backbone_params, adapter_params, aux_gate_params = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if 'modality_branch' in name or 'safegate' in name:
+        if 'modality_branch' in name or 'safegate' in name or 'av_fusion' in name:
             aux_gate_params.append(p)
-        elif 'rupa' in name or 'clip_adapter' in name:
-            rupa_adapter_params.append(p)
+        elif 'clip_adapter' in name:
+            adapter_params.append(p)
         else:
             backbone_params.append(p)
 
     optimizer = torch.optim.AdamW([
         {'params': backbone_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
-        {'params': rupa_adapter_params, 'lr': args.lr * 0.75, 'weight_decay': args.weight_decay},
+        {'params': adapter_params, 'lr': args.lr * 0.75, 'weight_decay': args.weight_decay},
         {'params': aux_gate_params, 'lr': args.lr * 0.45, 'weight_decay': args.weight_decay * 2.0},
     ], betas=(0.9, 0.999))
 
@@ -464,6 +464,39 @@ def train(args):
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
                       f"Aux: {loss_mil_aux.item():.4f} | Guide: {(w_guide * loss_sem_guide).item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
+
+            # Mid-Epoch Evaluation & Peak-Catching (DSANet Benchmark Standard: every 50 iters)
+            eval_interval_raw = getattr(args, 'eval_interval', 50)
+            eval_interval_iters = eval_interval_raw if eval_interval_raw < 100 else max(1, eval_interval_raw // args.batch_size)
+            if eval_interval_iters > 0 and (step_idx + 1) % eval_interval_iters == 0 and (step_idx + 1) < iters_per_epoch:
+                eval_model = model.module if hasattr(model, 'module') else model
+                eval_model.eval()
+                eval_model._text_features_cache = None
+                mid_auc, mid_ap, _ = test(
+                    eval_model, test_loader, args.visual_length, prompt_text, gt, gtsegments,
+                    gtlabels, args.DNP_use, args, device, compute_dmap=False
+                )
+                step_total = epoch * iters_per_epoch + (step_idx + 1)
+                print(f"  --> [Step {step_total} / Iter {step_idx + 1}] Mid-Epoch AP: {mid_ap * 100:.2f}% | AUC: {mid_auc * 100:.2f}% (Peak AP: {best_ap * 100:.2f}%)", flush=True)
+                if mid_ap > best_ap or (abs(mid_ap - best_ap) < 1e-4 and mid_auc > best_auc):
+                    best_ap = mid_ap
+                    best_auc = mid_auc
+                    print(f"  🏆 [NEW SOTA PEAK] Step {step_total}: Best Frame-level AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}% saved to {args.model_path}", flush=True)
+                    safe_save_checkpoint(
+                        {
+                            'epoch': epoch,
+                            'step': step_total,
+                            'model_state_dict': {k: v.cpu() for k, v in eval_model.state_dict().items()},
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scheduler_state_dict': scheduler.state_dict(),
+                            'best_ap': best_ap,
+                            'best_auc': best_auc,
+                            'args': vars(args)
+                        },
+                        args.model_path
+                    )
+                eval_model._text_features_cache = None
+                model.train()
 
         # End of Epoch Reporting
         avg_total = loss_accum['total'] / iters_per_epoch

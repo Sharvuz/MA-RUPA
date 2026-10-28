@@ -799,7 +799,7 @@ class MarginAwareFocalMILLoss(nn.Module):
     """
     def __init__(self, k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
                  gamma_min: float = 0.15, gamma_max: float = 0.35,
-                 alpha: float = 2.0, lambda_mar: float = 0.50):
+                 alpha: float = 0.0, lambda_mar: float = 0.50):
         super().__init__()
         self.k_min = k_min
         self.k_max = k_max
@@ -865,9 +865,12 @@ class MarginAwareFocalMILLoss(nn.Module):
                 s_top = s_sorted[:k]
                 s_bkg = s_sorted[max(0, L - self.k_min):]
                 
-                # 1. Focal loss on top anomaly snippets (upweights hard snippets where s < 0.5)
-                focal_w = torch.pow(1.0 - s_top, self.alpha)
-                loss_pos_focal = loss_pos_focal - torch.mean(focal_w * torch.log(s_top + 1e-8))
+                # 1. Focal / BCE loss on top anomaly snippets (if alpha=0, pure BCE matches DSANet)
+                if self.alpha > 0.0:
+                    focal_w = torch.pow(1.0 - s_top, self.alpha)
+                    loss_pos_focal = loss_pos_focal - torch.mean(focal_w * torch.log(s_top + 1e-8))
+                else:
+                    loss_pos_focal = loss_pos_focal - torch.mean(torch.log(s_top + 1e-8))
                 
                 # 2. Annealed intra-bag margin ranking: enforce s_top >= s_bkg.mean() + current_gamma
                 margin_gap = F.relu(current_gamma - (s_top - s_bkg.mean()))
@@ -878,8 +881,11 @@ class MarginAwareFocalMILLoss(nn.Module):
                 s_sorted, _ = torch.sort(s, descending=True)
                 s_hard_neg = s_sorted[:min(self.k_min, L)]
                 
-                focal_w = torch.pow(s_hard_neg, self.alpha)
-                loss_neg_focal = loss_neg_focal - torch.mean(focal_w * torch.log(1.0 - s_hard_neg + 1e-8))
+                if self.alpha > 0.0:
+                    focal_w = torch.pow(s_hard_neg, self.alpha)
+                    loss_neg_focal = loss_neg_focal - torch.mean(focal_w * torch.log(1.0 - s_hard_neg + 1e-8))
+                else:
+                    loss_neg_focal = loss_neg_focal - torch.mean(torch.log(1.0 - s_hard_neg + 1e-8))
                 n_neg += 1
                 
         loss_pos = (loss_pos_focal + self.lambda_mar * loss_pos_margin) / max(1, n_pos)
@@ -891,7 +897,7 @@ def compute_maf_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
                          lengths: torch.Tensor = None, epoch: float = 1.0,
                          k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
                          gamma_min: float = 0.15, gamma_max: float = 0.35,
-                         alpha: float = 2.0, lambda_mar: float = 0.50) -> torch.Tensor:
+                         alpha: float = 0.0, lambda_mar: float = 0.50) -> torch.Tensor:
     """Convenience wrapper for Margin-Aware Focal MIL Loss with ATS and Annealed Margin."""
     criterion = MarginAwareFocalMILLoss(k_min=k_min, k_max=k_max, gamma=gamma,
                                         gamma_min=gamma_min, gamma_max=gamma_max,

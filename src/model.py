@@ -1976,21 +1976,8 @@ class MARUPA(nn.Module):
             use_pcgrad=self.use_pcgrad
         )
 
-        # 3. Core Module 3: GradientSafeRUPA (Disabled by default under pure BR-STB)
-        self.rupa = GradientSafeRUPA(
-            feature_dim=visual_width,
-            num_prototypes=getattr(args, 'num_prototypes', 16),
-            num_heads=visual_head,
-            extractor_depth=1,
-            decoder_depth=getattr(args, 'decoder_depth', 4),
-            sampling=self.sampling,
-            normal_selection_ratio=getattr(args, 'normal_selection_ratio', 0.60),
-            min_normal_frames=getattr(args, 'min_normal_frames', 4),
-            max_normal_ratio=getattr(args, 'max_normal_ratio', 0.70),
-            use_aspm=self.use_aspm,
-            aspm_max_rank=self.aspm_max_rank
-        )
-        self.sem_bb_weight_logit = nn.Parameter(torch.tensor(0.0))
+        # 3. Core Module 3: GradientSafeRUPA (Permanently pruned for pure zero-start SOTA)
+        self.rupa = None
 
         # 4. Core Module 4: QuadSafeGate
         prior_weights = None
@@ -2138,16 +2125,12 @@ class MARUPA(nn.Module):
         return text_features
 
     def set_epoch(self, epoch_idx: int):
-        """Updates epoch buffer for SM-ASPM adaptive Stiefel rank scheduling (1-indexed)."""
-        if hasattr(self, 'rupa') and hasattr(self.rupa, 'current_epoch_buf'):
-            self.rupa.current_epoch_buf.fill_(float(max(1, epoch_idx)))
+        self.current_epoch = epoch_idx
 
     @torch.no_grad()
     def update_global_normal_bank(self, u_norm_batch: torch.Tensor,
                                   binary_labels: torch.Tensor, momentum: float = 0.98):
-        """Updates Global Normal Memory Bank on primary GPU strictly from pure Normal bags."""
-        if hasattr(self, 'rupa') and not self.no_rupa:
-            self.rupa.update_global_normal_bank(u_norm_batch, binary_labels, momentum=momentum)
+        pass
 
     def forward(self, visual: torch.Tensor, padding_mask: torch.Tensor = None,
                 text: list = None, lengths: torch.Tensor = None,

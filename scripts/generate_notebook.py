@@ -268,8 +268,8 @@ subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
 UCF_BATCH_SIZE = 64
-UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps matches DSANet SOTA)
-UCF_LR = 7e-5
+UCF_EPOCHS = 10  # 10-epoch schedule with mid-epoch peak-catching (eval every 20 iters = 1280 samples matches DSANet)
+UCF_LR = 4e-5
 SEED = 234
 
 ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
@@ -292,10 +292,14 @@ cmd_train_ucf = [
     "--margin-gamma", "0.30",
     "--gamma-min", "0.15",
     "--gamma-max", "0.35",
-    "--focal-alpha", "2.0",
+    "--focal-alpha", "0.0",                  # Pure top-k BCE matches DSANet (prevents loss collapse)
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.08",
-    "--sample-one-crop-per-video", "False",  # Full 10-crop dataset per epoch
+    "--sample-one-crop-per-video", "True",   # Dynamic crop diversity sampling prevents memorization
+    "--crops-per-video", "4",                 # 4 random crops per video each epoch (~100 iters/epoch)
+    "--eval-interval", "20",                  # Mid-epoch test & peak-catching every 20 iters (1280 samples) matches DSANet
+    "--snippet-dropout", "0.20",
+    "--weight-decay", "1e-3",
     "--attn-window", "8",                    # BR-STB: Window size W=8 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(ucf_model_path),
@@ -363,8 +367,8 @@ subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
 XD_BATCH_SIZE = 64
-XD_EPOCHS = 10  # Full 10-epoch schedule (~593 iters/epoch -> 5,930 gradient steps matches DSANet SOTA)
-XD_LR = 1.5e-4
+XD_EPOCHS = 10  # 10-epoch schedule with mid-epoch peak-catching
+XD_LR = 8e-5
 SEED = 234
 
 xd_model_path = ARTIFACTS / "model_xd_best.pth"
@@ -389,10 +393,14 @@ cmd_train_xd = [
     "--gamma-min", "0.15",
     "--gamma-max", "0.30",
     "--lambda-ahns", "0.10",
-    "--focal-alpha", "2.0",
+    "--focal-alpha", "0.0",                  # Pure top-k BCE matches DSANet (prevents loss collapse)
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.05",
-    "--sample-one-crop-per-video", "False",  # Full 10-crop dataset per epoch
+    "--sample-one-crop-per-video", "True",   # Dynamic crop diversity sampling prevents memorization
+    "--crops-per-video", "4",                 # 4 random crops per video each epoch (~120 iters/epoch)
+    "--eval-interval", "30",                  # Mid-epoch test & peak-catching every 30 iters
+    "--snippet-dropout", "0.20",
+    "--weight-decay", "1e-3",
     "--attn-window", "64",                   # BR-STB: Window size W=64 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(xd_model_path),
