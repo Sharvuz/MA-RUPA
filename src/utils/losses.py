@@ -784,3 +784,116 @@ def compute_ogdp_geometry_loss(dnp_dict: dict, device: torch.device = None) -> t
 
     return loss_geo
 
+
+# ============================================================================
+# 7. Margin-Aware Focal MIL (MAF-MIL) with Adaptive Temporal Support (ATS)
+# ============================================================================
+
+class MarginAwareFocalMILLoss(nn.Module):
+    """Margin-Aware Focal Multiple Instance Learning with Adaptive Temporal Support (ATS).
+    
+    Solves:
+    1. Gradient starvation at loss=0.07 via focal weighting (alpha >= 2.0).
+    2. Top-k spike collapse via Adaptive Temporal Support expanding k(e, b) = 16 -> 64.
+    3. Subtle anomaly separation via intra-bag margin ranking (gamma >= 0.25).
+    """
+    def __init__(self, k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
+                 alpha: float = 2.0, lambda_mar: float = 0.50):
+        super().__init__()
+        self.k_min = k_min
+        self.k_max = k_max
+        self.gamma = gamma
+        self.alpha = alpha
+        self.lambda_mar = lambda_mar
+
+    def compute_ats_k(self, scores: torch.Tensor, lengths: torch.Tensor, epoch: float) -> list:
+        B = scores.shape[0]
+        k_list = []
+        # Epoch ramp-up sigmoid: e_0 = 2.0, beta_e = 1.0
+        sig_e = 1.0 / (1.0 + math.exp(-1.0 * (float(epoch) - 2.0)))
+        
+        for b in range(B):
+            L = int(lengths[b].item()) if lengths is not None else scores.shape[1]
+            vid_s = scores[b, :L].squeeze(-1)
+            k_base = min(self.k_min, max(1, L // 16))
+            
+            top_k_base = torch.topk(vid_s, k=k_base)[0]
+            conf = top_k_base.mean().item()
+            # Confidence lock sigmoid: s_0 = 0.70, beta_t = 8.0
+            sig_t = 1.0 / (1.0 + math.exp(-8.0 * (conf - 0.70)))
+            
+            eff_k = int(self.k_min + (self.k_max - self.k_min) * sig_e * sig_t)
+            k_clamped = min(max(self.k_min, eff_k), max(1, L // 2))
+            k_list.append(k_clamped)
+        return k_list
+
+    def forward(self, scores: torch.Tensor, binary_labels: torch.Tensor,
+                lengths: torch.Tensor = None, epoch: float = 1.0):
+        device = scores.device
+        B = scores.shape[0]
+        
+        k_list = self.compute_ats_k(scores, lengths, epoch)
+        
+        loss_pos_focal = torch.tensor(0.0, device=device)
+        loss_pos_margin = torch.tensor(0.0, device=device)
+        loss_neg_focal = torch.tensor(0.0, device=device)
+        
+        n_pos = 0
+        n_neg = 0
+        
+        for b in range(B):
+            L = int(lengths[b].item()) if lengths is not None else scores.shape[1]
+            s = scores[b, :L].squeeze(-1).clamp(1e-6, 1.0 - 1e-6)
+            k = k_list[b]
+            
+            if binary_labels[b] == 1.0:
+                # Abnormal bag: Sort descending
+                s_sorted, _ = torch.sort(s, descending=True)
+                s_top = s_sorted[:k]
+                s_bkg = s_sorted[max(0, L - self.k_min):]
+                
+                # 1. Focal loss on top anomaly snippets (upweights hard snippets where s < 0.5)
+                focal_w = torch.pow(1.0 - s_top, self.alpha)
+                loss_pos_focal = loss_pos_focal - torch.mean(focal_w * torch.log(s_top + 1e-8))
+                
+                # 2. Intra-bag margin ranking: enforce s_top >= s_bkg.mean() + gamma
+                margin_gap = F.relu(self.gamma - (s_top - s_bkg.mean()))
+                loss_pos_margin = loss_pos_margin + torch.mean(margin_gap)
+                n_pos += 1
+            else:
+                # Normal bag: Sort descending, mine hardest false alarms
+                s_sorted, _ = torch.sort(s, descending=True)
+                s_hard_neg = s_sorted[:min(self.k_min, L)]
+                
+                focal_w = torch.pow(s_hard_neg, self.alpha)
+                loss_neg_focal = loss_neg_focal - torch.mean(focal_w * torch.log(1.0 - s_hard_neg + 1e-8))
+                n_neg += 1
+                
+        loss_pos = (loss_pos_focal + self.lambda_mar * loss_pos_margin) / max(1, n_pos)
+        loss_neg = loss_neg_focal / max(1, n_neg)
+        return loss_pos + loss_neg
+
+
+def compute_maf_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
+                         lengths: torch.Tensor = None, epoch: float = 1.0,
+                         k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
+                         alpha: float = 2.0, lambda_mar: float = 0.50) -> torch.Tensor:
+    """Convenience wrapper for Margin-Aware Focal MIL Loss with ATS."""
+    criterion = MarginAwareFocalMILLoss(k_min=k_min, k_max=k_max, gamma=gamma,
+                                        alpha=alpha, lambda_mar=lambda_mar)
+    return criterion(scores, binary_labels, lengths=lengths, epoch=epoch)
+
+
+def compute_temporal_tv_loss(scores: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
+    """L1 Total Variation smoothness loss preserving sharp anomaly transitions."""
+    if scores.dim() == 3:
+        scores = scores.squeeze(-1)
+    B, T = scores.shape
+    diff = torch.abs(scores[:, 1:] - scores[:, :-1])
+    if lengths is not None:
+        mask = torch.arange(T - 1, device=scores.device)[None, :] < (lengths[:, None] - 1)
+        diff = diff * mask.float()
+        return diff.sum() / mask.float().sum().clamp_min(1.0)
+    return diff.mean()
+
+

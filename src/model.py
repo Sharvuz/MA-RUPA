@@ -446,6 +446,263 @@ class MDTBackbone(nn.Module):
 
 
 # ============================================================================
+# 1B. Core Module: Bi-Relational Spatio-Temporal Backbone (BR-STB)
+# ============================================================================
+
+class BiRelationalBlock(nn.Module):
+    """Bi-Relational Spatio-Temporal Graph-Attention Block.
+    
+    Unifies:
+    1. Local continuous temporal distance-decay diffusion prior (A_dist with learnable tau)
+    2. Dynamic non-local event similarity graph (A_sim with adaptive statistical threshold)
+    3. Local windowed multi-head self-attention
+    """
+    def __init__(self, embed_dim: int = 512, num_heads: int = 4, window_size: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+
+        # Local Temporal Diffusion Parameters: tau = softplus(tau_param) + 0.10
+        self.tau_param = nn.Parameter(torch.tensor(0.70))  # softplus(0.70) ~ 1.10
+        self.w_dist = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # Dynamic Non-Local Event Similarity Graph: threshold theta = mu + kappa * sigma
+        self.kappa = nn.Parameter(torch.tensor(0.75))
+        self.tau_sim = 0.10
+        self.w_sim = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # Bi-Relational Convex Fusion Gate: g in (0, 1)
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(embed_dim * 3, embed_dim // 2),
+            QuickGELU(),
+            nn.Linear(embed_dim // 2, 1)
+        )
+
+        # Local Window Multi-Head Self-Attention
+        self.norm_attn = LayerNormFP32(embed_dim)
+        self.mha = nn.MultiheadAttention(
+            embed_dim, num_heads, dropout=dropout, batch_first=True
+        )
+
+        # Output Fusion & Feed-Forward Network
+        self.gamma_graph = nn.Parameter(torch.tensor(0.5))
+        self.gamma_attn = nn.Parameter(torch.tensor(0.5))
+        self.norm_out = LayerNormFP32(embed_dim)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            QuickGELU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm_ffn = LayerNormFP32(embed_dim)
+
+    def _compute_a_dist(self, T: int, device: torch.device) -> torch.Tensor:
+        tau = F.softplus(self.tau_param) + 0.10
+        idx = torch.arange(T, device=device, dtype=torch.float32)
+        dist_mat = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))  # [T, T]
+        a_dist = torch.exp(-dist_mat / tau)
+        a_dist = a_dist / a_dist.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return a_dist  # [T, T]
+
+    def _compute_a_sim(self, x_norm: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
+        # x_norm: [B, T, D]
+        B, T, _ = x_norm.shape
+        sim = torch.bmm(x_norm, x_norm.transpose(1, 2))  # [B, T, T]
+
+        # Adaptive threshold per video: theta = mu + kappa * sigma
+        mu = sim.mean(dim=(-1, -2), keepdim=True)
+        sigma = sim.std(dim=(-1, -2), keepdim=True).clamp_min(1e-6)
+        theta = mu + self.kappa * sigma
+
+        mask = (sim >= theta).float()
+        if valid_mask is not None:
+            # valid_mask: [B, T, 1]
+            pair_mask = torch.bmm(valid_mask.float(), valid_mask.float().transpose(1, 2))
+            mask = mask * pair_mask
+
+        # Ensure diagonal self-loop
+        eye = torch.eye(T, device=x_norm.device).unsqueeze(0)
+        mask = torch.maximum(mask, eye)
+
+        sim_masked = sim / self.tau_sim
+        sim_masked = sim_masked.masked_fill(mask == 0, -1e9)
+        a_sim = F.softmax(sim_masked, dim=-1)
+        return a_sim  # [B, T, T]
+
+    def _build_window_mask(self, T: int, device: torch.device) -> torch.Tensor:
+        idx = torch.arange(T, device=device)
+        dist = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))
+        mask = (dist > (self.window_size // 2)).float()
+        return mask.masked_fill(mask == 1, float('-inf'))
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
+        B, T, D = x.shape
+        device = x.device
+
+        valid_mask = None
+        if lengths is not None:
+            valid_mask = (torch.arange(T, device=device)[None, :] < lengths.to(device)[:, None]).unsqueeze(-1)
+
+        # 1. Local Diffusion
+        a_dist = self._compute_a_dist(T, device)  # [T, T]
+        z_dist = torch.matmul(a_dist, x)          # [B, T, D]
+        z_dist = self.w_dist(z_dist)
+
+        # 2. Dynamic Non-Local Similarity Graph
+        x_norm = F.normalize(x, p=2, dim=-1)
+        a_sim = self._compute_a_sim(x_norm, valid_mask)  # [B, T, T]
+        z_sim = torch.bmm(a_sim, x)                      # [B, T, D]
+        z_sim = self.w_sim(z_sim)
+
+        # 3. Gated Graph Fusion
+        gate_in = torch.cat([x, z_dist, z_sim], dim=-1)
+        g = torch.sigmoid(self.fusion_gate(gate_in))     # [B, T, 1]
+        z_graph = g * z_dist + (1.0 - g) * z_sim
+
+        # 4. Multi-Head Windowed Attention
+        attn_in = self.norm_attn(x)
+        win_mask = self._build_window_mask(T, device)
+        z_attn, _ = self.mha(attn_in, attn_in, attn_in, attn_mask=win_mask)
+        z_attn = torch.nan_to_num(z_attn, nan=0.0)
+
+        # 5. Residual Aggregation & FFN
+        f_mid = self.norm_out(x + self.gamma_graph * z_graph + self.gamma_attn * z_attn)
+        f_out = self.norm_ffn(f_mid + self.ffn(f_mid))
+
+        if valid_mask is not None:
+            f_out = f_out * valid_mask.float()
+        return f_out
+
+
+class BRSTBackbone(nn.Module):
+    """Bi-Relational Spatio-Temporal Backbone (BR-STB).
+    
+    Replaces legacy MDTBackbone with unified temporal diffusion, non-local event affinity
+    graphs, and local window self-attention.
+    """
+    def __init__(self, visual_length: int = 256, embed_dim: int = 512,
+                 attn_window: int = 8, visual_layers: int = 2, visual_heads: int = 4,
+                 mlp_dropout: float = 0.1):
+        super().__init__()
+        self.visual_length = visual_length
+        self.embed_dim = embed_dim
+        self.pos_embed = nn.Parameter(torch.randn(1, visual_length, embed_dim) * 0.02)
+        self.layers = nn.ModuleList([
+            BiRelationalBlock(
+                embed_dim=embed_dim,
+                num_heads=visual_heads,
+                window_size=attn_window,
+                dropout=mlp_dropout
+            )
+            for _ in range(visual_layers)
+        ])
+        self.mlp_det = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            QuickGELU(),
+            nn.Dropout(mlp_dropout),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        self.classifier_det = nn.Linear(embed_dim, 1)
+
+    def classify_anomaly(self, feat: torch.Tensor):
+        det_features = feat + self.mlp_det(feat)
+        logits_det = self.classifier_det(det_features)  # [B, T, 1]
+        s_det = torch.sigmoid(logits_det)
+        return s_det, logits_det
+
+    def forward(self, visual_features: torch.Tensor, padding_mask: torch.Tensor = None, lengths: torch.Tensor = None):
+        B, T, D = visual_features.shape
+        x = visual_features + self.pos_embed[:, :T, :]
+        for layer in self.layers:
+            x = layer(x, lengths)
+
+        f_base = x
+        s_det, logits_det = self.classify_anomaly(f_base)
+        return f_base, s_det, logits_det
+
+
+class NoiseGatedAVFusion(nn.Module):
+    """Noise-Gated Acoustic-Visual Fusion with Reliability Gating.
+    
+    Suppresses acoustic noise on multimodal streams (XD-Violence) while protecting
+    the visual anchor. Initialized to suppress 90% of early audio noise.
+    """
+    def __init__(self, visual_dim: int = 512, audio_dim: int = 128, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.visual_dim = visual_dim
+        self.audio_dim = audio_dim
+
+        # Audio Dimension Projection (128 -> 512)
+        self.audio_proj = nn.Sequential(
+            nn.Linear(audio_dim, visual_dim),
+            QuickGELU(),
+            nn.Dropout(dropout),
+            nn.Linear(visual_dim, visual_dim),
+            LayerNormFP32(visual_dim)
+        )
+
+        # Cross-Attention (Visual Query, Audio Key/Value)
+        self.cross_attn = nn.MultiheadAttention(
+            visual_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm_cross = LayerNormFP32(visual_dim)
+
+        # Audio Auxiliary Classification Head
+        self.aux_classifier = nn.Sequential(
+            nn.Linear(visual_dim, visual_dim // 2),
+            QuickGELU(),
+            nn.Dropout(dropout),
+            nn.Linear(visual_dim // 2, 1)
+        )
+
+        # Dynamic Acoustic Reliability Gate: Initialized to sigmoid(-2.2) ~ 0.10
+        # Inputs: [f_base, h_a, |f_base - h_a|, 1 - discordance] -> dim = 512*3 + 1
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(visual_dim * 3 + 1, visual_dim // 4),
+            QuickGELU(),
+            nn.Linear(visual_dim // 4, 1)
+        )
+        nn.init.constant_(self.gate_mlp[-1].bias, -2.2)
+        nn.init.normal_(self.gate_mlp[-1].weight, std=0.01)
+
+    def forward(self, f_base: torch.Tensor, audio_raw: torch.Tensor, s_det: torch.Tensor, lengths: torch.Tensor = None):
+        B, T, D = f_base.shape
+
+        # Handle temporal length alignment between visual and audio if needed
+        if audio_raw.shape[1] != T:
+            a_perm = audio_raw.permute(0, 2, 1)  # [B, D_a, T_a]
+            a_interp = F.interpolate(a_perm, size=T, mode='linear', align_corners=False)
+            audio_aligned = a_interp.permute(0, 2, 1)  # [B, T, D_a]
+        else:
+            audio_aligned = audio_raw
+
+        h_a = self.audio_proj(audio_aligned)  # [B, T, 512]
+
+        # Auxiliary score from audio stream
+        logits_aux = self.aux_classifier(h_a)
+        s_aux = torch.sigmoid(logits_aux)
+
+        # Cross-Attention (Visual attends to Audio)
+        attn_out, _ = self.cross_attn(query=f_base, key=h_a, value=h_a)
+        attn_out = torch.nan_to_num(attn_out, nan=0.0)
+
+        # Discordance between visual and audio: d_va = |S_det - S_aux|
+        discord = torch.abs(s_det.detach() - s_aux.detach())  # [B, T, 1]
+        consistency = 1.0 - discord
+
+        # Reliability Gate
+        gate_in = torch.cat([f_base, h_a, torch.abs(f_base - h_a), consistency], dim=-1)
+        g_audio = torch.sigmoid(self.gate_mlp(gate_in))  # [B, T, 1]
+
+        # Protected Residual Fusion
+        f_fused = f_base + g_audio * self.norm_cross(attn_out)
+        return f_fused, s_aux, logits_aux, g_audio
+
+
+# ============================================================================
 # 2. Core Module 2: ModalityAdaptiveBranch
 # ============================================================================
 
@@ -1640,19 +1897,37 @@ class MARUPA(nn.Module):
         self.use_pcgrad = getattr(args, 'use_pcgrad', True)
         dataset_type = 'xd' if num_class == 7 else 'ucf'
 
-        # 1. Core Module 1: MDTBackbone
-        self.backbone = MDTBackbone(
+        # 1. Core Module 1: BR-STB Backbone (Bi-Relational Spatio-Temporal Graph Transformer)
+        self.brst_backbone = BRSTBackbone(
             visual_length=visual_length,
             embed_dim=visual_width,
             attn_window=attn_window,
             visual_layers=visual_layers,
             visual_heads=visual_head,
-            mlp_dropout=getattr(args, 'mlp_dropout', 0.1),
-            no_mdtp=self.no_mdtp
+            mlp_dropout=getattr(args, 'mlp_dropout', 0.1)
         )
+        self.use_brst = getattr(args, 'use_brst', True)
+        if self.use_brst:
+            self.backbone = self.brst_backbone
+        else:
+            self.backbone = MDTBackbone(
+                visual_length=visual_length,
+                embed_dim=visual_width,
+                attn_window=attn_window,
+                visual_layers=visual_layers,
+                visual_heads=visual_head,
+                mlp_dropout=getattr(args, 'mlp_dropout', 0.1),
+                no_mdtp=self.no_mdtp
+            )
 
-        # 2. Core Module 2: ModalityAdaptiveBranch (TD-AVCA + TASL + PCGrad)
+        # 2. Core Module 2: NoiseGatedAVFusion (Reliability-Gated Multimodal Fusion)
         audio_dim = getattr(args, 'audio_dim', 128)
+        self.av_fusion = NoiseGatedAVFusion(
+            visual_dim=visual_width,
+            audio_dim=audio_dim,
+            num_heads=visual_head,
+            dropout=getattr(args, 'mlp_dropout', 0.1)
+        )
         self.modality_branch = ModalityAdaptiveBranch(
             embed_dim=visual_width,
             audio_dim=audio_dim,
@@ -1663,7 +1938,7 @@ class MARUPA(nn.Module):
             use_pcgrad=self.use_pcgrad
         )
 
-        # 3. Core Module 3: GradientSafeRUPA (with SM-ASPM v2)
+        # 3. Core Module 3: GradientSafeRUPA (Disabled by default under pure BR-STB)
         self.rupa = GradientSafeRUPA(
             feature_dim=visual_width,
             num_prototypes=getattr(args, 'num_prototypes', 16),
@@ -1677,7 +1952,6 @@ class MARUPA(nn.Module):
             use_aspm=self.use_aspm,
             aspm_max_rank=self.aspm_max_rank
         )
-        # Learnable semantic blend weight between Backbone CLIP Semantics & RUPA Residual Semantics
         self.sem_bb_weight_logit = nn.Parameter(torch.tensor(0.0))
 
         # 4. Core Module 4: QuadSafeGate
@@ -1854,32 +2128,33 @@ class MARUPA(nn.Module):
         B, T, D = visual.shape
         target_device = visual.device
 
-        # Step 1: MDTBackbone -> F_base, initial S_det
+        # Step 1: Forward through Backbone (BR-STB or legacy MDT)
         f_base, s_det_base, logits_det_base = self.backbone(visual, padding_mask, lengths)
 
-        # Text features for semantic alignment & TASL audio lifting (adapted & pure zero-shot anchor)
+        # Text features for semantic alignment (adapted & pure zero-shot anchor)
         text_features_ori = self.get_text_features(text, target_device=target_device)
         text_features_zs = self.get_zero_shot_text_features(text, target_device=target_device)
 
-        # Step 2: ModalityAdaptiveBranch -> F_fused, S_aux, logits_aux, G_av, av_suppress_loss, audio_sem_logits
-        f_fused, s_aux, logits_aux, g_av, av_suppress_loss, audio_sem_logits = self.modality_branch(
-            f_base, visual, audio_features=audio, lengths=lengths,
-            return_suppress_loss=True, category_text_features=text_features_ori, return_tasl=True
-        )
-
-        # Unified Anomaly Detector: Anchor S_det on visual F_base for UCF-Crime (no audio)
-        # to avoid motion residual false alarms; use 50/50 fusion for XD-Violence (with audio)
-        if audio is None:
-            f_det_in = f_base
+        # Step 2: Multimodal Audio-Visual Fusion (XD-Violence) or Pure Visual Anchor (UCF-Crime)
+        if audio is not None:
+            f_fused, s_aux, logits_aux, g_av = self.av_fusion(f_base, audio, s_det_base, lengths)
+            # Refined detector score using 65% visual anchor + 35% audio-gated representation
+            f_det_in = 0.65 * f_base + 0.35 * f_fused
+            s_det, logits_det = self.backbone.classify_anomaly(f_det_in)
+            p_routing = 0.65 * s_det + 0.35 * s_aux
+            audio_sem_logits = None
+            av_suppress_loss = torch.tensor(0.0, device=target_device)
         else:
-            f_det_in = 0.5 * f_base + 0.5 * f_fused
-        s_det, logits_det = self.backbone.classify_anomaly(f_det_in)
+            f_fused = f_base
+            s_det, logits_det = s_det_base, logits_det_base
+            s_aux = s_det
+            logits_aux = logits_det
+            g_av = torch.zeros(B, T, 1, device=target_device)
+            p_routing = s_det
+            audio_sem_logits = None
+            av_suppress_loss = torch.tensor(0.0, device=target_device)
 
-        # Per-snippet Multi-Objective PCGrad Junction between Main CLIP Semantics & RUPA Subspace
-        if DNP_use and not self.no_rupa and self.training and self.use_pcgrad:
-            f_main, f_rupa_in = GradientProjectionJunction.apply(f_fused)
-        else:
-            f_main, f_rupa_in = f_fused, f_fused
+        f_main = f_fused
 
         # Valid sequence mask for temporal pooling [B, T, 1]
         if lengths is not None:
@@ -1919,65 +2194,29 @@ class MARUPA(nn.Module):
         p0_bb = F.softmax(logits2, dim=-1)[:, :, :1]
         s_sem_bb = (1.0 - p0_bb).clamp(1e-5, 1.0 - 1e-5)
 
-        # Step 3 & 4: SM-ASPM RUPA & QuadSafeGate
-        dnp_dict = {}
-        if DNP_use and not self.no_rupa:
-            f_rec, residual, s_rec, s_sem, rupa_dict = self.rupa(
-                f_rupa_in, s_det, text_features_ori, lengths=lengths,
-                visual_raw=visual, text_features_zs=text_features_zs
-            )
-            w_bb = torch.sigmoid(self.sem_bb_weight_logit).clamp(0.40, 0.75)
-            s_sem_joint = (w_bb * s_sem_bb + (1.0 - w_bb) * s_sem).clamp(1e-5, 1.0 - 1e-5)
-            p_routing, gate, s_fixed = self.safegate(s_det, s_rec, s_sem_joint, s_aux)
-            dnp_dict.update(rupa_dict)
-            dnp_dict.update({
-                'routing_scores': p_routing,
-                'routing_logits': torch.logit(p_routing.clamp(1e-6, 1.0 - 1e-6)),
-                'detector_scores': s_det,
-                'detector_logits': logits_det,
-                'aux_scores': s_aux,
-                'aux_logits': logits_aux,
-                'reconstruction_scores': s_rec,
-                'semantic_scores': s_sem,
-                'backbone_semantic_scores': s_sem_bb,
-                'fixed_scores': s_fixed,
-                'gate': gate,
-                'noise_gate_av': g_av,
-                'av_suppress_loss': av_suppress_loss,
-                'original_features': f_main,
-                'reconstructed_features': f_rec,
-                'residual_features': residual,
-            })
-            if audio_sem_logits is not None:
-                dnp_dict['audio_semantic_logits'] = audio_sem_logits
-            logits1 = logits_det
-        else:
-            # Fallback when RUPA is disabled (Ablation mode)
-            p_routing, gate, s_fixed = self.safegate(s_det, s_det, s_sem_bb, s_aux)
-            logits1 = logits_det
-            dnp_dict.update({
-                'routing_scores': p_routing,
-                'routing_logits': torch.logit(p_routing.clamp(1e-6, 1.0 - 1e-6)),
-                'detector_scores': s_det,
-                'detector_logits': logits_det,
-                'aux_scores': s_aux,
-                'aux_logits': logits_aux,
-                'reconstruction_scores': torch.zeros_like(s_det),
-                'semantic_scores': s_sem_bb,
-                'backbone_semantic_scores': s_sem_bb,
-                'fixed_scores': s_fixed,
-                'gate': gate,
-                'noise_gate_av': g_av,
-                'av_suppress_loss': av_suppress_loss,
-                'original_features': f_fused,
-                'reconstructed_features': f_fused,
-                'residual_features': torch.zeros_like(f_fused),
-                'g_loss': torch.zeros(B, 1, device=target_device),
-                'orth_loss': torch.zeros(B, 1, device=target_device),
-                'dnp_normal_loss': torch.zeros(B, 1, device=target_device),
-            })
-            if audio_sem_logits is not None:
-                dnp_dict['audio_semantic_logits'] = audio_sem_logits
+        # Step 3: Stream Outputs & Dictionary Population (Zero RUPA Overheads)
+        logits1 = logits_det
+        dnp_dict = {
+            'routing_scores': p_routing,
+            'routing_logits': torch.logit(p_routing.clamp(1e-6, 1.0 - 1e-6)),
+            'detector_scores': s_det,
+            'detector_logits': logits_det,
+            'aux_scores': s_aux,
+            'aux_logits': logits_aux,
+            'reconstruction_scores': torch.zeros_like(s_det),
+            'semantic_scores': s_sem_bb,
+            'backbone_semantic_scores': s_sem_bb,
+            'fixed_scores': p_routing,
+            'gate': torch.zeros(B, T, 1, device=target_device),
+            'noise_gate_av': g_av,
+            'av_suppress_loss': av_suppress_loss,
+            'original_features': f_main,
+            'reconstructed_features': f_main,
+            'residual_features': torch.zeros_like(f_main),
+            'g_loss': torch.zeros(B, 1, device=target_device),
+            'orth_loss': torch.zeros(B, 1, device=target_device),
+            'dnp_normal_loss': torch.zeros(B, 1, device=target_device),
+        }
 
         # Decoupled Contrastive Semantic Alignment (DCSA - DSANet Eq. 5):
         # Pool unified video representation f_main into F_event and F_bkg using S_det weights
@@ -2002,8 +2241,9 @@ class MARUPA(nn.Module):
         return text_features_ori, logits1, logits2, logits3, logits4
 
 
-# Legacy alias for backward compatibility with imports
+# Aliases for backward compatibility and publication nomenclature
 DSANet = MARUPA
+BRMVAD = MARUPA
 
 
 def load_compatible_model_state(model, state_dict, strict=False):

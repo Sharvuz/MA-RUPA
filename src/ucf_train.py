@@ -20,6 +20,8 @@ from utils.dataset import UCFDataset
 from utils.tools import get_batch_label, get_prompt_text, safe_load_checkpoint
 from utils.losses import (
     get_curriculum_omega,
+    compute_maf_mil_loss,
+    compute_temporal_tv_loss,
     compute_at_bce_topk_mil_loss,
     compute_topk_mil_loss,
     compute_dats_mil_loss,
@@ -296,24 +298,31 @@ def train(args):
             s_sem_teacher = (1.0 - p0_teacher).clamp(0.0, 1.0)
             # Robust Smooth-L1 Guidance Anchor: provides steady, bounded gradients between detector and semantic teacher
             loss_sem_guide = F.smooth_l1_loss(s_det, s_sem_teacher)
-            w_guide = 0.20
+            w_guide = 0.10
 
-            # Pillar 1: DATS-MIL (Density-Adaptive Temporal Support MIL)
-            loss_mil_dats = compute_dats_mil_loss(
+            k_min = getattr(args, 'k_min', 16)
+            k_max = getattr(args, 'k_max', 48)
+            m_gamma = getattr(args, 'margin_gamma', 0.30)
+            f_alpha = getattr(args, 'focal_alpha', 2.0)
+            l_mar = getattr(args, 'lambda_mar', 0.50)
+            w_smooth = getattr(args, 'lambda_smooth', 0.08)
+
+            # Pillar 1: Margin-Aware Focal MIL (MAF-MIL) with ATS (k expands dynamically from 16 to 48)
+            loss_mil_det = compute_maf_mil_loss(
                 scores=s_det,
-                teacher=s_sem_teacher,
                 binary_labels=binary_labels,
                 lengths=lengths_batch,
-                current_epoch=epoch,
-                max_epoch=args.max_epoch,
-                device=device
+                epoch=epoch_idx,
+                k_min=k_min,
+                k_max=k_max,
+                gamma=m_gamma,
+                alpha=f_alpha,
+                lambda_mar=l_mar
             )
-            loss_mil_det = loss_mil_dats
-            loss_mil_routing = loss_mil_dats
+            loss_mil_routing = loss_mil_det
             loss_mil_aux = torch.tensor(0.0, device=device)
 
-            # Pillar 2: Multi-Class MIL Frame Supervision on Semantics (CLASM)
-            # Directly supervises logits2 with true crime class vs normal to anchor CLIP manifold
+            # Pillar 2: Multi-Class MIL Frame Supervision on Semantics (CLASM, calibrated to 0.10 for CCTV)
             loss_clasm = compute_clasm_loss(
                 logits=logits2,
                 labels=one_hot_labels,
@@ -325,30 +334,29 @@ def train(args):
                 peak_drop_prob=0.15
             )
 
-            # Pillar 3: Compact Decoupled Contrastive Alignment (DCS = Event + Background)
+            # Pillar 3: Decoupled Contrastive Alignment (DCSA = Event + Background)
             loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dcs = loss_event + loss_bkg
 
-            # Pillar 4: Subspace Geometry (OGDP)
-            loss_geo = compute_ogdp_geometry_loss(dnp_dict, device=device)
+            # Pillar 4: L1 Total Variation Smoothness
+            loss_smooth = compute_temporal_tv_loss(s_det, lengths_batch)
 
             # Backward-compatible dummy logs
             loss_tasl = torch.tensor(0.0, device=device)
             loss_consistency = torch.tensor(0.0, device=device)
-            loss_smooth = torch.tensor(0.0, device=device)
-            loss_gather = dnp_dict.get('g_loss', torch.tensor(0.0, device=device)).mean()
-            loss_orth = dnp_dict.get('orth_loss', torch.tensor(0.0, device=device)).mean()
+            loss_gather = torch.tensor(0.0, device=device)
+            loss_orth = torch.tensor(0.0, device=device)
             loss_gate = torch.tensor(0.0, device=device)
+            loss_geo = torch.tensor(0.0, device=device)
 
-            # 5-Pillar Unified Loss Engine:
-            # 1.0 * DATS-MIL + 0.25 * CLASM + 0.5 * DCS + 0.20 * Guidance + 0.1 * Geometry
+            # Pristine 4-Pillar Master Loss Engine (Zero RUPA Overheads)
             total_loss = (
-                1.00 * loss_mil_dats
-                + 0.25 * loss_clasm
-                + 0.50 * loss_dcs
+                1.00 * loss_mil_det
+                + 0.10 * loss_clasm
+                + 0.15 * loss_dcs
+                + w_smooth * loss_smooth
                 + w_guide * loss_sem_guide
-                + 0.10 * loss_geo
             )
 
             optimizer.zero_grad()

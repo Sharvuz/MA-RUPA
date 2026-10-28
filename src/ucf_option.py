@@ -16,6 +16,7 @@ parser = argparse.ArgumentParser(description='MA-RUPA: Modality-Adaptive Multisc
 parser.add_argument('--seed', default=234, type=int, help='Random seed for reproducibility')
 
 # Architecture Hyperparameters
+parser.add_argument('--use-brst', default=True, type=str2bool, help='Enable Bi-Relational Spatio-Temporal Backbone (BR-STB)')
 parser.add_argument('--embed-dim', default=512, type=int, help='Feature embedding dimension')
 parser.add_argument('--visual-length', default=256, type=int, help='Maximum temporal snippets per video')
 parser.add_argument('--visual-width', default=512, type=int, help='Visual feature width')
@@ -61,8 +62,13 @@ parser.add_argument('--routing-aux-weight', default=0.07, type=float, help='Prio
 # Training & Optimization
 parser.add_argument('--max-epoch', default=25, type=int, help='Total training epochs (default 25 for ~1250 gradient steps)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size (32 normal + 32 anomaly)')
-parser.add_argument('--lr', type=float, default=2.5e-5, help='Learning rate for End-to-End AdamW optimizer (default 2.5e-5)')
+parser.add_argument('--lr', type=float, default=7e-5, help='Learning rate for End-to-End AdamW optimizer (default 7e-5 for BR-STB)')
 parser.add_argument('--weight-decay', type=float, default=2e-3, help='Weight decay for regularization (default 2e-3)')
+parser.add_argument('--k-min', type=int, default=16, help='Minimum top-k snippets for ATS MAF-MIL (default 16)')
+parser.add_argument('--k-max', type=int, default=48, help='Maximum top-k snippets for ATS MAF-MIL (default 48)')
+parser.add_argument('--margin-gamma', type=float, default=0.30, help='Margin gamma for intra-bag separation (default 0.30)')
+parser.add_argument('--focal-alpha', type=float, default=2.0, help='Focal loss focusing parameter alpha (default 2.0)')
+parser.add_argument('--lambda-mar', type=float, default=0.50, help='Weight for intra-bag margin loss (default 0.50)')
 parser.add_argument('--curriculum-epochs', type=float, default=3.0, help='Epochs to smoothly ramp up RUPA losses via cosine schedule (default 3.0)')
 parser.add_argument('--max-omega', default=0.20, type=float, help='Maximum curriculum omega ceiling (default 0.20 to prevent over-regularization)')
 parser.add_argument('--topk-ratio', type=int, default=16, help='Base divisor for variance-adaptive top-k (VAT-K) selection (default 16 -> ~6.25%% frames for sparse CCTV crimes)')
@@ -79,7 +85,7 @@ parser.add_argument('--lambda-ohnm', default=0.2, type=float, help='Online hard 
 # Loss Weighting (Pareto optimal weighting for simultaneous Detector and RUPA performance)
 parser.add_argument('--lambda-aux', type=float, default=0.20, help='Weight for auxiliary branch MIL loss (default 0.20 for UCF-Crime)')
 parser.add_argument('--lambda-tasl', type=float, default=0.10, help='Weight for TASL cross-modal semantic alignment loss (default 0.10 for UCF-Crime)')
-parser.add_argument('--lambda-smooth', type=float, default=0.06, help='Weight for SA-EPTS edge-preserving smoothness & halo expansion loss (default 0.06)')
+parser.add_argument('--lambda-smooth', type=float, default=0.08, help='Weight for Total Variation temporal smoothness loss (default 0.08)')
 parser.add_argument('--lambda-orth', type=float, default=0.05, help='Weight for active-slot prototype orthogonality & repulsion loss (default 0.05)')
 parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight for DNP subspace gather loss (default 0.12)')
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
