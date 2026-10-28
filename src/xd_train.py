@@ -84,8 +84,8 @@ def train(args):
         args.routing_aux_weight = 0.08
     if getattr(args, 'routing_rec_weight', 0.05) > 0.10:
         args.routing_rec_weight = 0.05
-    if getattr(args, 'lambda_smooth', 0.06) > 0.12 or getattr(args, 'lambda_smooth', 0.06) < 0.02:
-        args.lambda_smooth = 0.06
+    if getattr(args, 'lambda_smooth', 0.0) < 0.0:
+        args.lambda_smooth = 0.0
     if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 0.50) > 0.75:
         args.smooth_sigma = 0.50
     if getattr(args, 'use_aspm', True):
@@ -345,7 +345,7 @@ def train(args):
             g_max = getattr(args, 'gamma_max', 0.30)
             f_alpha = getattr(args, 'focal_alpha', 0.0)
             l_mar = getattr(args, 'lambda_mar', 0.50)
-            w_smooth = getattr(args, 'lambda_smooth', 0.05)
+            w_smooth = getattr(args, 'lambda_smooth', 0.0)
             w_ahns = getattr(args, 'lambda_ahns', 0.10)
 
             # Pillar 1: Margin-Aware Focal MIL (MAF-MIL) with ATS and Sigmoid-Annealed Margin
@@ -406,8 +406,11 @@ def train(args):
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dcs = loss_event + loss_bkg
 
-            # Pillar 4: L1 Total Variation Smoothness
-            loss_smooth = compute_temporal_tv_loss(s_det, lengths_batch)
+            # Pillar 4: L1 Total Variation Smoothness (0.0 disables peak clipping)
+            if w_smooth > 0.0:
+                loss_smooth = compute_temporal_tv_loss(s_det, lengths_batch)
+            else:
+                loss_smooth = torch.tensor(0.0, device=device)
 
             loss_tasl = torch.tensor(0.0, device=device)
             loss_geo = torch.tensor(0.0, device=device)

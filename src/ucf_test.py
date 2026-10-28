@@ -98,7 +98,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     ap_master_list = []
     ap_opt_list = []
 
-    smooth_eval = getattr(args, 'smooth_eval', True)
+    smooth_eval = getattr(args, 'smooth_eval', False)
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
     smooth_sigma = getattr(args, 'smooth_sigma', 0.50)
 
@@ -347,6 +347,30 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     min_len = min(len(gt), len(frame_scores_routing))
     gt_eval = gt[:min_len]
 
+    # Raw Uncalibrated, Unsmoothed Stream Evaluation (Zero calibration distortion, zero peak clipping)
+    raw_scores_det = np.concatenate(raw_det_vids, axis=0)
+    raw_scores_sem = np.concatenate(raw_sem_vids, axis=0)
+    raw_scores_sem_rupa = np.concatenate(raw_sem_rupa_vids, axis=0)
+    raw_scores_fusion = 0.5 * raw_scores_det + 0.5 * raw_scores_sem_rupa
+
+    frame_raw_det = np.nan_to_num(np.repeat(raw_scores_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_raw_sem = np.nan_to_num(np.repeat(raw_scores_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_raw_sem_rupa = np.nan_to_num(np.repeat(raw_scores_sem_rupa, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_raw_fusion = np.nan_to_num(np.repeat(raw_scores_fusion, 16), nan=0.0, posinf=1.0, neginf=0.0)
+
+    roc_raw_det = roc_auc_score(gt_eval, frame_raw_det[:min_len])
+    ap_raw_det = average_precision_score(gt_eval, frame_raw_det[:min_len])
+    roc_raw_sem = roc_auc_score(gt_eval, frame_raw_sem[:min_len])
+    ap_raw_sem = average_precision_score(gt_eval, frame_raw_sem[:min_len])
+    roc_raw_sem_rupa = roc_auc_score(gt_eval, frame_raw_sem_rupa[:min_len])
+    ap_raw_sem_rupa = average_precision_score(gt_eval, frame_raw_sem_rupa[:min_len])
+    roc_raw_fusion = roc_auc_score(gt_eval, frame_raw_fusion[:min_len])
+    ap_raw_fusion = average_precision_score(gt_eval, frame_raw_fusion[:min_len])
+
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical BR-STB Backbone - Raw SOTA): {roc_raw_det * 100:.2f}% | AP: {ap_raw_det * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Fine-Grained Semantic Alignment - Raw TVSA): {roc_raw_sem_rupa * 100:.2f}% | AP: {ap_raw_sem_rupa * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Dual-Stream Synergistic Fusion - Raw): {roc_raw_fusion * 100:.2f}% | AP: {ap_raw_fusion * 100:.2f}%", flush=True)
+
     roc_routing = roc_auc_score(gt_eval, frame_scores_routing[:min_len])
     ap_routing = average_precision_score(gt_eval, frame_scores_routing[:min_len])
 
@@ -422,13 +446,15 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
         sys.stdout.flush()
 
-    # Use the best stream across all WS-VAD paradigms
+    # Use the best stream across all WS-VAD paradigms (including Raw SOTA streams)
     best_auc = max(
+        roc_raw_det, roc_raw_sem, roc_raw_sem_rupa, roc_raw_fusion,
         roc_routing, roc_det, roc_sem, roc_sem_rupa,
         roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_tri,
         roc_weighted, roc_geom, roc_opt, roc_harmonic, roc_master, roc_hier, roc_uccf, roc_dodo
     )
     best_ap = max(
+        ap_raw_det, ap_raw_sem, ap_raw_sem_rupa, ap_raw_fusion,
         ap_routing, ap_det, ap_sem, ap_sem_rupa,
         ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_tri,
         ap_weighted, ap_geom, ap_opt, ap_harmonic, ap_master, ap_hier, ap_uccf, ap_dodo

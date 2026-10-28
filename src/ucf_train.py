@@ -77,8 +77,8 @@ def train(args):
         args.curriculum_epochs = 3.0
     if getattr(args, 'max_omega', 0.20) > 0.25:
         args.max_omega = 0.20
-    if getattr(args, 'lambda_smooth', 0.06) > 0.12 or getattr(args, 'lambda_smooth', 0.06) < 0.02:
-        args.lambda_smooth = 0.06
+    if getattr(args, 'lambda_smooth', 0.0) < 0.0:
+        args.lambda_smooth = 0.0
     if getattr(args, 'lambda_aux', 0.05) > 0.10:
         args.lambda_aux = 0.05
     if getattr(args, 'use_epts', True):
@@ -317,7 +317,7 @@ def train(args):
             g_max = getattr(args, 'gamma_max', 0.35)
             f_alpha = getattr(args, 'focal_alpha', 0.0)
             l_mar = getattr(args, 'lambda_mar', 0.50)
-            w_smooth = getattr(args, 'lambda_smooth', 0.08)
+            w_smooth = getattr(args, 'lambda_smooth', 0.0)
 
             # Pillar 1: Margin-Aware Focal MIL (MAF-MIL) with ATS and Sigmoid-Annealed Margin
             loss_mil_det = compute_maf_mil_loss(
@@ -353,8 +353,11 @@ def train(args):
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dcs = loss_event + loss_bkg
 
-            # Pillar 4: L1 Total Variation Smoothness
-            loss_smooth = compute_temporal_tv_loss(s_det, lengths_batch)
+            # Pillar 4: L1 Total Variation Smoothness (0.0 disables peak clipping)
+            if w_smooth > 0.0:
+                loss_smooth = compute_temporal_tv_loss(s_det, lengths_batch)
+            else:
+                loss_smooth = torch.tensor(0.0, device=device)
 
             # Backward-compatible dummy logs
             loss_tasl = torch.tensor(0.0, device=device)

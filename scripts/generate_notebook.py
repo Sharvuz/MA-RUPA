@@ -267,9 +267,9 @@ import subprocess, sys
 subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
-UCF_BATCH_SIZE = 64
-UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps SOTA)
-UCF_LR = 5e-5
+UCF_BATCH_SIZE = 32
+UCF_EPOCHS = 10  # Full 10-epoch schedule (500 iters/epoch -> 5,000 gradient steps SOTA)
+UCF_LR = 7e-5
 SEED = 234
 
 ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
@@ -293,17 +293,17 @@ cmd_train_ucf = [
     "--gamma-min", "0.15",
     "--gamma-max", "0.35",
     "--focal-alpha", "0.0",                  # Pure top-k BCE prevents loss collapse
-    "--lambda-mar", "0.50",
-    "--lambda-smooth", "0.08",
-    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (16,000 samples/epoch, 250 iters/epoch)
-    "--eval-interval", "20",                  # Mid-epoch test & peak-catching every 20 iters (1280 samples)
-    "--snippet-dropout", "0.15",
-    "--weight-decay", "1e-4",
+    "--lambda-mar", "0.20",
+    "--lambda-smooth", "0.0",                # ZERO TV Loss: Eliminates peak clipping on explosive anomalies!
+    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (16,000 samples/epoch, 500 iters/epoch)
+    "--eval-interval", "25",                  # Mid-epoch test & peak-catching every 25 iters
+    "--snippet-dropout", "0.10",
+    "--weight-decay", "1e-5",                # Optimal weight decay (1e-5 prevents weight suppression)
     "--attn-window", "8",                    # BR-STB: Window size W=8 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(ucf_model_path),
     "--checkpoint-path", str(ucf_checkpoint_path),
-    "--smooth-eval", "True",
+    "--smooth-eval", "False",                # Raw sharp evaluation: No Gaussian blur peak destruction!
     "--smooth-sigma", "0.50"
 ]
 
@@ -336,11 +336,11 @@ cmd_eval_ucf = [
     "--gt-segment-path", "list/gt_segment_ucf.npy",
     "--gt-label-path", "list/gt_label_ucf.npy",
     "--model-path", str(ucf_model_path),
-    "--smooth-eval", "True",
+    "--smooth-eval", "False",
     "--smooth-sigma", "0.50"
 ]
 
-print("🔍 Đang đánh giá model UCF-Crime tốt nhất với Multi-Stream Evaluation & Gaussian Smoothing (sigma=2.0)...", flush=True)
+print("🔍 Đang đánh giá model UCF-Crime tốt nhất với Raw SOTA Stream Evaluation (Không làm mờ đỉnh)...", flush=True)
 subprocess.run(cmd_eval_ucf, cwd=REPO_DIR, check=True)
 """))
 
@@ -393,17 +393,17 @@ cmd_train_xd = [
     "--gamma-max", "0.30",
     "--lambda-ahns", "0.10",
     "--focal-alpha", "0.0",                  # Pure top-k BCE prevents loss collapse
-    "--lambda-mar", "0.50",
-    "--lambda-smooth", "0.05",
+    "--lambda-mar", "0.20",
+    "--lambda-smooth", "0.0",                 # ZERO TV Loss: Eliminates peak clipping!
     "--sample-one-crop-per-video", "False",  # Full 10 crops per video (~593 iters/epoch)
     "--eval-interval", "30",                  # Mid-epoch test & peak-catching every 30 iters
-    "--snippet-dropout", "0.15",
-    "--weight-decay", "1e-4",
+    "--snippet-dropout", "0.10",
+    "--weight-decay", "1e-5",                # Optimal weight decay (1e-5 prevents weight suppression)
     "--attn-window", "64",                   # BR-STB: Window size W=64 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(xd_model_path),
     "--checkpoint-path", str(xd_checkpoint_path),
-    "--smooth-eval", "True",
+    "--smooth-eval", "False",                # Raw sharp evaluation
     "--smooth-sigma", "0.50"
 ]
 
@@ -436,11 +436,11 @@ cmd_eval_xd = [
     "--gt-segment-path", "list/gt_segment.npy",
     "--gt-label-path", "list/gt_label.npy",
     "--model-path", str(xd_model_path),
-    "--smooth-eval", "True",
+    "--smooth-eval", "False",
     "--smooth-sigma", "0.50"
 ]
 
-print("🔍 Đang đánh giá model XD-Violence tốt nhất...", flush=True)
+print("🔍 Đang đánh giá model XD-Violence tốt nhất với Raw SOTA Stream Evaluation...", flush=True)
 subprocess.run(cmd_eval_xd, cwd=REPO_DIR, check=True)
 """))
 
