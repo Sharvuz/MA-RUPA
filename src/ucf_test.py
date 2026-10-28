@@ -71,7 +71,7 @@ def refine_scores_hierarchical(logits_det: torch.Tensor,
 
 
 def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
-         DNP_use, device, args):
+         DNP_use, device, args, compute_dmap: bool = False):
     """Evaluates MA-RUPA on UCF-Crime test set.
     
     Computes Frame-level ROC-AUC, Frame-level AP, and detection mAP@IoU[0.1:0.5].
@@ -412,17 +412,18 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     print(f"[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): {roc_uccf * 100:.2f}% | AP: {ap_uccf * 100:.2f}%", flush=True)
     print(f"[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): {roc_dodo * 100:.2f}% | AP: {ap_dodo * 100:.2f}%", flush=True)
 
-    try:
-        dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
-        avg_map = 0.0
-        for i in range(len(iou)):
-            print(f"  mAP@{iou[i]:.1f} = {dmap[i]:.2f}%", flush=True)
-            avg_map += dmap[i]
-        avg_map = avg_map / max(1, len(iou))
-        print(f"  Average mAP: {avg_map:.2f}%", flush=True)
-    except Exception as e:
-        print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
-    sys.stdout.flush()
+    if compute_dmap:
+        try:
+            dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
+            avg_map = 0.0
+            for i in range(len(iou)):
+                print(f"  mAP@{iou[i]:.1f} = {dmap[i]:.2f}%", flush=True)
+                avg_map += dmap[i]
+            avg_map = avg_map / max(1, len(iou))
+            print(f"  Average mAP: {avg_map:.2f}%", flush=True)
+        except Exception as e:
+            print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
+        sys.stdout.flush()
 
     # Use the best stream across all WS-VAD paradigms
     best_auc = max(
@@ -480,4 +481,4 @@ if __name__ == '__main__':
                 model.clip_adapter.t_w = float(cp_args['t_w'])
                 print(f"[Auto-Detect] Restored checkpoint text adapter t_w = {model.clip_adapter.t_w}", flush=True)
 
-    test(model, testdataloader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, device, args)
+    test(model, testdataloader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, device, args, compute_dmap=True)

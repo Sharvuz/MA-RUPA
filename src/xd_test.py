@@ -71,7 +71,7 @@ def refine_scores_hierarchical(logits_det: torch.Tensor,
 
 
 def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
-         DNP_use, args, device):
+         DNP_use, args, device, compute_dmap: bool = False):
     """Evaluates MA-RUPA on XD-Violence test set.
     
     Computes Frame-level Average Precision (AP), Frame-level ROC-AUC, and mAP@IoU[0.1:0.5].
@@ -451,16 +451,17 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     print(f"[Evaluation] Frame-level AP (UCCF + DODO - SOTA): {ap_dodo * 100:.2f}% | AUC: {roc_dodo * 100:.2f}%", flush=True)
 
     avg_map = 0.0
-    try:
-        dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
-        for i in range(len(iou)):
-            print(f"  mAP@{iou[i]:.1f} = {dmap[i]:.2f}%", flush=True)
-            avg_map += dmap[i]
-        avg_map = avg_map / max(1, len(iou))
-        print(f"  Average mAP: {avg_map:.2f}%", flush=True)
-    except Exception as e:
-        print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
-    sys.stdout.flush()
+    if compute_dmap:
+        try:
+            dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
+            for i in range(len(iou)):
+                print(f"  mAP@{iou[i]:.1f} = {dmap[i]:.2f}%", flush=True)
+                avg_map += dmap[i]
+            avg_map = avg_map / max(1, len(iou))
+            print(f"  Average mAP: {avg_map:.2f}%", flush=True)
+        except Exception as e:
+            print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
+        sys.stdout.flush()
 
     best_ap = max(
         ap_routing, ap_det, ap_aux, ap_sem, ap_sem_rupa,
@@ -525,4 +526,4 @@ if __name__ == '__main__':
         checkpoint = safe_load_checkpoint(args.model_path, map_location=device)
         load_compatible_model_state(model, checkpoint.get('model_state_dict', checkpoint), strict=False)
 
-    test(model, test_loader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, args, device)
+    test(model, test_loader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, args, device, compute_dmap=True)
