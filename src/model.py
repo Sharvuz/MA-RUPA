@@ -1229,11 +1229,21 @@ class AdaptiveStiefelPrototypeManifold(nn.Module):
         return max(self.min_rank, min(self.max_rank, rank))
 
     def get_stiefel_basis(self) -> torch.Tensor:
-        """Returns orthonormal basis U_norm in St(M_e, D) via QR retraction."""
+        """Returns orthonormal basis U_norm in St(M_e, D) via Polar Retraction (Newton-Schulz).
+
+        Absil et al. (2008), 'Optimization Algorithms on Matrix Manifolds', Section 4.1.2.
+        Symmetric, gauge-invariant, completely thread-safe under DataParallel (cuBLAS matmul),
+        and avoids cuSOLVER lazy-loader collisions across multiple GPU threads.
+        """
         m_e = self.get_current_rank()
-        u_sub = self.u_raw[:m_e]  # [M_e, D]
-        q, _ = torch.linalg.qr(u_sub.t(), mode='reduced')  # [D, M_e]
-        return q.t()  # [M_e, D]
+        u_sub = self.u_raw[:m_e].float()  # [M_e, D] in float32 for high numerical stability
+        scale = (float(m_e) ** 0.5) / (torch.norm(u_sub) + 1e-8)
+        x = u_sub * scale
+        eye = torch.eye(m_e, device=u_sub.device, dtype=torch.float32)
+        for _ in range(5):
+            a = torch.matmul(x, x.t())
+            x = 0.5 * torch.matmul(3.0 * eye - a, x)
+        return x.to(self.u_raw.dtype)  # [M_e, D]
 
     def forward(self, f_video: torch.Tensor, s_det: torch.Tensor = None):
         """

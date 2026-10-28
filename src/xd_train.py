@@ -192,6 +192,13 @@ def train(args):
 
     # Multi-GPU support (e.g. Kaggle GPU T4 x 2)
     if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        for dev_idx in range(torch.cuda.device_count()):
+            try:
+                # Pre-warm CUDA linear algebra stubs sequentially on main thread
+                dummy = torch.eye(4, device=f"cuda:{dev_idx}")
+                _ = torch.linalg.qr(dummy)
+            except Exception:
+                pass
         gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
         print(f"[Multi-GPU] Detected {torch.cuda.device_count()} GPUs ({', '.join(gpu_names)}). Activating DataParallel for T4x2!", flush=True)
         model = torch.nn.DataParallel(model)
