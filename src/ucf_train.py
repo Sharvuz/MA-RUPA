@@ -53,6 +53,14 @@ def get_compact_state_dict(state_dict):
     }
 
 
+def safe_save_checkpoint(checkpoint_dict, path):
+    """Saves checkpoint compactly and safely."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    if 'model_state_dict' in checkpoint_dict:
+        checkpoint_dict['model_state_dict'] = get_compact_state_dict(checkpoint_dict['model_state_dict'])
+    torch.save(checkpoint_dict, path)
+
+
 def train(args):
     try:
         import subprocess
