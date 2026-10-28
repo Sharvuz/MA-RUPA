@@ -66,7 +66,7 @@ parser.add_argument('--routing-sem-weight', default=0.42, type=float, help='Prio
 parser.add_argument('--routing-aux-weight', default=0.08, type=float, help='Prior weight for auxiliary audio-visual stream')
 
 # Training & Optimization
-parser.add_argument('--max-epoch', default=25, type=int, help='Total training epochs (default 25 for ~1475 gradient steps)')
+parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for full dataset SOTA schedule ~5930 gradient steps)')
 parser.add_argument('--batch-size', default=64, type=int, help='Batch size for training (32 normal + 32 anomaly)')
 parser.add_argument('--lr', type=float, default=1.5e-4, help='Learning rate for End-to-End AdamW optimizer (default 1.5e-4 for BR-STB multimodal)')
 parser.add_argument('--weight-decay', type=float, default=2e-3, help='Weight decay for regularization (default 2e-3)')
@@ -81,7 +81,7 @@ parser.add_argument('--topk-ratio', type=int, default=8, help='Base divisor for 
 parser.add_argument('--topk-ratio-clasm', type=int, default=8, help='Top-k divisor for snippet multi-class classification (default 8)')
 parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing factor for binary MIL loss (default 0.0; AT-BCE + OHNM prevents collapse)')
 parser.add_argument('--snippet-dropout', type=float, default=0.15, help='Snippet dropout rate during training to prevent 1-frame spike collapse (default 0.15)')
-parser.add_argument('--sample-one-crop-per-video', default=True, type=str2bool, help='DPSS: Randomly sample distinct crop(s) per video per epoch (default True)')
+parser.add_argument('--sample-one-crop-per-video', default=False, type=str2bool, help='Train on full 10 crops per video (default False for Full 10-Epoch SOTA schedule)')
 parser.add_argument('--crops-per-video', default=2, type=int, help='DPSS: Number of random crops sampled per video per epoch (default 2 for ~59 iters/epoch)')
 parser.add_argument('--vatk', default=True, type=str2bool, help='Whether to use Variance-Adaptive Top-K selection (default True)')
 parser.add_argument('--gamma-edge', default=5.0, type=float, help='Edge-preserving sensitivity for SA-EPTS smoothness loss (default 5.0)')

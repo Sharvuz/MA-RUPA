@@ -249,10 +249,11 @@ if sample_p.exists():
     # ---------------------------------------------------------
     # Cell 3: Markdown UCF
     # ---------------------------------------------------------
-    nb["cells"].append(md("""## 3. UCF-Crime Training (BR-STB End-to-End on GPU T4 x 2)
+    nb["cells"].append(md("""## 3. UCF-Crime Training (BR-STB Full 10-Epoch SOTA Schedule on GPU T4 x 2)
 
 - **Mục tiêu hiệu năng:** **89.5% – 90.0% Frame-level ROC-AUC** (~38% - 40% AP).
-- **Cơ chế:** Huấn luyện End-to-End từ đầu (Zero Warm-Start) với **BR-STB** (Bi-Relational Spatio-Temporal Graph Transformer) + **Margin-Aware Focal MIL (MAF-MIL)** với Adaptive Temporal Support ($k: 16 \\to 48$).
+- **Cơ chế:** Huấn luyện End-to-End từ đầu (Zero Warm-Start) với **BR-STB** + **MAF-MIL ATS ($k: 16 \\to 48$)**.
+- **Full 10-Epoch SOTA Schedule:** Huấn luyện toàn bộ 10 crops (16,100 mẫu/epoch, 250 bước gradient/epoch $\\times$ 10 epochs = **2,500 bước gradient**, tương tự DSANet). Thời gian chạy chỉ mất ~10 - 12 phút trên Dual T4.
 - **Multi-GPU:** Tự động kích hoạt `DataParallel` chia đều batch 64 (32 mẫu/GPU) trên 2x GPU T4.
 """))
 
@@ -267,8 +268,7 @@ subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
 UCF_BATCH_SIZE = 64
-UCF_EPOCHS = 25
-UCF_CROPS_PER_VIDEO = 2  # DPSS: 2 distinct crops/video/epoch -> 50 iters/epoch -> 1,250 gradient steps!
+UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps matches DSANet SOTA)
 UCF_LR = 7e-5
 SEED = 234
 
@@ -292,9 +292,8 @@ cmd_train_ucf = [
     "--focal-alpha", "2.0",
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.08",
-    "--sample-one-crop-per-video", "True",
-    "--crops-per-video", str(UCF_CROPS_PER_VIDEO),
-    "--attn-window", "8",          # BR-STB: Window size W=8 for local graph attention
+    "--sample-one-crop-per-video", "False",  # Full 10-crop dataset per epoch
+    "--attn-window", "8",                    # BR-STB: Window size W=8 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(ucf_model_path),
     "--checkpoint-path", str(ucf_checkpoint_path),
@@ -302,7 +301,7 @@ cmd_train_ucf = [
     "--smooth-sigma", "0.50"
 ]
 
-print("🚀 Bắt đầu huấn luyện End-to-End BR-MVAD trên UCF-Crime (Tối ưu SOTA ≥89.5% AUC) với GPU T4x2...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện End-to-End BR-MVAD trên UCF-Crime (Full 10 Epochs, SOTA ≥89.5% AUC) với GPU T4x2...\\n", flush=True)
 
 process = subprocess.Popen(
     cmd_train_ucf, cwd=REPO_DIR, text=True,
@@ -342,10 +341,11 @@ subprocess.run(cmd_eval_ucf, cwd=REPO_DIR, check=True)
     # ---------------------------------------------------------
     # Cell 6: Markdown XD
     # ---------------------------------------------------------
-    nb["cells"].append(md("""## 4. XD-Violence Training (Multimodal Audio-Visual on GPU T4 x 2)
+    nb["cells"].append(md("""## 4. XD-Violence Training (BR-STB Full 10-Epoch SOTA Schedule on GPU T4 x 2)
 
 - **Mục tiêu hiệu năng:** **87.0% – 87.5%+ Frame-level Average Precision (AP)**, **95.0% - 95.5% ROC-AUC**.
-- **Cơ chế:** Huấn luyện End-to-End đa phương thức kết hợp Visual BR-STB (512-D) và Audio VGGish (128-D) qua cổng lọc nhiễu âm thanh độ tin cậy cao $G_{\\text{audio}}$ (khởi tạo bias -2.2, chặn 90% nhiễu âm thanh) + **Margin-Aware Focal MIL (MAF-MIL)** với Adaptive Temporal Support ($k: 16 \\to 64$).
+- **Cơ chế:** Huấn luyện End-to-End đa phương thức kết hợp Visual BR-STB (512-D) và Audio VGGish (128-D) qua cổng lọc nhiễu âm thanh $G_{\\text{audio}}$ (chặn 90% nhiễu âm) + **MAF-MIL ATS ($k: 16 \\to 64$)**.
+- **Full 10-Epoch SOTA Schedule:** Huấn luyện toàn bộ 10 crops (39,540 mẫu/epoch, 593 bước gradient/epoch $\\times$ 10 epochs = **5,930 bước gradient**, chuẩn DSANet). Thời gian chạy chỉ mất ~30 - 35 phút trên Dual T4.
 - **Multi-GPU:** Tự động kích hoạt `DataParallel` trên 2x GPU T4.
 """))
 
@@ -360,8 +360,7 @@ subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
 XD_BATCH_SIZE = 64
-XD_EPOCHS = 25
-XD_CROPS_PER_VIDEO = 2  # DPSS: 2 distinct crops/video/epoch -> ~59 iters/epoch -> 1,475 gradient steps!
+XD_EPOCHS = 10  # Full 10-epoch schedule (~593 iters/epoch -> 5,930 gradient steps matches DSANet SOTA)
 XD_LR = 1.5e-4
 SEED = 234
 
@@ -386,9 +385,8 @@ cmd_train_xd = [
     "--focal-alpha", "2.0",
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.05",
-    "--sample-one-crop-per-video", "True",
-    "--crops-per-video", str(XD_CROPS_PER_VIDEO),
-    "--attn-window", "64",         # BR-STB: Window size W=64 for local graph attention
+    "--sample-one-crop-per-video", "False",  # Full 10-crop dataset per epoch
+    "--attn-window", "64",                   # BR-STB: Window size W=64 for local graph attention
     "--seed", str(SEED),
     "--model-path", str(xd_model_path),
     "--checkpoint-path", str(xd_checkpoint_path),
@@ -396,7 +394,7 @@ cmd_train_xd = [
     "--smooth-sigma", "0.50"
 ]
 
-print("🚀 Bắt đầu huấn luyện End-to-End BR-MVAD trên XD-Violence (Tối ưu SOTA ≥87.0% AP) với GPU T4x2...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện End-to-End BR-MVAD trên XD-Violence (Full 10 Epochs, SOTA ≥87.0% AP) với GPU T4x2...\\n", flush=True)
 
 process = subprocess.Popen(
     cmd_train_xd, cwd=REPO_DIR, text=True,
