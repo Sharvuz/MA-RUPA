@@ -142,108 +142,137 @@ print("=" * 60)
     # Cell 2: Data Radar with # -> + mapping
     # ---------------------------------------------------------
     nb["cells"].append(code("""# ========================= 2. RADAR: QUÉT DỮ LIỆU & XỬ LÝ '#' -> '+' =========================
+import os
 import zipfile
 from collections import defaultdict
 import numpy as np
 import pandas as pd
 
-print("🔍 Đang quét toàn bộ /kaggle/input và /kaggle/working để lập bản đồ feature (.npy)...")
+print("🔍 Đang kiểm tra và thiết lập bản đồ dữ liệu feature (.npy)...")
 
-# 1. Tự động giải nén file .zip nếu có
-zip_files = list(INPUT.rglob("*.zip"))
-if zip_files:
-    extract_dir = WORK / "extracted_features"
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    print(f"📦 Tìm thấy {len(zip_files)} file zip. Đang kiểm tra giải nén...")
-    for zf in zip_files:
-        dest = extract_dir / zf.stem
-        if not dest.exists() or not any(dest.iterdir()):
-            dest.mkdir(parents=True, exist_ok=True)
-            print(f"  Unzipping {zf.name} -> {dest.name}...")
-            with zipfile.ZipFile(zf, 'r') as archive:
-                archive.extractall(dest)
+# Kiểm tra nếu đã đồng bộ và các file tồn tại thì tái sử dụng ngay lập tức
+artifacts_ready = all(
+    (ARTIFACTS / f).exists() and (ARTIFACTS / f).stat().st_size > 0
+    for f in ["ucf_train.csv", "ucf_test.csv"]
+)
 
-# 2. Quét tất cả các file .npy trên hệ thống
-search_roots = [INPUT, WORK]
-all_npy_files = []
-for root in search_roots:
-    if root.exists():
-        all_npy_files.extend(root.rglob("*.npy"))
+skip_scan = False
+if artifacts_ready:
+    try:
+        sample_df = pd.read_csv(ARTIFACTS / "ucf_train.csv", nrows=5)
+        if all(Path(p).exists() for p in sample_df['path']):
+            print("⚡ Đã phát hiện danh sách đặc trưng hợp lệ trong rupa_artifacts!")
+            print("🚀 Tự động kích hoạt Fast-Pass: Bỏ qua bước quét đĩa để tiết kiệm thời gian.")
+            skip_scan = True
+            sample_p = Path(sample_df.iloc[0]['path'])
+            sample_feat = np.load(sample_p, mmap_mode='r')
+            print(f"🎯 Feature Preflight Test: {sample_p.name} | Shape: {sample_feat.shape}")
+    except Exception:
+        skip_scan = False
 
-print(f"📡 Radar phát hiện tổng cộng {len(all_npy_files)} tệp tin .npy trên hệ thống!")
+if not skip_scan:
+    # 1. Tự động giải nén file .zip nếu có (Chỉ quét tầng nông <= 2 để tránh nghẽn FUSE I/O)
+    zip_files = []
+    if INPUT.exists():
+        for root, dirs, files in os.walk(INPUT):
+            rel_depth = len(Path(root).relative_to(INPUT).parts)
+            if rel_depth >= 2:
+                dirs.clear()
+            for f in files:
+                if f.lower().endswith(".zip"):
+                    zip_files.append(Path(root) / f)
 
-# 3. Lập bản đồ tra cứu đa chiều (Hỗ trợ đổi tên '#' -> '+' trên Kaggle)
-file_map = {}
-for p in all_npy_files:
-    fname = p.name
-    full_path = str(p.resolve())
-    file_map[fname] = full_path
-    
-    # Kaggle không cho phép ký tự '#' nên đổi thành '+'
-    if '+' in fname:
-        file_map[fname.replace('+', '#')] = full_path
-    if '#' in fname:
-        file_map[fname.replace('#', '+')] = full_path
-    if '_' in fname and ('+' in fname or '#' in fname):
-        file_map[fname.replace('+', '_').replace('#', '_')] = full_path
+    if zip_files:
+        extract_dir = WORK / "extracted_features"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        print(f"📦 Tìm thấy {len(zip_files)} file zip. Đang kiểm tra giải nén...")
+        for zf in zip_files:
+            dest = extract_dir / zf.stem
+            if not dest.exists() or not any(dest.iterdir()):
+                dest.mkdir(parents=True, exist_ok=True)
+                print(f"  Unzipping {zf.name} -> {dest.name}...")
+                with zipfile.ZipFile(zf, 'r') as archive:
+                    archive.extractall(dest)
 
+    # 2. Quét nhanh tất cả các file .npy trong một lượt os.walk siêu tốc (bỏ qua .git, cache, checkpoints)
+    file_map = {}
+    search_roots = [INPUT, WORK]
+    total_npy = 0
+    for s_root in search_roots:
+        if not s_root.exists():
+            continue
+        for root, dirs, files in os.walk(s_root):
+            # Lọc bỏ thư mục rác để tránh duyệt hàng nghìn git objects
+            dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', '.ipynb_checkpoints', '.cache', 'checkpoint', 'checkpoints', 'runs'}]
+            for fname in files:
+                if fname.endswith(".npy"):
+                    total_npy += 1
+                    full_path = os.path.join(root, fname)
+                    file_map[fname] = full_path
+                    if '+' in fname:
+                        file_map[fname.replace('+', '#')] = full_path
+                    if '#' in fname:
+                        file_map[fname.replace('#', '+')] = full_path
+                    if '_' in fname and ('+' in fname or '#' in fname):
+                        file_map[fname.replace('+', '_').replace('#', '_')] = full_path
 
-def sync_csv_list(dataset_name, csv_rel_path, output_name):
-    \"\"\"Đồng bộ đường dẫn CSV gốc sang đường dẫn thực tế trên Kaggle.\"\"\"
-    input_csv = REPO_DIR / csv_rel_path
-    output_csv = ARTIFACTS / output_name
-    
-    if not input_csv.exists():
-        raise FileNotFoundError(f"Không tìm thấy file danh sách mẫu: {input_csv}")
+    print(f"📡 Radar phát hiện tổng cộng {total_npy} tệp tin .npy trên hệ thống!")
+
+    def sync_csv_list(dataset_name, csv_rel_path, output_name):
+        \"\"\"Đồng bộ đường dẫn CSV gốc sang đường dẫn thực tế trên Kaggle.\"\"\"
+        input_csv = REPO_DIR / csv_rel_path
+        output_csv = ARTIFACTS / output_name
         
-    df = pd.read_csv(input_csv)
-    resolved_paths = []
-    missing_files = []
-    
-    for orig_path in df['path'].astype(str):
-        base_name = Path(orig_path).name
-        
-        # Danh sách các biến thể tên khả dĩ
-        candidates = [
-            base_name,
-            base_name.replace('#', '+'),
-            base_name.replace('+', '#'),
-            base_name.replace('#', '_'),
-            base_name.replace('#', '')
-        ]
-        
-        match = None
-        for cand in candidates:
-            if cand in file_map:
-                match = file_map[cand]
-                break
-                
-        if match:
-            resolved_paths.append(match)
-        else:
-            missing_files.append(base_name)
-            resolved_paths.append(orig_path)
+        if not input_csv.exists():
+            raise FileNotFoundError(f"Không tìm thấy file danh sách mẫu: {input_csv}")
             
-    if missing_files:
-        print(f"⚠️ Cảnh báo: Thiếu {len(missing_files)}/{len(df)} files cho {output_name}. Ví dụ: {missing_files[:3]}")
-    else:
-        print(f"✅ Đồng bộ 100% {len(df)} file cho {output_name} thành công!")
+        df = pd.read_csv(input_csv)
+        resolved_paths = []
+        missing_files = []
         
-    df['path'] = resolved_paths
-    df.to_csv(output_csv, index=False)
-    return output_csv
+        for orig_path in df['path'].astype(str):
+            base_name = Path(orig_path).name
+            
+            candidates = [
+                base_name,
+                base_name.replace('#', '+'),
+                base_name.replace('+', '#'),
+                base_name.replace('#', '_'),
+                base_name.replace('#', '')
+            ]
+            
+            match = None
+            for cand in candidates:
+                if cand in file_map:
+                    match = file_map[cand]
+                    break
+                    
+            if match:
+                resolved_paths.append(match)
+            else:
+                missing_files.append(base_name)
+                resolved_paths.append(orig_path)
+                
+        if missing_files:
+            print(f"⚠️ Cảnh báo: Thiếu {len(missing_files)}/{len(df)} files cho {output_name}. Ví dụ: {missing_files[:3]}")
+        else:
+            print(f"✅ Đồng bộ 100% {len(df)} file cho {output_name} thành công!")
+            
+        df['path'] = resolved_paths
+        df.to_csv(output_csv, index=False)
+        return output_csv
 
-# Đồng bộ danh sách cho cả 2 tập dữ liệu
-ucf_train_csv = sync_csv_list("ucf", "list/ucf_CLIP_rgb.csv", "ucf_train.csv")
-ucf_test_csv = sync_csv_list("ucf", "list/ucf_CLIP_rgbtest.csv", "ucf_test.csv")
-xd_train_csv = sync_csv_list("xd", "list/xd_CLIP_rgb.csv", "xd_train.csv")
-xd_test_csv = sync_csv_list("xd", "list/xd_CLIP_rgbtest.csv", "xd_test.csv")
+    # Đồng bộ danh sách cho cả 2 tập dữ liệu
+    ucf_train_csv = sync_csv_list("ucf", "list/ucf_CLIP_rgb.csv", "ucf_train.csv")
+    ucf_test_csv = sync_csv_list("ucf", "list/ucf_CLIP_rgbtest.csv", "ucf_test.csv")
+    xd_train_csv = sync_csv_list("xd", "list/xd_CLIP_rgb.csv", "xd_train.csv")
+    xd_test_csv = sync_csv_list("xd", "list/xd_CLIP_rgbtest.csv", "xd_test.csv")
 
-# Kiểm tra thử nghiệm 1 file bất kỳ
-sample_p = Path(pd.read_csv(ucf_train_csv).iloc[0]['path'])
-if sample_p.exists():
-    sample_feat = np.load(sample_p, mmap_mode='r')
-    print(f"\\n🎯 Feature Preflight Test: {sample_p.name} | Shape: {sample_feat.shape}")
+    # Kiểm tra thử nghiệm 1 file bất kỳ
+    sample_p = Path(pd.read_csv(ucf_train_csv).iloc[0]['path'])
+    if sample_p.exists():
+        sample_feat = np.load(sample_p, mmap_mode='r')
+        print(f"\\n🎯 Feature Preflight Test: {sample_p.name} | Shape: {sample_feat.shape}")
 """))
 
     # ---------------------------------------------------------
