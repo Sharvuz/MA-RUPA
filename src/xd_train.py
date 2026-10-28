@@ -21,6 +21,7 @@ from utils.tools import get_batch_label, get_prompt_text, xd_collate_fn, xd_test
 from utils.losses import (
     get_curriculum_omega,
     compute_maf_mil_loss,
+    compute_ahns_loss,
     compute_temporal_tv_loss,
     compute_at_bce_topk_mil_loss,
     compute_topk_mil_loss,
@@ -330,11 +331,14 @@ def train(args):
             k_min = getattr(args, 'k_min', 16)
             k_max = getattr(args, 'k_max', 64)
             m_gamma = getattr(args, 'margin_gamma', 0.25)
+            g_min = getattr(args, 'gamma_min', 0.15)
+            g_max = getattr(args, 'gamma_max', 0.30)
             f_alpha = getattr(args, 'focal_alpha', 2.0)
             l_mar = getattr(args, 'lambda_mar', 0.50)
             w_smooth = getattr(args, 'lambda_smooth', 0.05)
+            w_ahns = getattr(args, 'lambda_ahns', 0.10)
 
-            # Pillar 1: Margin-Aware Focal MIL (MAF-MIL) with ATS (k expands dynamically from 16 to 64)
+            # Pillar 1: Margin-Aware Focal MIL (MAF-MIL) with ATS and Sigmoid-Annealed Margin
             loss_mil_det = compute_maf_mil_loss(
                 scores=s_det,
                 binary_labels=binary_labels,
@@ -343,6 +347,8 @@ def train(args):
                 k_min=k_min,
                 k_max=k_max,
                 gamma=m_gamma,
+                gamma_min=g_min,
+                gamma_max=g_max,
                 alpha=f_alpha,
                 lambda_mar=l_mar
             )
@@ -357,8 +363,20 @@ def train(args):
                 k_min=k_min,
                 k_max=k_max,
                 gamma=m_gamma,
+                gamma_min=g_min,
+                gamma_max=g_max,
                 alpha=f_alpha,
                 lambda_mar=l_mar
+            )
+
+            # Audio Hard Negative Suppression (AHNS): Suppresses false acoustic activations on normal bags
+            loss_ahns = compute_ahns_loss(
+                scores_aux=s_aux,
+                scores_det=s_det,
+                binary_labels=binary_labels,
+                lengths=lengths_batch,
+                delta_hns=0.20,
+                k_a=16
             )
 
             # Pillar 2: Multi-Class Action Classification on Semantics (CLASM, 6 violence classes)
@@ -388,7 +406,7 @@ def train(args):
             loss_orth = torch.tensor(0.0, device=device)
             loss_gate = torch.tensor(0.0, device=device)
 
-            # Pristine 4-Pillar Master Loss Engine for XD-Violence (Zero RUPA Overheads)
+            # Pristine Master Loss Engine for XD-Violence (MAF-MIL + CLASM + DCSA + TV + Guide + AHNS)
             total_loss = (
                 1.00 * loss_mil_det
                 + 0.30 * loss_mil_aux
@@ -396,6 +414,7 @@ def train(args):
                 + 0.35 * loss_dcs
                 + w_smooth * loss_smooth
                 + w_guide * loss_sem_guide
+                + w_ahns * loss_ahns
             )
 
             optimizer.zero_grad()

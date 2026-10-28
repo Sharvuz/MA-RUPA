@@ -303,11 +303,13 @@ def train(args):
             k_min = getattr(args, 'k_min', 16)
             k_max = getattr(args, 'k_max', 48)
             m_gamma = getattr(args, 'margin_gamma', 0.30)
+            g_min = getattr(args, 'gamma_min', 0.15)
+            g_max = getattr(args, 'gamma_max', 0.35)
             f_alpha = getattr(args, 'focal_alpha', 2.0)
             l_mar = getattr(args, 'lambda_mar', 0.50)
             w_smooth = getattr(args, 'lambda_smooth', 0.08)
 
-            # Pillar 1: Margin-Aware Focal MIL (MAF-MIL) with ATS (k expands dynamically from 16 to 48)
+            # Pillar 1: Margin-Aware Focal MIL (MAF-MIL) with ATS and Sigmoid-Annealed Margin
             loss_mil_det = compute_maf_mil_loss(
                 scores=s_det,
                 binary_labels=binary_labels,
@@ -316,6 +318,8 @@ def train(args):
                 k_min=k_min,
                 k_max=k_max,
                 gamma=m_gamma,
+                gamma_min=g_min,
+                gamma_max=g_max,
                 alpha=f_alpha,
                 lambda_mar=l_mar
             )

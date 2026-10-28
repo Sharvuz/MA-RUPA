@@ -790,21 +790,32 @@ def compute_ogdp_geometry_loss(dnp_dict: dict, device: torch.device = None) -> t
 # ============================================================================
 
 class MarginAwareFocalMILLoss(nn.Module):
-    """Margin-Aware Focal Multiple Instance Learning with Adaptive Temporal Support (ATS).
+    """Margin-Aware Focal MIL Loss with Adaptive Temporal Support (ATS) and Dynamic Margin Annealing.
     
     Solves:
     1. Gradient starvation at loss=0.07 via focal weighting (alpha >= 2.0).
     2. Top-k spike collapse via Adaptive Temporal Support expanding k(e, b) = 16 -> 64.
-    3. Subtle anomaly separation via intra-bag margin ranking (gamma >= 0.25).
+    3. Subtle anomaly separation via sigmoid-annealed intra-bag margin ranking gamma(e).
     """
     def __init__(self, k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
+                 gamma_min: float = 0.15, gamma_max: float = 0.35,
                  alpha: float = 2.0, lambda_mar: float = 0.50):
         super().__init__()
         self.k_min = k_min
         self.k_max = k_max
         self.gamma = gamma
+        self.gamma_min = gamma_min
+        self.gamma_max = gamma_max
         self.alpha = alpha
         self.lambda_mar = lambda_mar
+
+    def compute_gamma(self, epoch: float) -> float:
+        """Sigmoid annealing for intra-bag separation margin: starts at gamma_min, saturates at gamma_max."""
+        if self.gamma_min == self.gamma_max:
+            return self.gamma
+        progress = (float(epoch) - 2.5) * 1.5
+        sig = 1.0 / (1.0 + math.exp(-max(-10.0, min(10.0, progress))))
+        return self.gamma_min + (self.gamma_max - self.gamma_min) * sig
 
     def compute_ats_k(self, scores: torch.Tensor, lengths: torch.Tensor, epoch: float) -> list:
         B = scores.shape[0]
@@ -819,8 +830,8 @@ class MarginAwareFocalMILLoss(nn.Module):
             
             top_k_base = torch.topk(vid_s, k=k_base)[0]
             conf = top_k_base.mean().item()
-            # Confidence lock sigmoid: s_0 = 0.70, beta_t = 8.0
-            sig_t = 1.0 / (1.0 + math.exp(-8.0 * (conf - 0.70)))
+            # Confidence lock sigmoid: s_0 = 0.65, beta_t = 8.0
+            sig_t = 1.0 / (1.0 + math.exp(-8.0 * (conf - 0.65)))
             
             eff_k = int(self.k_min + (self.k_max - self.k_min) * sig_e * sig_t)
             k_clamped = min(max(self.k_min, eff_k), max(1, L // 2))
@@ -831,8 +842,10 @@ class MarginAwareFocalMILLoss(nn.Module):
                 lengths: torch.Tensor = None, epoch: float = 1.0):
         device = scores.device
         B = scores.shape[0]
+        labels_1d = binary_labels.view(-1)
         
         k_list = self.compute_ats_k(scores, lengths, epoch)
+        current_gamma = self.compute_gamma(epoch)
         
         loss_pos_focal = torch.tensor(0.0, device=device)
         loss_pos_margin = torch.tensor(0.0, device=device)
@@ -846,7 +859,7 @@ class MarginAwareFocalMILLoss(nn.Module):
             s = scores[b, :L].squeeze(-1).clamp(1e-6, 1.0 - 1e-6)
             k = k_list[b]
             
-            if binary_labels[b] == 1.0:
+            if labels_1d[b] > 0.5:
                 # Abnormal bag: Sort descending
                 s_sorted, _ = torch.sort(s, descending=True)
                 s_top = s_sorted[:k]
@@ -856,8 +869,8 @@ class MarginAwareFocalMILLoss(nn.Module):
                 focal_w = torch.pow(1.0 - s_top, self.alpha)
                 loss_pos_focal = loss_pos_focal - torch.mean(focal_w * torch.log(s_top + 1e-8))
                 
-                # 2. Intra-bag margin ranking: enforce s_top >= s_bkg.mean() + gamma
-                margin_gap = F.relu(self.gamma - (s_top - s_bkg.mean()))
+                # 2. Annealed intra-bag margin ranking: enforce s_top >= s_bkg.mean() + current_gamma
+                margin_gap = F.relu(current_gamma - (s_top - s_bkg.mean()))
                 loss_pos_margin = loss_pos_margin + torch.mean(margin_gap)
                 n_pos += 1
             else:
@@ -877,11 +890,52 @@ class MarginAwareFocalMILLoss(nn.Module):
 def compute_maf_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
                          lengths: torch.Tensor = None, epoch: float = 1.0,
                          k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
+                         gamma_min: float = 0.15, gamma_max: float = 0.35,
                          alpha: float = 2.0, lambda_mar: float = 0.50) -> torch.Tensor:
-    """Convenience wrapper for Margin-Aware Focal MIL Loss with ATS."""
+    """Convenience wrapper for Margin-Aware Focal MIL Loss with ATS and Annealed Margin."""
     criterion = MarginAwareFocalMILLoss(k_min=k_min, k_max=k_max, gamma=gamma,
+                                        gamma_min=gamma_min, gamma_max=gamma_max,
                                         alpha=alpha, lambda_mar=lambda_mar)
     return criterion(scores, binary_labels, lengths=lengths, epoch=epoch)
+
+
+def compute_ahns_loss(scores_aux: torch.Tensor, scores_det: torch.Tensor,
+                      binary_labels: torch.Tensor, lengths: torch.Tensor = None,
+                      delta_hns: float = 0.20, k_a: int = 16) -> torch.Tensor:
+    """Audio Hard Negative Suppression (AHNS) loss for XD-Violence multimodal training.
+    
+    Suppresses audio false alarms by:
+    1. Penalizing top-k audio anomaly scores on purely Normal bags.
+    2. Penalizing acoustic discordance where audio triggers without any visual grounding on Anomaly bags.
+    """
+    device = scores_aux.device
+    B = scores_aux.shape[0]
+    labels_1d = binary_labels.view(-1)
+    
+    loss_norm = torch.tensor(0.0, device=device)
+    loss_discord = torch.tensor(0.0, device=device)
+    n_norm = 0
+    n_anom = 0
+    
+    for b in range(B):
+        L = int(lengths[b].item()) if lengths is not None else scores_aux.shape[1]
+        s_a = scores_aux[b, :L].squeeze(-1)
+        s_v = scores_det[b, :L].squeeze(-1)
+        
+        if labels_1d[b] <= 0.5:
+            # Normal bag: audio should NOT trigger high scores
+            k_eff = min(k_a, max(1, L // 8))
+            top_a = torch.topk(s_a, k=k_eff)[0]
+            loss_norm = loss_norm + top_a.mean()
+            n_norm += 1
+        else:
+            # Anomaly bag: if audio triggers but visual is quiet, suppress false acoustic correlation
+            gap = F.relu(s_a - s_v.detach() - delta_hns)
+            loss_discord = loss_discord + gap.mean()
+            n_anom += 1
+            
+    total_ahns = (loss_norm / max(1, n_norm)) + (loss_discord / max(1, n_anom))
+    return total_ahns
 
 
 def compute_temporal_tv_loss(scores: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:

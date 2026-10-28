@@ -446,22 +446,24 @@ class MDTBackbone(nn.Module):
 
 
 # ============================================================================
-# 1B. Core Module: Bi-Relational Spatio-Temporal Backbone (BR-STB)
+# 1B. Core Module: Bi-Relational Spatio-Temporal Backbone (BR-STB-v2)
 # ============================================================================
 
 class BiRelationalBlock(nn.Module):
-    """Bi-Relational Spatio-Temporal Graph-Attention Block.
+    """Bi-Relational Spatio-Temporal Graph-Attention Block (BR-STB-v2).
     
     Unifies:
     1. Local continuous temporal distance-decay diffusion prior (A_dist with learnable tau)
     2. Dynamic non-local event similarity graph (A_sim with adaptive statistical threshold)
-    3. Local windowed multi-head self-attention
+    3. Dilated local windowed multi-head self-attention
     """
-    def __init__(self, embed_dim: int = 512, num_heads: int = 4, window_size: int = 8, dropout: float = 0.1):
+    def __init__(self, embed_dim: int = 512, num_heads: int = 4, window_size: int = 8,
+                 dilation: int = 1, dropout: float = 0.1):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.window_size = window_size
+        self.dilation = dilation
 
         # Local Temporal Diffusion Parameters: tau = softplus(tau_param) + 0.10
         self.tau_param = nn.Parameter(torch.tensor(0.70))  # softplus(0.70) ~ 1.10
@@ -479,7 +481,7 @@ class BiRelationalBlock(nn.Module):
             nn.Linear(embed_dim // 2, 1)
         )
 
-        # Local Window Multi-Head Self-Attention
+        # Dilated Window Multi-Head Self-Attention
         self.norm_attn = LayerNormFP32(embed_dim)
         self.mha = nn.MultiheadAttention(
             embed_dim, num_heads, dropout=dropout, batch_first=True
@@ -535,7 +537,8 @@ class BiRelationalBlock(nn.Module):
     def _build_window_mask(self, T: int, device: torch.device) -> torch.Tensor:
         idx = torch.arange(T, device=device)
         dist = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))
-        mask = (dist > (self.window_size // 2)).float()
+        max_span = (self.window_size // 2) * self.dilation
+        mask = (dist > max_span).float()
         return mask.masked_fill(mask == 1, float('-inf'))
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
@@ -562,7 +565,7 @@ class BiRelationalBlock(nn.Module):
         g = torch.sigmoid(self.fusion_gate(gate_in))     # [B, T, 1]
         z_graph = g * z_dist + (1.0 - g) * z_sim
 
-        # 4. Multi-Head Windowed Attention
+        # 4. Dilated Multi-Head Windowed Attention
         attn_in = self.norm_attn(x)
         win_mask = self._build_window_mask(T, device)
         z_attn, _ = self.mha(attn_in, attn_in, attn_in, attn_mask=win_mask)
@@ -578,27 +581,41 @@ class BiRelationalBlock(nn.Module):
 
 
 class BRSTBackbone(nn.Module):
-    """Bi-Relational Spatio-Temporal Backbone (BR-STB).
+    """Hierarchical Bi-Relational Spatio-Temporal Backbone (BR-STB-v2).
     
-    Replaces legacy MDTBackbone with unified temporal diffusion, non-local event affinity
-    graphs, and local window self-attention.
+    Stacks 4 hierarchical multi-scale layers with progressive receptive fields:
+    - Layer 0: Micro-temporal (W=4, d=1) -> explosive local anomalies
+    - Layer 1: Meso-temporal  (W=8, d=2) -> onset actions
+    - Layer 2: Macro-temporal (W=16, d=4) -> sustained anomaly events
+    - Layer 3: Global-context (W=32, d=8) -> long-range video coherence
     """
     def __init__(self, visual_length: int = 256, embed_dim: int = 512,
-                 attn_window: int = 8, visual_layers: int = 2, visual_heads: int = 4,
+                 attn_window: int = 8, visual_layers: int = 4, visual_heads: int = 4,
                  mlp_dropout: float = 0.1):
         super().__init__()
         self.visual_length = visual_length
         self.embed_dim = embed_dim
         self.pos_embed = nn.Parameter(torch.randn(1, visual_length, embed_dim) * 0.02)
-        self.layers = nn.ModuleList([
-            BiRelationalBlock(
-                embed_dim=embed_dim,
-                num_heads=visual_heads,
-                window_size=attn_window,
-                dropout=mlp_dropout
+        
+        base_windows = [4, 8, 16, 32]
+        base_dilations = [1, 2, 4, 8]
+        
+        self.layers = nn.ModuleList()
+        for idx in range(visual_layers):
+            w = base_windows[idx] if idx < len(base_windows) else base_windows[-1]
+            d = base_dilations[idx] if idx < len(base_dilations) else base_dilations[-1]
+            if attn_window != 8 and attn_window > 0:
+                scale_factor = attn_window / 8.0
+                w = max(4, int(w * scale_factor))
+            self.layers.append(
+                BiRelationalBlock(
+                    embed_dim=embed_dim,
+                    num_heads=visual_heads,
+                    window_size=w,
+                    dilation=d,
+                    dropout=mlp_dropout
+                )
             )
-            for _ in range(visual_layers)
-        ])
         self.mlp_det = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             QuickGELU(),
@@ -624,11 +641,14 @@ class BRSTBackbone(nn.Module):
         return f_base, s_det, logits_det
 
 
-class NoiseGatedAVFusion(nn.Module):
-    """Noise-Gated Acoustic-Visual Fusion with Reliability Gating.
+class BiDirectionalNoiseGatedAVFusion(nn.Module):
+    """Bi-Directional Noise-Gated Acoustic-Visual Fusion with Anti-Collapse Floor.
     
-    Suppresses acoustic noise on multimodal streams (XD-Violence) while protecting
-    the visual anchor. Initialized to suppress 90% of early audio noise.
+    Features:
+    1. Two-way cross-attention: Visual attends to Audio (V -> A) and Audio attends to Visual (A -> V).
+    2. Dynamic Acoustic Reliability Gate with floor (g_min = 0.02) and bias init -2.2 (~10% pass-through).
+    3. Anti-collapse guarantee: Audio branch gradients are never completely zeroed out.
+    4. Audio Auxiliary Classification Head for multimodal MIL training.
     """
     def __init__(self, visual_dim: int = 512, audio_dim: int = 128, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -643,12 +663,18 @@ class NoiseGatedAVFusion(nn.Module):
             nn.Linear(visual_dim, visual_dim),
             LayerNormFP32(visual_dim)
         )
+        self.norm_v = LayerNormFP32(visual_dim)
+        self.norm_a = LayerNormFP32(visual_dim)
 
-        # Cross-Attention (Visual Query, Audio Key/Value)
-        self.cross_attn = nn.MultiheadAttention(
+        # Bi-Directional Cross-Attention: V -> A and A -> V
+        self.cross_v2a = nn.MultiheadAttention(
             visual_dim, num_heads, dropout=dropout, batch_first=True
         )
-        self.norm_cross = LayerNormFP32(visual_dim)
+        self.cross_a2v = nn.MultiheadAttention(
+            visual_dim, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm_cross_v = LayerNormFP32(visual_dim)
+        self.norm_cross_a = LayerNormFP32(visual_dim)
 
         # Audio Auxiliary Classification Head
         self.aux_classifier = nn.Sequential(
@@ -658,8 +684,7 @@ class NoiseGatedAVFusion(nn.Module):
             nn.Linear(visual_dim // 2, 1)
         )
 
-        # Dynamic Acoustic Reliability Gate: Initialized to sigmoid(-2.2) ~ 0.10
-        # Inputs: [f_base, h_a, |f_base - h_a|, 1 - discordance] -> dim = 512*3 + 1
+        # Dynamic Acoustic Reliability Gate with floor
         self.gate_mlp = nn.Sequential(
             nn.Linear(visual_dim * 3 + 1, visual_dim // 4),
             QuickGELU(),
@@ -681,25 +706,38 @@ class NoiseGatedAVFusion(nn.Module):
 
         h_a = self.audio_proj(audio_aligned)  # [B, T, 512]
 
-        # Auxiliary score from audio stream
-        logits_aux = self.aux_classifier(h_a)
-        s_aux = torch.sigmoid(logits_aux)
+        v_norm = self.norm_v(f_base)
+        a_norm = self.norm_a(h_a)
 
-        # Cross-Attention (Visual attends to Audio)
-        attn_out, _ = self.cross_attn(query=f_base, key=h_a, value=h_a)
-        attn_out = torch.nan_to_num(attn_out, nan=0.0)
+        # 1. Visual attends to Audio: what acoustic signals support visual evidence?
+        v_aud, _ = self.cross_v2a(query=v_norm, key=a_norm, value=a_norm)
+        v_aud = torch.nan_to_num(v_aud, nan=0.0)
+
+        # 2. Audio attends to Visual: visual context cleans and refines raw acoustic signal
+        a_vis, _ = self.cross_a2v(query=a_norm, key=v_norm, value=v_norm)
+        a_vis = torch.nan_to_num(a_vis, nan=0.0)
+
+        # Auxiliary score from refined audio stream
+        h_aux = self.norm_cross_a(a_norm + a_vis)
+        logits_aux = self.aux_classifier(h_aux)
+        s_aux = torch.sigmoid(logits_aux)
 
         # Discordance between visual and audio: d_va = |S_det - S_aux|
         discord = torch.abs(s_det.detach() - s_aux.detach())  # [B, T, 1]
         consistency = 1.0 - discord
 
-        # Reliability Gate
+        # Reliability Gate with Anti-Collapse Floor: g_eff = 0.02 + 0.98 * g_raw
         gate_in = torch.cat([f_base, h_a, torch.abs(f_base - h_a), consistency], dim=-1)
-        g_audio = torch.sigmoid(self.gate_mlp(gate_in))  # [B, T, 1]
+        g_raw = torch.sigmoid(self.gate_mlp(gate_in))  # [B, T, 1]
+        g_audio = 0.02 + 0.98 * g_raw  # Never collapses to absolute zero
 
         # Protected Residual Fusion
-        f_fused = f_base + g_audio * self.norm_cross(attn_out)
+        f_fused = f_base + g_audio * self.norm_cross_v(v_aud)
         return f_fused, s_aux, logits_aux, g_audio
+
+
+# Alias for backward compatibility
+NoiseGatedAVFusion = BiDirectionalNoiseGatedAVFusion
 
 
 # ============================================================================
