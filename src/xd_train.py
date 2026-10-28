@@ -49,9 +49,9 @@ def train(args):
         pass
 
     # Enforce 20-epoch DPSS schedule for XD-Violence
-    if getattr(args, 'max_epoch', 20) > 20:
-        print(f"[Auto-Config] Setting --max-epoch {args.max_epoch} -> 20 epochs (DPSS 20-epoch schedule).", flush=True)
-        args.max_epoch = 20
+    if getattr(args, 'max_epoch', 25) > 40:
+        print(f"[Auto-Config] Setting --max-epoch {args.max_epoch} -> 40 epochs ceiling.", flush=True)
+        args.max_epoch = 40
     if getattr(args, 'lr', 1.5e-5) > 2.2e-5:
         print(f"[Auto-Config] Stabilizing XD-Violence --lr {args.lr} -> 1.5e-5 to prevent Epoch 4 catastrophic forgetting.", flush=True)
         args.lr = 1.5e-5

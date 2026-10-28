@@ -49,9 +49,9 @@ def train(args):
         pass
 
     # Enforce 15-epoch DPSS schedule for UCF-Crime
-    if getattr(args, 'max_epoch', 15) > 15:
-        print(f"[Auto-Config] Setting --max-epoch {args.max_epoch} -> 15 epochs (DPSS 15-epoch schedule).", flush=True)
-        args.max_epoch = 15
+    if getattr(args, 'max_epoch', 25) > 40:
+        print(f"[Auto-Config] Setting --max-epoch {args.max_epoch} -> 40 epochs ceiling.", flush=True)
+        args.max_epoch = 40
     if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
         args.curriculum_epochs = 3.0
     if getattr(args, 'max_omega', 0.20) > 0.25:
