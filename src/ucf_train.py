@@ -22,6 +22,8 @@ from utils.losses import (
     get_curriculum_omega,
     compute_maf_mil_loss,
     compute_temporal_tv_loss,
+    compute_epts_loss,
+    compute_text_separation_loss,
     compute_at_bce_topk_mil_loss,
     compute_topk_mil_loss,
     compute_dats_mil_loss,
@@ -342,10 +344,10 @@ def train(args):
                 labels=one_hot_labels,
                 lengths=lengths_batch,
                 device=device,
-                k_ratio=topk_r_clasm,
+                k_ratio=16,
                 epsilon=0.02,
                 is_training=True,
-                peak_drop_prob=0.15
+                peak_drop_prob=0.0
             )
 
             # Pillar 3: Decoupled Contrastive Alignment (DCSA = Event + Background)
@@ -353,25 +355,34 @@ def train(args):
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dcs = loss_event + loss_bkg
 
-            # Pillar 4: L1 Total Variation Smoothness (0.0 disables peak clipping)
+            # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency & Compactness
+            loss_consistency = F.mse_loss(s_det, dnp_dict['reconstruction_scores'])
+            loss_compact = dnp_dict.get('l_compact', torch.tensor(0.0, device=device))
+
+            # Pillar 5: Edge-Preserving Temporal Sharpening (EPTS - Zero Peak Clipping)
             if w_smooth > 0.0:
-                loss_smooth = compute_temporal_tv_loss(s_det, lengths_batch)
+                loss_smooth = compute_epts_loss(s_det, lengths_batch)
             else:
                 loss_smooth = torch.tensor(0.0, device=device)
 
+            # Pillar 6: Text Orthogonality Separation Loss (L_sep, AAAI-26 Eq. 6)
+            loss_sep = compute_text_separation_loss(text_features)
+
             # Backward-compatible dummy logs
             loss_tasl = torch.tensor(0.0, device=device)
-            loss_consistency = torch.tensor(0.0, device=device)
             loss_gather = torch.tensor(0.0, device=device)
             loss_orth = torch.tensor(0.0, device=device)
             loss_gate = torch.tensor(0.0, device=device)
             loss_geo = torch.tensor(0.0, device=device)
 
-            # Pristine 4-Pillar Master Loss Engine (Zero RUPA Overheads)
+            # SOTA Master Loss Engine: ASPM + EPTS + Clean MIL + DCSA + L_sep
             total_loss = (
                 1.00 * loss_mil_det
-                + 1.00 * loss_clasm
+                + 1.10 * loss_clasm
+                + 0.50 * loss_consistency
+                + 0.10 * loss_compact
                 + 0.20 * loss_dcs
+                + 0.20 * loss_sep
                 + w_smooth * loss_smooth
                 + w_guide * loss_sem_guide
             )
@@ -421,8 +432,9 @@ def train(args):
             if (step_idx + 1) % log_interval == 0 or (step_idx + 1) == iters_per_epoch:
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
-                      f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
-                      f"CLASM: {loss_clasm.item():.4f} | Guide: {(w_guide * loss_sem_guide).item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} | "
+                      f"CLASM: {loss_clasm.item():.4f} | ASPM: {loss_consistency.item():.4f} | "
+                      f"Sep: {loss_sep.item():.4f} | EPTS: {loss_smooth.item():.4f} | DCSA: {loss_dcs.item():.4f}", flush=True)
 
             # Mid-Epoch Evaluation & Peak-Catching (SOTA Benchmark Standard: every 20 iters / 1280 samples)
             eval_interval_raw = getattr(args, 'eval_interval', 20)

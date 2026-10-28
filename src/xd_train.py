@@ -23,6 +23,8 @@ from utils.losses import (
     compute_maf_mil_loss,
     compute_ahns_loss,
     compute_temporal_tv_loss,
+    compute_epts_loss,
+    compute_text_separation_loss,
     compute_at_bce_topk_mil_loss,
     compute_topk_mil_loss,
     compute_dats_mil_loss,
@@ -395,10 +397,10 @@ def train(args):
                 labels=one_hot_labels,
                 lengths=lengths_batch,
                 device=device,
-                k_ratio=topk_r_clasm,
+                k_ratio=16,
                 epsilon=0.02,
                 is_training=True,
-                peak_drop_prob=0.15
+                peak_drop_prob=0.0
             )
 
             # Pillar 3: Decoupled Contrastive Alignment (DCSA = Event + Background)
@@ -406,25 +408,34 @@ def train(args):
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dcs = loss_event + loss_bkg
 
-            # Pillar 4: L1 Total Variation Smoothness (0.0 disables peak clipping)
+            # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency & Compactness
+            loss_consistency = F.mse_loss(s_det, dnp_dict['reconstruction_scores'])
+            loss_compact = dnp_dict.get('l_compact', torch.tensor(0.0, device=device))
+
+            # Pillar 5: Edge-Preserving Temporal Sharpening (EPTS - Zero Peak Clipping)
             if w_smooth > 0.0:
-                loss_smooth = compute_temporal_tv_loss(s_det, lengths_batch)
+                loss_smooth = compute_epts_loss(s_det, lengths_batch)
             else:
                 loss_smooth = torch.tensor(0.0, device=device)
 
+            # Pillar 6: Text Orthogonality Separation Loss (L_sep, AAAI-26 Eq. 6)
+            loss_sep = compute_text_separation_loss(text_features)
+
             loss_tasl = torch.tensor(0.0, device=device)
             loss_geo = torch.tensor(0.0, device=device)
-            loss_consistency = torch.tensor(0.0, device=device)
             loss_gather = torch.tensor(0.0, device=device)
             loss_orth = torch.tensor(0.0, device=device)
             loss_gate = torch.tensor(0.0, device=device)
 
-            # Pristine Master Loss Engine for XD-Violence (MAF-MIL + CLASM + DCSA + TV + Guide + AHNS)
+            # SOTA Master Loss Engine for XD-Violence (MAF-MIL + CLASM + ASPM + DCSA + EPTS + L_sep + AHNS)
             total_loss = (
                 1.00 * loss_mil_det
                 + 0.30 * loss_mil_aux
-                + 0.80 * loss_clasm
+                + 1.00 * loss_clasm
+                + 0.40 * loss_consistency
+                + 0.10 * loss_compact
                 + 0.30 * loss_dcs
+                + 0.20 * loss_sep
                 + w_smooth * loss_smooth
                 + w_guide * loss_sem_guide
                 + w_ahns * loss_ahns

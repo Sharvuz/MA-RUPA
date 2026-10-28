@@ -456,10 +456,10 @@ def compute_clasm_loss(logits: torch.Tensor,
                        labels: torch.Tensor,
                        lengths: torch.Tensor,
                        device: torch.device = None,
-                       k_ratio: int = 10,
+                       k_ratio: int = 16,
                        epsilon: float = 0.02,
                        is_training: bool = False,
-                       peak_drop_prob: float = 0.20) -> torch.Tensor:
+                       peak_drop_prob: float = 0.0) -> torch.Tensor:
     """Snippet-level multi-class MIL cross-entropy loss against fine-grained categories,
     with optional Stochastic Peak Erasure on Abnormal bags to prevent 1-frame memorization.
     """
@@ -967,5 +967,52 @@ def compute_temporal_tv_loss(scores: torch.Tensor, lengths: torch.Tensor = None)
         diff = diff * mask.float()
         return diff.sum() / mask.float().sum().clamp_min(1.0)
     return diff.mean()
+
+
+def compute_epts_loss(scores: torch.Tensor, lengths: torch.Tensor = None, eps: float = 0.01) -> torch.Tensor:
+    """Edge-Preserving Temporal Sharpening (EPTS) Loss (Breakthrough 2).
+    
+    Replaces destructive isotropic TV loss with Charbonnier penalty:
+    psi_eps(x) = sqrt(x^2 + eps^2) - eps
+    Combined with Boundary Gating Signal:
+    g_t = exp(- (s_{t+1} - s_t)^2 / (2 * sigma_g^2))
+    
+    At explosive anomaly boundaries (|delta_s| is large), g_t -> 0,
+    completely shutting off the smoothness penalty and preserving sharp crime spikes!
+    At normal background segments (|delta_s| is small), g_t -> 1,
+    providing gentle, smooth regularization.
+    """
+    if scores.dim() == 3:
+        scores = scores.squeeze(-1)
+    B, T = scores.shape
+    loss_list = []
+    for i in range(B):
+        l_i = int(lengths[i].item()) if lengths is not None else T
+        if l_i <= 2:
+            continue
+        s_i = scores[i, :l_i]
+        delta_s = s_i[1:] - s_i[:-1]
+        charb = torch.sqrt(delta_s ** 2 + eps ** 2) - eps
+        sigma_g = torch.median(torch.abs(delta_s.detach())) + 1e-4
+        g_t = torch.exp(- (delta_s.detach() ** 2) / (2.0 * sigma_g ** 2 + 1e-6))
+        loss_i = torch.mean(g_t * charb)
+        loss_list.append(loss_i)
+    if not loss_list:
+        return torch.tensor(0.0, device=scores.device)
+    return torch.stack(loss_list).mean()
+
+
+def compute_text_separation_loss(text_features: torch.Tensor) -> torch.Tensor:
+    """Text Orthogonality Separation Loss (L_sep, AAAI-26 Eq. 6).
+    
+    Forces the Normal text embedding t_0 to be strictly orthogonal to all anomaly category embeddings.
+    L_sep = (1 / (C-1)) * sum_{a=1}^{C-1} |t_0^T t_a| / (||t_0|| * ||t_a||)
+    """
+    t_norm = F.normalize(text_features, dim=-1)
+    t0 = t_norm[0]
+    ta = t_norm[1:]
+    dot_prods = torch.abs(torch.matmul(ta, t0))
+    return dot_prods.mean()
+
 
 

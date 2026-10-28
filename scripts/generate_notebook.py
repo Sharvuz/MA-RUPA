@@ -296,8 +296,8 @@ import subprocess, sys
 subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
-UCF_BATCH_SIZE = 32
-UCF_EPOCHS = 10  # Full 10-epoch schedule (500 iters/epoch -> 5,000 gradient steps SOTA)
+UCF_BATCH_SIZE = 64
+UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps SOTA)
 UCF_LR = 7e-5
 SEED = 234
 
@@ -323,10 +323,10 @@ cmd_train_ucf = [
     "--gamma-max", "0.35",
     "--focal-alpha", "0.0",                  # Pure top-k BCE prevents loss collapse
     "--lambda-mar", "0.20",
-    "--lambda-smooth", "0.0",                # ZERO TV Loss: Eliminates peak clipping on explosive anomalies!
-    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (16,000 samples/epoch, 500 iters/epoch)
-    "--eval-interval", "25",                  # Mid-epoch test & peak-catching every 25 iters
-    "--snippet-dropout", "0.10",
+    "--lambda-smooth", "0.05",               # EPTS: Edge-Preserving Temporal Sharpening with Boundary Gating
+    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (16,000 samples/epoch, 250 iters/epoch)
+    "--eval-interval", "20",                 # Mid-epoch test & peak-catching every 20 iters (1280 samples)
+    "--snippet-dropout", "0.0",
     "--weight-decay", "1e-5",                # Optimal weight decay (1e-5 prevents weight suppression)
     "--attn-window", "8",                    # BR-STB: Window size W=8 for local graph attention
     "--seed", str(SEED),
@@ -394,9 +394,9 @@ import subprocess, sys
 subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
-XD_BATCH_SIZE = 64
+XD_BATCH_SIZE = 96
 XD_EPOCHS = 10  # 10-epoch schedule with mid-epoch peak-catching
-XD_LR = 8e-5
+XD_LR = 1e-5
 SEED = 234
 
 xd_model_path = ARTIFACTS / "model_xd_best.pth"
@@ -423,10 +423,10 @@ cmd_train_xd = [
     "--lambda-ahns", "0.10",
     "--focal-alpha", "0.0",                  # Pure top-k BCE prevents loss collapse
     "--lambda-mar", "0.20",
-    "--lambda-smooth", "0.0",                 # ZERO TV Loss: Eliminates peak clipping!
+    "--lambda-smooth", "0.05",               # EPTS: Edge-Preserving Temporal Sharpening with Boundary Gating
     "--sample-one-crop-per-video", "False",  # Full 10 crops per video (~593 iters/epoch)
-    "--eval-interval", "30",                  # Mid-epoch test & peak-catching every 30 iters
-    "--snippet-dropout", "0.10",
+    "--eval-interval", "20",                 # Mid-epoch test & peak-catching every 20 iters
+    "--snippet-dropout", "0.0",
     "--weight-decay", "1e-5",                # Optimal weight decay (1e-5 prevents weight suppression)
     "--attn-window", "64",                   # BR-STB: Window size W=64 for local graph attention
     "--seed", str(SEED),

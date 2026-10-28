@@ -52,7 +52,7 @@ parser.add_argument('--no-audio', action='store_true', default=False, help='Abla
 parser.add_argument('--no-rupa', action='store_true', default=False, help='Ablation: disable RUPA prototype reconstruction branch')
 parser.add_argument('--no-safegate', action='store_true', default=False, help='Ablation: disable dynamic uncertainty Safe Gate')
 parser.add_argument('--use-aspm', default=True, type=str2bool, help='MA-RUPA v2: enable Soft-Masked Adaptive Stiefel Prototype Manifold (SM-ASPM)')
-parser.add_argument('--aspm-max-rank', default=48, type=int, help='MA-RUPA v2: maximum adaptive Stiefel subspace rank M_max (default 48)')
+parser.add_argument('--aspm-max-rank', default=64, type=int, help='MA-RUPA v2: maximum adaptive Stiefel subspace rank M_max (default 64)')
 parser.add_argument('--use-epts', default=True, type=str2bool, help='MA-RUPA v2: enable Semantic-Affinity Edge-Preserving Temporal Sharpness & Peak Erasure')
 parser.add_argument('--use-tasl', default=True, type=str2bool, help='MA-RUPA v2: enable CLIP-Text-Anchored Semantic Audio Lifting (TASL)')
 parser.add_argument('--use-pcgrad', default=True, type=str2bool, help='MA-RUPA v2: enable Per-Snippet Multi-Objective PCGrad Junctions')
@@ -67,8 +67,8 @@ parser.add_argument('--routing-aux-weight', default=0.08, type=float, help='Prio
 
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for full dataset SOTA schedule ~5930 gradient steps)')
-parser.add_argument('--batch-size', default=64, type=int, help='Batch size for training (32 normal + 32 anomaly)')
-parser.add_argument('--lr', type=float, default=8e-5, help='Learning rate for End-to-End AdamW optimizer (default 8e-5 for 4-layer BR-STB multimodal)')
+parser.add_argument('--batch-size', default=96, type=int, help='Batch size for training (48 normal + 48 anomaly)')
+parser.add_argument('--lr', type=float, default=1e-5, help='Learning rate for End-to-End AdamW optimizer (default 1e-5 for XD-Violence SOTA)')
 parser.add_argument('--weight-decay', type=float, default=1e-5, help='Weight decay for regularization (default 1e-5)')
 parser.add_argument('--k-min', type=int, default=8, help='Minimum top-k snippets for ATS MAF-MIL (default 8)')
 parser.add_argument('--k-max', type=int, default=20, help='Maximum top-k snippets for ATS MAF-MIL (default 20)')
@@ -94,7 +94,7 @@ parser.add_argument('--lambda-ohnm', default=0.2, type=float, help='Online hard 
 parser.add_argument('--lambda-aux', type=float, default=0.18, help='Weight for auxiliary multimodal MIL loss (default 0.18)')
 parser.add_argument('--lambda-tasl', type=float, default=0.25, help='Weight for TASL audio-visual semantic alignment loss (default 0.25)')
 parser.add_argument('--lambda-ahns', type=float, default=0.10, help='Weight for Audio Hard Negative Suppression (AHNS) loss (default 0.10)')
-parser.add_argument('--lambda-smooth', type=float, default=0.0, help='Weight for Total Variation temporal smoothness loss (default 0.0 to prevent peak clipping)')
+parser.add_argument('--lambda-smooth', type=float, default=0.05, help='Weight for EPTS edge-preserving temporal smoothness loss (default 0.05)')
 parser.add_argument('--lambda-orth', type=float, default=0.05, help='Weight for active-slot prototype orthogonality & repulsion loss (default 0.05)')
 parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight for DNP subspace gather loss (default 0.12)')
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')

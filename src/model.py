@@ -1197,8 +1197,81 @@ class ModalityAdaptiveBranch(nn.Module):
 
 
 # ============================================================================
-# 3. Core Module 3: GradientSafeRUPA (with SM-ASPM v2)
+# 3. Core Module 3: Adaptive Stiefel Prototype Manifold (ASPM)
 # ============================================================================
+
+class AdaptiveStiefelPrototypeManifold(nn.Module):
+    """Adaptive Stiefel Prototype Manifold (ASPM) for Normality Subspace Modeling.
+    
+    Operates on the Stiefel Manifold St(M_e, D).
+    Rank M_e expands smoothly across epochs: M_0=16 -> 24 -> 36 -> 48 -> 64.
+    Reconstruction: F_rec = (F_video @ U_norm^T) @ U_norm in [B, T, D]
+    Residual: R = F_video - F_rec in [B, T, D] (pure anomaly component)
+    Reconstruction Anomaly Score: S_rec = (1.0 - cosine_similarity(F_video, F_rec)) / 2.0
+    Complexity: O(M_e * T * D) with pure torch.matmul (zero heavy decoder layers).
+    """
+    def __init__(self, embed_dim: int = 512, max_rank: int = 64, min_rank: int = 16):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_rank = max_rank
+        self.min_rank = min_rank
+        self.u_raw = nn.Parameter(torch.empty(max_rank, embed_dim))
+        nn.init.orthogonal_(self.u_raw)
+        self.register_buffer('epoch_buf', torch.tensor(1.0, dtype=torch.float32), persistent=True)
+
+    def set_epoch(self, epoch: float):
+        self.epoch_buf.fill_(float(epoch))
+
+    def get_current_rank(self) -> int:
+        e = float(self.epoch_buf.item())
+        ratio = 1.0 / (1.0 + math.exp(-1.5 * (e - 3.0)))
+        rank = int(self.min_rank + (self.max_rank - self.min_rank) * ratio)
+        return max(self.min_rank, min(self.max_rank, rank))
+
+    def get_stiefel_basis(self) -> torch.Tensor:
+        """Returns orthonormal basis U_norm in St(M_e, D) via QR retraction."""
+        m_e = self.get_current_rank()
+        u_sub = self.u_raw[:m_e]  # [M_e, D]
+        q, _ = torch.linalg.qr(u_sub.t(), mode='reduced')  # [D, M_e]
+        return q.t()  # [M_e, D]
+
+    def forward(self, f_video: torch.Tensor, s_det: torch.Tensor = None):
+        """
+        Args:
+            f_video: [B, T, D] fused video features
+            s_det: [B, T, 1] initial detector scores
+        Returns:
+            f_rec: [B, T, D] reconstructed normal component
+            r_anom: [B, T, D] orthogonal residual
+            s_rec: [B, T, 1] reconstruction anomaly score
+            l_compact: compactness penalty on bottom-M candidate normal frames
+        """
+        B, T, D = f_video.shape
+        u_norm = self.get_stiefel_basis().to(f_video.dtype)  # [M_e, D]
+
+        # Orthogonal projection: F_rec = (F_video @ U^T) @ U
+        proj = torch.matmul(f_video, u_norm.t())  # [B, T, M_e]
+        f_rec = torch.matmul(proj, u_norm)        # [B, T, D]
+        r_anom = f_video - f_rec
+
+        # Cosine distance reconstruction error normalized to [0, 1]
+        sim = F.cosine_similarity(f_video, f_rec + 1e-7, dim=-1).unsqueeze(-1)
+        s_rec = ((1.0 - sim) / 2.0).clamp(0.0, 1.0)
+
+        # Compactness loss on candidate normal frames (bottom 70% lowest scoring frames)
+        if s_det is not None and T > 4:
+            k_norm = max(1, int(T * 0.70))
+            _, norm_idx = torch.topk(s_det.squeeze(-1), k=k_norm, largest=False, dim=-1)
+            batch_idx = torch.arange(B, device=f_video.device).unsqueeze(1).expand(-1, k_norm)
+            f_norm_cand = f_video[batch_idx, norm_idx]  # [B, k_norm, D]
+            p_n = torch.matmul(f_norm_cand, u_norm.t())
+            rec_n = torch.matmul(p_n, u_norm)
+            l_compact = F.mse_loss(rec_n, f_norm_cand)
+        else:
+            l_compact = torch.tensor(0.0, device=f_video.device)
+
+        return f_rec, r_anom, s_rec, l_compact
+
 
 class GradientSafeRUPA(nn.Module):
     """Soft-Masked Adaptive Stiefel Prototype Manifold (SM-ASPM) RUPA Module.
@@ -1976,8 +2049,13 @@ class MARUPA(nn.Module):
             use_pcgrad=self.use_pcgrad
         )
 
-        # 3. Core Module 3: GradientSafeRUPA (Permanently pruned for pure zero-start SOTA)
-        self.rupa = None
+        # 3. Core Module 3: Adaptive Stiefel Prototype Manifold (ASPM)
+        self.aspm = AdaptiveStiefelPrototypeManifold(
+            embed_dim=visual_width,
+            max_rank=getattr(args, 'aspm_max_rank', 64),
+            min_rank=16
+        )
+        self.rupa = self.aspm
 
         # 4. Core Module 4: QuadSafeGate
         prior_weights = None
@@ -2124,8 +2202,10 @@ class MARUPA(nn.Module):
             self._text_features_cache = text_features
         return text_features
 
-    def set_epoch(self, epoch_idx: int):
+    def set_epoch(self, epoch_idx: float):
         self.current_epoch = epoch_idx
+        if hasattr(self, 'aspm') and self.aspm is not None:
+            self.aspm.set_epoch(epoch_idx)
 
     @torch.no_grad()
     def update_global_normal_bank(self, u_norm_batch: torch.Tensor,
@@ -2215,7 +2295,15 @@ class MARUPA(nn.Module):
         p0_bb = F.softmax(logits2, dim=-1)[:, :, :1]
         s_sem_bb = (1.0 - p0_bb).clamp(1e-5, 1.0 - 1e-5)
 
-        # Step 3: Stream Outputs & Dictionary Population (Zero RUPA Overheads)
+        # Step 3: Adaptive Stiefel Prototype Manifold (ASPM) Normality Modeling
+        if hasattr(self, 'aspm') and self.aspm is not None:
+            f_rec, r_anom, s_rec, l_compact = self.aspm(f_main, s_det)
+        else:
+            f_rec = f_main
+            r_anom = torch.zeros_like(f_main)
+            s_rec = torch.zeros_like(s_det)
+            l_compact = torch.tensor(0.0, device=target_device)
+
         logits1 = logits_det
         dnp_dict = {
             'routing_scores': p_routing,
@@ -2224,7 +2312,7 @@ class MARUPA(nn.Module):
             'detector_logits': logits_det,
             'aux_scores': s_aux,
             'aux_logits': logits_aux,
-            'reconstruction_scores': torch.zeros_like(s_det),
+            'reconstruction_scores': s_rec,
             'semantic_scores': s_sem_bb,
             'backbone_semantic_scores': s_sem_bb,
             'fixed_scores': p_routing,
@@ -2232,8 +2320,9 @@ class MARUPA(nn.Module):
             'noise_gate_av': g_av,
             'av_suppress_loss': av_suppress_loss,
             'original_features': f_main,
-            'reconstructed_features': f_main,
-            'residual_features': torch.zeros_like(f_main),
+            'reconstructed_features': f_rec,
+            'residual_features': r_anom,
+            'l_compact': l_compact,
             'g_loss': torch.zeros(B, 1, device=target_device),
             'orth_loss': torch.zeros(B, 1, device=target_device),
             'dnp_normal_loss': torch.zeros(B, 1, device=target_device),
