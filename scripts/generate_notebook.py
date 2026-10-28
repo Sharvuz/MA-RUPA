@@ -68,23 +68,30 @@ import torch
 
 WORK = Path("/kaggle/working")
 INPUT = Path("/kaggle/input")
-REPO_DIR = WORK / "RUPA-DSA"
+REPO_DIR = WORK / "MA-RUPA"
 ARTIFACTS = WORK / "rupa_artifacts"
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
+
+# Luôn luôn chuyển về /kaggle/working trước để tránh lỗi Linux "Unable to read current working directory" khi re-run cell
+os.chdir(WORK)
 
 # Clone or synchronize repository
 REPO_URL = "https://github.com/Sharvuz/MA-RUPA.git"
 REPO_REF = None  # Đặt tên branch nếu cần (ví dụ "main")
 
-if REPO_DIR.exists():
-    shutil.rmtree(REPO_DIR)
-
-print("📥 Cloning repository from GitHub...", flush=True)
-clone_cmd = ["git", "clone", "--depth", "1"]
-if REPO_REF:
-    clone_cmd += ["--branch", REPO_REF]
-clone_cmd += [REPO_URL, str(REPO_DIR)]
-subprocess.run(clone_cmd, check=True)
+if (REPO_DIR / ".git").exists():
+    print("🔄 Repository đã tồn tại. Đang đồng bộ commit mới nhất từ GitHub...", flush=True)
+    subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
+    subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
+else:
+    if REPO_DIR.exists():
+        shutil.rmtree(REPO_DIR)
+    print("📥 Cloning repository from GitHub...", flush=True)
+    clone_cmd = ["git", "clone", "--depth", "1"]
+    if REPO_REF:
+        clone_cmd += ["--branch", REPO_REF]
+    clone_cmd += [REPO_URL, str(REPO_DIR)]
+    subprocess.run(clone_cmd, cwd=WORK, check=True)
 
 os.chdir(REPO_DIR)
 
