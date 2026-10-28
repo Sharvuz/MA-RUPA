@@ -226,7 +226,7 @@ def train(args):
     print(f"  Batch size: {args.batch_size} ({batch_half} Normal + {batch_half} Abnormal per batch, Interleaved)")
     crop_mode_str = "Full 10 Crops/video (100% Data, Zero Sampling)" if not sample_one_crop else f"{crops_per_video} random crops/video (DPSS)"
     print(f"  Iters per epoch: {iters_per_epoch} | Dataset: {crop_mode_str} | Samples/epoch: {iters_per_epoch * args.batch_size}")
-    print(f"  Total Gradient Steps: {total_iters} steps (Học sâu 100% chuẩn DSANet SOTA)")
+    print(f"  Total Gradient Steps: {total_iters} steps (Full Deep Optimization - SOTA Schedule)")
     print("=" * 70, flush=True)
 
     for epoch in range(start_epoch, args.max_epoch):
@@ -310,12 +310,12 @@ def train(args):
             loss_sem_guide = F.smooth_l1_loss(s_det, s_sem_teacher)
             w_guide = 0.10
 
-            k_min = getattr(args, 'k_min', 16)
-            k_max = getattr(args, 'k_max', 48)
+            k_min = getattr(args, 'k_min', 8)
+            k_max = getattr(args, 'k_max', 20)
             m_gamma = getattr(args, 'margin_gamma', 0.30)
             g_min = getattr(args, 'gamma_min', 0.15)
             g_max = getattr(args, 'gamma_max', 0.35)
-            f_alpha = getattr(args, 'focal_alpha', 2.0)
+            f_alpha = getattr(args, 'focal_alpha', 0.0)
             l_mar = getattr(args, 'lambda_mar', 0.50)
             w_smooth = getattr(args, 'lambda_smooth', 0.08)
 
@@ -336,7 +336,7 @@ def train(args):
             loss_mil_routing = loss_mil_det
             loss_mil_aux = torch.tensor(0.0, device=device)
 
-            # Pillar 2: Multi-Class MIL Frame Supervision on Semantics (CLASM, calibrated to 0.10 for CCTV)
+            # Pillar 2: Fine-grained Multi-Class Video-Text Semantic Supervision (TVSA Stream)
             loss_clasm = compute_clasm_loss(
                 logits=logits2,
                 labels=one_hot_labels,
@@ -367,8 +367,8 @@ def train(args):
             # Pristine 4-Pillar Master Loss Engine (Zero RUPA Overheads)
             total_loss = (
                 1.00 * loss_mil_det
-                + 0.10 * loss_clasm
-                + 0.15 * loss_dcs
+                + 1.00 * loss_clasm
+                + 0.20 * loss_dcs
                 + w_smooth * loss_smooth
                 + w_guide * loss_sem_guide
             )
@@ -421,7 +421,7 @@ def train(args):
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
                       f"CLASM: {loss_clasm.item():.4f} | Guide: {(w_guide * loss_sem_guide).item():.4f} | Consist: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
 
-            # Mid-Epoch Evaluation & Peak-Catching (DSANet Benchmark Standard: every 20 iters / 1280 samples)
+            # Mid-Epoch Evaluation & Peak-Catching (SOTA Benchmark Standard: every 20 iters / 1280 samples)
             eval_interval_raw = getattr(args, 'eval_interval', 20)
             eval_interval_iters = eval_interval_raw if eval_interval_raw < 100 else max(1, eval_interval_raw // args.batch_size)
             if eval_interval_iters > 0 and (step_idx + 1) % eval_interval_iters == 0 and (step_idx + 1) < iters_per_epoch:

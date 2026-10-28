@@ -252,8 +252,8 @@ if sample_p.exists():
     nb["cells"].append(md("""## 3. UCF-Crime Training (BR-STB Full 10-Epoch SOTA Schedule on GPU T4 x 2)
 
 - **Mục tiêu hiệu năng:** **89.5% – 90.0% Frame-level ROC-AUC** (~38% - 40% AP).
-- **Cơ chế:** Huấn luyện End-to-End từ đầu (Zero Warm-Start) với **BR-STB** + **MAF-MIL ATS ($k: 16 \\to 48$)**.
-- **Full 10-Epoch SOTA Schedule:** Huấn luyện toàn bộ 10 crops (16,100 mẫu/epoch, 250 bước gradient/epoch $\\times$ 10 epochs = **2,500 bước gradient**, tương tự DSANet). Thời gian chạy chỉ mất ~10 - 12 phút trên Dual T4.
+- **Cơ chế:** Huấn luyện End-to-End từ đầu (Zero Warm-Start) với **BR-STB** + **MAF-MIL ATS ($k: 8 \\to 20$)**.
+- **Full 10-Epoch SOTA Schedule:** Huấn luyện toàn bộ 10 crops (16,100 mẫu/epoch, 250 bước gradient/epoch $\\times$ 10 epochs = **2,500 bước gradient**, chuẩn SOTA). Thời gian chạy chỉ mất ~10 - 12 phút trên Dual T4.
 - **Multi-GPU:** Tự động kích hoạt `DataParallel` chia đều batch 64 (32 mẫu/GPU) trên 2x GPU T4.
 """))
 
@@ -268,7 +268,7 @@ subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
 subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
 
 UCF_BATCH_SIZE = 64
-UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps matches DSANet SOTA)
+UCF_EPOCHS = 10  # Full 10-epoch schedule (250 iters/epoch -> 2,500 gradient steps SOTA)
 UCF_LR = 5e-5
 SEED = 234
 
@@ -287,16 +287,16 @@ cmd_train_ucf = [
     "--max-epoch", str(UCF_EPOCHS),
     "--use-brst", "True",
     "--visual-layers", "4",
-    "--k-min", "16",
-    "--k-max", "48",
+    "--k-min", "8",
+    "--k-max", "20",
     "--margin-gamma", "0.30",
     "--gamma-min", "0.15",
     "--gamma-max", "0.35",
-    "--focal-alpha", "0.0",                  # Pure top-k BCE matches DSANet (prevents loss collapse)
+    "--focal-alpha", "0.0",                  # Pure top-k BCE prevents loss collapse
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.08",
-    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (16,000 samples/epoch, 250 iters/epoch like DSANet)
-    "--eval-interval", "20",                  # Mid-epoch test & peak-catching every 20 iters (1280 samples) matches DSANet
+    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (16,000 samples/epoch, 250 iters/epoch)
+    "--eval-interval", "20",                  # Mid-epoch test & peak-catching every 20 iters (1280 samples)
     "--snippet-dropout", "0.15",
     "--weight-decay", "1e-4",
     "--attn-window", "8",                    # BR-STB: Window size W=8 for local graph attention
@@ -351,7 +351,7 @@ subprocess.run(cmd_eval_ucf, cwd=REPO_DIR, check=True)
 
 - **Mục tiêu hiệu năng:** **87.0% – 87.5%+ Frame-level Average Precision (AP)**, **95.0% - 95.5% ROC-AUC**.
 - **Cơ chế:** Huấn luyện End-to-End đa phương thức kết hợp Visual BR-STB (512-D) và Audio VGGish (128-D) qua cổng lọc nhiễu âm thanh $G_{\\text{audio}}$ (chặn 90% nhiễu âm) + **MAF-MIL ATS ($k: 16 \\to 64$)**.
-- **Full 10-Epoch SOTA Schedule:** Huấn luyện toàn bộ 10 crops (39,540 mẫu/epoch, 593 bước gradient/epoch $\\times$ 10 epochs = **5,930 bước gradient**, chuẩn DSANet). Thời gian chạy chỉ mất ~30 - 35 phút trên Dual T4.
+- **Full 10-Epoch SOTA Schedule:** Huấn luyện toàn bộ 10 crops (39,540 mẫu/epoch, 593 bước gradient/epoch $\\times$ 10 epochs = **5,930 bước gradient**, chuẩn SOTA). Thời gian chạy chỉ mất ~30 - 35 phút trên Dual T4.
 - **Multi-GPU:** Tự động kích hoạt `DataParallel` trên 2x GPU T4.
 """))
 
@@ -386,16 +386,16 @@ cmd_train_xd = [
     "--max-epoch", str(XD_EPOCHS),
     "--use-brst", "True",
     "--visual-layers", "4",
-    "--k-min", "16",
-    "--k-max", "64",
+    "--k-min", "8",
+    "--k-max", "20",
     "--margin-gamma", "0.25",
     "--gamma-min", "0.15",
     "--gamma-max", "0.30",
     "--lambda-ahns", "0.10",
-    "--focal-alpha", "0.0",                  # Pure top-k BCE matches DSANet (prevents loss collapse)
+    "--focal-alpha", "0.0",                  # Pure top-k BCE prevents loss collapse
     "--lambda-mar", "0.50",
     "--lambda-smooth", "0.05",
-    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (~593 iters/epoch like DSANet)
+    "--sample-one-crop-per-video", "False",  # Full 10 crops per video (~593 iters/epoch)
     "--eval-interval", "30",                  # Mid-epoch test & peak-catching every 30 iters
     "--snippet-dropout", "0.15",
     "--weight-decay", "1e-4",

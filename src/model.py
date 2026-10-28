@@ -164,7 +164,7 @@ class MDTPBranch(nn.Module):
 class GlobalLinearContextAggregator(nn.Module):
     """Branch C: Global Linear Context Aggregator with O(T) complexity.
     
-    Replaces DSANet's dense similarity GCN without graph noise:
+    Continuous Spatio-Temporal Graph Attention without graph noise:
     phi(x) = ELU(x) + 1
     Q = phi(X W_q), K = phi(X W_k), V = X W_v
     F_global = (Q (K^T V)) / (Q (sum_t K_t)^T + eps)
@@ -367,7 +367,7 @@ class MDTBackbone(nn.Module):
         """Construct continuous temporal distance-decay attention bias mask (float [T, T]).
         Attn_ij = (Q K^T / sqrt(d)) - gamma * log(1 + |i - j| / tau)
         Close frames have zero penalty; distant frames receive smooth power-law attenuation.
-        Equivalent to DSANet's disAdj continuous relational prior in Transformer attention.
+        Continuous relational distance-decay prior in Transformer attention.
         """
         t = torch.arange(length, device=device, dtype=torch.float32)
         dist = (t.unsqueeze(0) - t.unsqueeze(1)).abs()
@@ -1717,7 +1717,7 @@ class GradientSafeRUPA(nn.Module):
         semantic_logits = res_sem_logits  # [B, T, C]
         scaled_sem_logits = semantic_logits
 
-        # Multi-class Semantic Anomaly Score (DSANet Eq. 8): P(Anomaly) = 1.0 - P(Normal)
+        # Multi-class Semantic Anomaly Score (TVSA Stream): P(Anomaly) = 1.0 - P(Normal)
         p0_rupa = F.softmax(scaled_sem_logits, dim=-1)[:, :, :1]
         s_sem = (1.0 - p0_rupa).clamp(1e-5, 1.0 - 1e-5)
 
@@ -1899,7 +1899,7 @@ class CLIPAdapter(nn.Module):
 class MARUPA(nn.Module):
     """MA-RUPA: Modality-Adaptive Multiscale Prototype Alignment Network.
     
-    End-to-End trainable from scratch without pre-trained DSANet checkpoints
+    End-to-End trainable from scratch without pre-trained legacy checkpoints
     or frozen two-stage warm-starts.
     """
     def __init__(self,
@@ -2186,7 +2186,7 @@ class MARUPA(nn.Module):
         else:
             valid_mask = torch.ones(B, T, 1, device=target_device, dtype=visual.dtype)
 
-        # Vision-Text Enhance (DSANet Eq. 2): aggregate video cue with S_det and enhance category embeddings
+        # Vision-Text Enhancement (ACTE): aggregate video cue with S_det and enhance category embeddings
         det_weights = ((scale * s_det.detach()).exp() - 1.0) * valid_mask
         det_weights = F.normalize(det_weights, p=1, dim=1)
         vid_cue = F.normalize(torch.matmul(det_weights.permute(0, 2, 1), f_main.detach()), dim=-1)  # [B, 1, D]
@@ -2195,7 +2195,7 @@ class MARUPA(nn.Module):
 
         text_mat = F.normalize(text_features_ori, dim=-1).t().to(visual.dtype)  # [D, C]
         text_enh = text_features_ori.unsqueeze(0).repeat(B, 1, 1)  # [B, C, D]
-        # DSANet Eq. 2: Enhance category embeddings strictly for anomaly classes (1..C-1), keeping Normal (0) pure!
+        # Anomaly-Centric Text Enhancement (ACTE): Enhance category embeddings strictly for anomaly classes (1..C-1), keeping Normal (0) pure!
         text_enh[:, 1:] = text_enh[:, 1:] + 0.35 * ctx_offset
         text_enh = F.normalize(text_enh, dim=-1).to(visual.dtype)  # [B, C, D]
         f_norm = F.normalize(f_main, dim=-1)  # [B, T, D]
@@ -2211,7 +2211,7 @@ class MARUPA(nn.Module):
         else:
             logits2 = logits2_euc
 
-        # Multi-class Semantic Anomaly Score (DSANet Eq. 8): P(Anomaly) = 1.0 - P(Normal)
+        # Multi-class Semantic Anomaly Score (TVSA Stream): P(Anomaly) = 1.0 - P(Normal)
         p0_bb = F.softmax(logits2, dim=-1)[:, :, :1]
         s_sem_bb = (1.0 - p0_bb).clamp(1e-5, 1.0 - 1e-5)
 
@@ -2239,7 +2239,7 @@ class MARUPA(nn.Module):
             'dnp_normal_loss': torch.zeros(B, 1, device=target_device),
         }
 
-        # Decoupled Contrastive Semantic Alignment (DCSA - DSANet Eq. 5):
+        # Decoupled Contrastive Semantic Alignment (DCSA):
         # Pool unified video representation f_main into F_event and F_bkg using S_det weights
         prob_abn = 0.65 * s_det + 0.35 * s_sem_bb.detach()
         abn_weights = ((scale * prob_abn).exp() - 1.0) * valid_mask

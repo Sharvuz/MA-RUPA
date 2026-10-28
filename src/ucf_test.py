@@ -168,7 +168,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             else:
                 prob_det = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
 
-            # Stream 3: Zero-Shot / Adapted Semantic Alignment (DSANet Eq. 8: P(Anomaly) = 1.0 - P(Normal))
+            # Stream 3: Zero-Shot / Adapted Semantic Alignment (TVSA: P(Anomaly) = 1.0 - P(Normal))
             p_align = F.softmax(logits2[0:len_cur] / eff_temp, dim=-1)
             p0_bb = p_align[:, 0]
             prob_sem = (1.0 - p0_bb).clamp(0.0, 1.0)
@@ -395,22 +395,19 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_dodo = roc_auc_score(gt_eval, frame_scores_dodo[:min_len])
     ap_dodo = average_precision_score(gt_eval, frame_scores_dodo[:min_len])
 
-    print(f"[Evaluation] Frame-level AUC (Routing): {roc_routing * 100:.2f}% | AP: {ap_routing * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Detector): {roc_det * 100:.2f}% | AP: {ap_det * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Semantics Backbone): {roc_sem * 100:.2f}% | AP: {ap_sem * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Semantics Alignment - DSANet): {roc_sem_rupa * 100:.2f}% | AP: {ap_sem_rupa * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Ensemble Routing+Detector): {roc_ens_det * 100:.2f}% | AP: {ap_ens_det * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Ensemble Routing+Semantics Backbone): {roc_ens_sem * 100:.2f}% | AP: {ap_ens_sem * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Ensemble Routing+Semantics DSANet): {roc_ens_rupa * 100:.2f}% | AP: {ap_ens_rupa * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): {roc_weighted * 100:.2f}% | AP: {ap_weighted * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Geometric Mean Filtered): {roc_geom * 100:.2f}% | AP: {ap_geom * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Geometric Blend Ensemble): {roc_opt * 100:.2f}% | AP: {ap_opt * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Harmonic Consensus Ensemble): {roc_harmonic * 100:.2f}% | AP: {ap_harmonic * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Master SOTA Ensemble): {roc_master * 100:.2f}% | AP: {ap_master * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Tri-Stream Ensemble): {roc_ens_tri * 100:.2f}% | AP: {ap_ens_tri * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Hierarchical Refined): {roc_hier * 100:.2f}% | AP: {ap_hier * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (Single-Pass UCCF - SOTA): {roc_uccf * 100:.2f}% | AP: {ap_uccf * 100:.2f}%", flush=True)
-    print(f"[Evaluation] Frame-level AUC (UCCF + DODO - SOTA): {roc_dodo * 100:.2f}% | AP: {ap_dodo * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical BR-STB Backbone): {roc_det * 100:.2f}% | AP: {ap_det * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Fine-Grained Semantic Alignment - TVSA): {roc_sem_rupa * 100:.2f}% | AP: {ap_sem_rupa * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Dual-Stream Synergistic Fusion): {roc_ens_rupa * 100:.2f}% | AP: {ap_ens_rupa * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Ensemble BR-STB + Backbone Semantics): {roc_ens_sem * 100:.2f}% | AP: {ap_ens_sem * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): {roc_weighted * 100:.2f}% | AP: {ap_weighted * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Geometric Mean Filtered): {roc_geom * 100:.2f}% | AP: {ap_geom * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Geometric Blend Ensemble): {roc_opt * 100:.2f}% | AP: {ap_opt * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Harmonic Consensus Ensemble): {roc_harmonic * 100:.2f}% | AP: {ap_harmonic * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Master SOTA Ensemble): {roc_master * 100:.2f}% | AP: {ap_master * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Tri-Stream Ensemble): {roc_ens_tri * 100:.2f}% | AP: {ap_ens_tri * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical Refined): {roc_hier * 100:.2f}% | AP: {ap_hier * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Single-Pass Multimodal SOTA): {roc_uccf * 100:.2f}% | AP: {ap_uccf * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (UCCF + DODO - SOTA): {roc_dodo * 100:.2f}% | AP: {ap_dodo * 100:.2f}%", flush=True)
 
     if compute_dmap:
         try:

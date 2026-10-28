@@ -395,7 +395,7 @@ def compute_confidence_gated_consistency_loss(s_det: torch.Tensor,
                                               s_rupa: torch.Tensor,
                                               lengths: torch.Tensor,
                                               device: torch.device = None) -> torch.Tensor:
-    """Self-Guided Normality Distillation Consistency Loss (DSANet Eq. 4).
+    """Self-Guided Normality Distillation Consistency Loss.
     
     Eliminates entropy teacher-inversion (where near-zero S_rec on anomalies had lower
     Shannon entropy than S_det and pulled S_det down to 0).
@@ -792,12 +792,21 @@ def compute_ogdp_geometry_loss(dnp_dict: dict, device: torch.device = None) -> t
 class MarginAwareFocalMILLoss(nn.Module):
     """Margin-Aware Focal MIL Loss with Adaptive Temporal Support (ATS) and Dynamic Margin Annealing.
     
-    Solves:
-    1. Gradient starvation at loss=0.07 via focal weighting (alpha >= 2.0).
-    2. Top-k spike collapse via Adaptive Temporal Support expanding k(e, b) = 16 -> 64.
-    3. Subtle anomaly separation via sigmoid-annealed intra-bag margin ranking gamma(e).
+    Architectural & Mathematical Rigor (BR-MVAD Proposed Formulation):
+    1. Bag-level Multiple Instance Learning:
+       - On Abnormal Bags (y=1): Computes bag anomaly score s_bag = mean(s_top) over top-k most anomalous snippets.
+         Applies Focal BCE loss: L_pos = (1 - s_bag)^alpha * (-log(s_bag + 1e-8)).
+         This preserves Jensen's inequality and strictly prevents background normal snippets in an abnormal video
+         from being forced to 1.0 (eliminates false-alarm contamination).
+       - On Normal Bags (y=0): Computes hard negative bag score s_neg = mean(s_hard_neg) over top-k false alarms.
+         Applies Focal BCE loss: L_neg = (s_neg)^alpha * (-log(1.0 - s_neg + 1e-8)).
+    2. Dynamic Margin Annealing gamma(e):
+       - Enforces intra-bag contrastive separation: mean(s_top) >= mean(s_bkg) + gamma(e).
+    3. Adaptive Temporal Support (ATS) with Safety Bounds:
+       - Length-proportional support: k = clamp(int(L / 16 + 1), k_min, k_max).
+       - Upper bounded to at most L // 4 (max 25% of video duration), preventing background pollution.
     """
-    def __init__(self, k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
+    def __init__(self, k_min: int = 8, k_max: int = 20, gamma: float = 0.30,
                  gamma_min: float = 0.15, gamma_max: float = 0.35,
                  alpha: float = 0.0, lambda_mar: float = 0.50):
         super().__init__()
@@ -820,21 +829,19 @@ class MarginAwareFocalMILLoss(nn.Module):
     def compute_ats_k(self, scores: torch.Tensor, lengths: torch.Tensor, epoch: float) -> list:
         B = scores.shape[0]
         k_list = []
-        # Epoch ramp-up sigmoid: e_0 = 2.0, beta_e = 1.0
         sig_e = 1.0 / (1.0 + math.exp(-1.0 * (float(epoch) - 2.0)))
         
         for b in range(B):
             L = int(lengths[b].item()) if lengths is not None else scores.shape[1]
             vid_s = scores[b, :L].squeeze(-1)
-            k_base = min(self.k_min, max(1, L // 16))
+            k_base = max(1, min(L // 16 + 1, self.k_max))
             
-            top_k_base = torch.topk(vid_s, k=k_base)[0]
+            top_k_base = torch.topk(vid_s, k=min(k_base, L))[0]
             conf = top_k_base.mean().item()
-            # Confidence lock sigmoid: s_0 = 0.65, beta_t = 8.0
             sig_t = 1.0 / (1.0 + math.exp(-8.0 * (conf - 0.65)))
             
-            eff_k = int(self.k_min + (self.k_max - self.k_min) * sig_e * sig_t)
-            k_clamped = min(max(self.k_min, eff_k), max(1, L // 2))
+            eff_k = int(k_base + (self.k_max - k_base) * sig_e * sig_t)
+            k_clamped = min(max(self.k_min, eff_k), max(1, L // 4))
             k_list.append(k_clamped)
         return k_list
 
@@ -863,29 +870,34 @@ class MarginAwareFocalMILLoss(nn.Module):
                 # Abnormal bag: Sort descending
                 s_sorted, _ = torch.sort(s, descending=True)
                 s_top = s_sorted[:k]
-                s_bkg = s_sorted[max(0, L - self.k_min):]
+                k_bkg = min(k, max(1, L // 4))
+                s_bkg = s_sorted[max(0, L - k_bkg):]
                 
-                # 1. Focal / BCE loss on top anomaly snippets (if alpha=0, pure BCE matches DSANet)
+                # Bag-level anomaly score: mean of top-k anomaly snippets
+                s_bag = s_top.mean()
                 if self.alpha > 0.0:
-                    focal_w = torch.pow(1.0 - s_top, self.alpha)
-                    loss_pos_focal = loss_pos_focal - torch.mean(focal_w * torch.log(s_top + 1e-8))
+                    focal_w = torch.pow(1.0 - s_bag, self.alpha)
+                    loss_pos_focal = loss_pos_focal - focal_w * torch.log(s_bag + 1e-8)
                 else:
-                    loss_pos_focal = loss_pos_focal - torch.mean(torch.log(s_top + 1e-8))
+                    loss_pos_focal = loss_pos_focal - torch.log(s_bag + 1e-8)
                 
-                # 2. Annealed intra-bag margin ranking: enforce s_top >= s_bkg.mean() + current_gamma
-                margin_gap = F.relu(current_gamma - (s_top - s_bkg.mean()))
-                loss_pos_margin = loss_pos_margin + torch.mean(margin_gap)
+                # Annealed intra-bag margin ranking: enforce s_bag >= s_bkg.mean() + current_gamma
+                margin_gap = F.relu(current_gamma - (s_bag - s_bkg.mean()))
+                loss_pos_margin = loss_pos_margin + margin_gap
                 n_pos += 1
             else:
                 # Normal bag: Sort descending, mine hardest false alarms
                 s_sorted, _ = torch.sort(s, descending=True)
-                s_hard_neg = s_sorted[:min(self.k_min, L)]
+                k_neg = min(k, max(1, L // 4))
+                s_hard_neg = s_sorted[:k_neg]
                 
+                # Bag-level normal score: mean of hardest false alarms
+                s_neg_bag = s_hard_neg.mean()
                 if self.alpha > 0.0:
-                    focal_w = torch.pow(s_hard_neg, self.alpha)
-                    loss_neg_focal = loss_neg_focal - torch.mean(focal_w * torch.log(1.0 - s_hard_neg + 1e-8))
+                    focal_w = torch.pow(s_neg_bag, self.alpha)
+                    loss_neg_focal = loss_neg_focal - focal_w * torch.log(1.0 - s_neg_bag + 1e-8)
                 else:
-                    loss_neg_focal = loss_neg_focal - torch.mean(torch.log(1.0 - s_hard_neg + 1e-8))
+                    loss_neg_focal = loss_neg_focal - torch.log(1.0 - s_neg_bag + 1e-8)
                 n_neg += 1
                 
         loss_pos = (loss_pos_focal + self.lambda_mar * loss_pos_margin) / max(1, n_pos)
@@ -895,7 +907,7 @@ class MarginAwareFocalMILLoss(nn.Module):
 
 def compute_maf_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
                          lengths: torch.Tensor = None, epoch: float = 1.0,
-                         k_min: int = 16, k_max: int = 64, gamma: float = 0.30,
+                         k_min: int = 8, k_max: int = 20, gamma: float = 0.30,
                          gamma_min: float = 0.15, gamma_max: float = 0.35,
                          alpha: float = 0.0, lambda_mar: float = 0.50) -> torch.Tensor:
     """Convenience wrapper for Margin-Aware Focal MIL Loss with ATS and Annealed Margin."""
