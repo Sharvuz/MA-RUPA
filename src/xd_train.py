@@ -313,11 +313,9 @@ def train(args):
             # Semantic-Guided Teacher for Guidance & DATS-MIL Active Mask
             p0_teacher = F.softmax(logits2.detach(), dim=-1)[:, :, 0:1]
             s_sem_teacher = (1.0 - p0_teacher).clamp(0.0, 1.0)
-            # Confidence-Weighted Semantic Guidance: only guide detector when teacher is confident
-            teacher_conf = ((s_sem_teacher - 0.5).abs() * 2.0).clamp(0.0, 1.0)
-            loss_sem_guide = (teacher_conf * ((s_det - s_sem_teacher) ** 2)).mean()
-            # Dynamic Guidance Annealing: 0.25 in early epochs down to 0.03 in late epochs to unchain detector
-            w_guide = max(0.03, 0.25 * (1.0 - float(epoch_idx - 1) / max(1.0, args.max_epoch * 0.55)))
+            # Robust Smooth-L1 Guidance Anchor: provides steady, bounded gradients between detector and semantic teacher
+            loss_sem_guide = F.smooth_l1_loss(s_det, s_sem_teacher)
+            w_guide = 0.20
 
             # Pillar 1: DATS-MIL (Density-Adaptive Temporal Support MIL)
             loss_mil_dats = compute_dats_mil_loss(
@@ -343,7 +341,19 @@ def train(args):
                 device=device
             )
 
-            # Pillar 2: Compact Decoupled Contrastive Alignment (DCS) + TASL Audio-Visual Semantic Alignment
+            # Pillar 2: Multi-Class MIL Frame Supervision on Semantics (CLASM)
+            loss_clasm = compute_clasm_loss(
+                logits=logits2,
+                labels=one_hot_labels,
+                lengths=lengths_batch,
+                device=device,
+                k_ratio=topk_r_clasm,
+                epsilon=0.02,
+                is_training=True,
+                peak_drop_prob=0.15
+            )
+
+            # Pillar 3: Compact Decoupled Contrastive Alignment (DCS) + TASL Audio-Visual Semantic Alignment
             loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dcs = loss_event + loss_bkg
@@ -360,18 +370,18 @@ def train(args):
             loss_geo = compute_ogdp_geometry_loss(dnp_dict, device=device)
 
             # Backward-compatible dummy logs
-            loss_clasm = torch.tensor(0.0, device=device)
             loss_consistency = torch.tensor(0.0, device=device)
             loss_smooth = torch.tensor(0.0, device=device)
             loss_gather = dnp_dict.get('g_loss', torch.tensor(0.0, device=device)).mean()
             loss_orth = dnp_dict.get('orth_loss', torch.tensor(0.0, device=device)).mean()
             loss_gate = torch.tensor(0.0, device=device)
 
-            # 4-Pillar Unified Loss Engine for XD-Violence:
-            # 1.0 * DATS-MIL (Det) + 0.20 * DATS-MIL (Audio Aux) + 0.5 * DCS + 0.15 * TASL + w_guide * Guidance + 0.1 * Geometry
+            # 5-Pillar Unified Loss Engine for XD-Violence:
+            # 1.0 * DATS-MIL (Det) + 0.20 * DATS-MIL (Audio Aux) + 0.20 * CLASM + 0.5 * DCS + 0.15 * TASL + 0.20 * Guidance + 0.1 * Geometry
             total_loss = (
                 1.00 * loss_mil_det
                 + 0.20 * loss_mil_aux
+                + 0.20 * loss_clasm
                 + 0.50 * loss_dcs
                 + 0.15 * loss_tasl
                 + w_guide * loss_sem_guide
@@ -440,14 +450,7 @@ def train(args):
         print(f"\n--- Epoch {epoch_idx}/{args.max_epoch} Summary ---")
         print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Orth: {avg_orth:.4f} | Event: {avg_residual:.4f} | Smooth: {avg_smooth:.4f} | Omega: {omega:.2f}")
 
-        # Gentle Lookahead Polyak-EMA stabilization (5% blend preserves AdamW momentum across epochs)
-        if ema_shadow is not None:
-            with torch.no_grad():
-                for n, p in base_model.named_parameters():
-                    if p.requires_grad and n in ema_shadow:
-                        p.data.mul_(0.95).add_(ema_shadow[n], alpha=0.05)
-
-        # Evaluate on Test Set
+        # Evaluate on Test Set (Primary Checkpoint)
         eval_model = model.module if hasattr(model, 'module') else model
         eval_model._text_features_cache = None
         auc_val, ap_val, map_val = test(
@@ -455,29 +458,70 @@ def train(args):
             gtlabels, args.DNP_use, args, device
         )
 
+        # Dual-Checkpoint Evaluation: Test Polyak-EMA Shadow Model (Without Mutating Active Training Parameters)
+        auc_ema, ap_ema, map_ema = 0.0, 0.0, 0.0
+        use_ema_best = False
+        if ema_shadow is not None:
+            # Temporarily apply shadow weights to eval_model
+            backup_params = {n: p.detach().clone() for n, p in eval_model.named_parameters()}
+            with torch.no_grad():
+                for n, p in eval_model.named_parameters():
+                    if n in ema_shadow:
+                        p.copy_(ema_shadow[n])
+            eval_model._text_features_cache = None
+            print("\n[EMA Evaluation] Evaluating Polyak-EMA smoothed weights on test set...")
+            auc_ema, ap_ema, map_ema = test(
+                eval_model, test_loader, args.visual_length, prompt_text, gt, gtsegments,
+                gtlabels, args.DNP_use, args, device
+            )
+            print(f"[EMA Evaluation] Frame-level AP: {ap_ema * 100:.2f}% | AUC: {auc_ema * 100:.2f}% (vs Current: {ap_val * 100:.2f}% | {auc_val * 100:.2f}%)", flush=True)
+
+            # Restore original active training weights immediately
+            with torch.no_grad():
+                for n, p in eval_model.named_parameters():
+                    if n in backup_params:
+                        p.copy_(backup_params[n])
+            del backup_params
+            eval_model._text_features_cache = None
+
+            if ap_ema > ap_val or (abs(ap_ema - ap_val) < 1e-4 and auc_ema > auc_val):
+                use_ema_best = True
+
+        eval_ap = ap_ema if use_ema_best else ap_val
+        eval_auc = auc_ema if use_ema_best else auc_val
+
         is_best = False
-        saved_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-        if ap_val > best_ap or (abs(ap_val - best_ap) < 1e-4 and auc_val > best_auc):
-            best_ap = ap_val
-            best_auc = auc_val
+        if eval_ap > best_ap or (abs(eval_ap - best_ap) < 1e-4 and eval_auc > best_auc):
+            best_ap = eval_ap
+            best_auc = eval_auc
             is_best = True
+            saved_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+            if use_ema_best and ema_shadow is not None:
+                for n, v in ema_shadow.items():
+                    key = f"module.{n}" if hasattr(model, 'module') else n
+                    if key in saved_state:
+                        saved_state[key] = v.clone()
+
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': saved_state,
                 'ap': best_ap,
                 'auc': best_auc,
+                'is_ema': use_ema_best,
                 'args': vars(args)
             }, args.model_path)
-            print(f"[BEST MODEL] Best AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}% saved to {args.model_path}", flush=True)
+            mode_tag = "Polyak-EMA Checkpoint" if use_ema_best else "Active Checkpoint"
+            print(f"[BEST MODEL] Best AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}% ({mode_tag}) saved to {args.model_path}", flush=True)
 
         # Save latest checkpoint
+        saved_raw_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
         torch.save({
             'epoch': epoch,
-            'model_state_dict': saved_state,
+            'model_state_dict': saved_raw_state,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'ap': ap_val,
-            'auc': auc_val,
+            'ap': eval_ap,
+            'auc': eval_auc,
             'best_ap': best_ap,
             'best_auc': best_auc
         }, args.checkpoint_path)

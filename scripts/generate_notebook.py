@@ -289,10 +289,10 @@ cmd_train_ucf = [
     "--max-epoch", str(UCF_EPOCHS),
     "--sample-one-crop-per-video", "True",
     "--crops-per-video", str(UCF_CROPS_PER_VIDEO),
-    "--attn-window", "0",          # 0 = Full Global Temporal Attention (256x256 all-pairs relational reasoning)
+    "--attn-window", "8",          # Layer 0: Local Window (W=8) + Layer 1: Continuous Distance-Decay Global Attention
     "--curriculum-epochs", "3.0",
     "--sampling", "topk",
-    "--topk-ratio", "8",          # L / 8 (~12.5% frames) bao quát trọn vẹn diễn biến tội phạm nhiều phút
+    "--topk-ratio", "16",         # L / 16 (~6.25% frames) matches typical anomaly duration without noise
     "--label-smoothing", "0.02",  # Ngăn BCE loss tụt về 0, giữ gradient sống qua các epoch sau
     "--lambda-aux", "0.15",       # Giảm trọng số nhánh Aux (Motion Residual) chống overfit sớm
     "--lambda-smooth", "0.06",     # Tăng làm phẳng biến thiên cục bộ giữa frame t và t-1, giảm False Positives
@@ -382,7 +382,7 @@ cmd_train_xd = [
     "--max-epoch", str(XD_EPOCHS),
     "--sample-one-crop-per-video", "True",
     "--crops-per-video", str(XD_CROPS_PER_VIDEO),
-    "--attn-window", "0",          # 0 = Full Global Temporal Attention
+    "--attn-window", "64",         # Layer 0: Local Window (W=64) + Layer 1: Continuous Distance-Decay Global Attention
     "--curriculum-epochs", "3.0",
     "--sampling", "topk",
     "--seed", str(SEED),

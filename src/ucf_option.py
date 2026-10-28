@@ -21,7 +21,7 @@ parser.add_argument('--visual-length', default=256, type=int, help='Maximum temp
 parser.add_argument('--visual-width', default=512, type=int, help='Visual feature width')
 parser.add_argument('--visual-head', default=4, type=int, help='Attention heads in backbone & cross-attention')
 parser.add_argument('--visual-layers', default=2, type=int, help='Number of transformer layers in Branch A')
-parser.add_argument('--attn-window', default=0, type=int, help='Window size for transformer self-attention (0 = Full 256-frame Global Temporal Attention)')
+parser.add_argument('--attn-window', default=8, type=int, help='Window size for Layer 0 local attention (default 8; Layer 1 uses continuous distance-decay global attention)')
 parser.add_argument('--classes-num', default=14, type=int, help='Number of classes (13 anomalies + 1 normal)')
 parser.add_argument('--mlp-dropout', default=0.1, type=float, help='Dropout rate for MLPs')
 

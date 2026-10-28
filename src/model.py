@@ -279,7 +279,7 @@ class MDTBackbone(nn.Module):
     - Base anomaly detector classifier S_det
     """
     def __init__(self, visual_length: int = 256, embed_dim: int = 512,
-                 attn_window: int = 0, visual_layers: int = 2, visual_heads: int = 4,
+                 attn_window: int = 8, visual_layers: int = 2, visual_heads: int = 4,
                  mlp_dropout: float = 0.1, no_mdtp: bool = False):
         super().__init__()
         self.visual_length = visual_length
@@ -351,7 +351,9 @@ class MDTBackbone(nn.Module):
         return s_det, logits_det
 
     def build_window_attention_mask(self, length: int, window: int, device: torch.device):
-        """Construct window attention mask. Returns None for full 256-snippet global temporal attention."""
+        """Construct block-diagonal local window attention mask.
+        True means position is masked out (cannot attend); False means attend.
+        """
         if window <= 0 or window >= length:
             return None
         mask = torch.ones(length, length, dtype=torch.bool, device=device)
@@ -360,6 +362,17 @@ class MDTBackbone(nn.Module):
             end = min(start + window, length)
             mask[start:end, start:end] = False
         return mask
+
+    def build_distance_bias_mask(self, length: int, device: torch.device, tau: float = 4.0, gamma: float = 0.5):
+        """Construct continuous temporal distance-decay attention bias mask (float [T, T]).
+        Attn_ij = (Q K^T / sqrt(d)) - gamma * log(1 + |i - j| / tau)
+        Close frames have zero penalty; distant frames receive smooth power-law attenuation.
+        Equivalent to DSANet's disAdj continuous relational prior in Transformer attention.
+        """
+        t = torch.arange(length, device=device, dtype=torch.float32)
+        dist = (t.unsqueeze(0) - t.unsqueeze(1)).abs()
+        bias = -gamma * torch.log(1.0 + dist / tau)
+        return bias
 
     def forward(self, visual_features: torch.Tensor, padding_mask: torch.Tensor = None,
                 lengths: torch.Tensor = None):
@@ -397,12 +410,17 @@ class MDTBackbone(nn.Module):
         if padding_mask is not None:
             x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
 
-        # Branch 1: Global Temporal Self-Attention
-        # By default (attn_window <= 0 or layer >= 1), captures all-pairs long-range semantic correlations
-        # across the full 256-snippet video, complementing Branch B's local MDTP convolutions.
+        # Branch 1: Hierarchical Dual-Scale Attention
+        # Layer 0: Local Window Attention (W=8 for UCF, W=64 for XD) modeling short-range causal continuity
+        # Layer 1: Global Relational Attention with Continuous Power-Law Temporal Distance Decay Bias (ALiBi / disAdj style)
         f_a = x
         for l_idx, layer in enumerate(self.branch_a_layers):
-            layer_mask = self.build_window_attention_mask(T, self.attn_window, visual_features.device) if (self.attn_window > 0 and l_idx == 0 and self.attn_window < T) else None
+            if l_idx == 0 and self.attn_window > 0 and self.attn_window < T:
+                layer_mask = self.build_window_attention_mask(T, self.attn_window, visual_features.device)
+            elif l_idx >= 1 or self.attn_window <= 0:
+                layer_mask = self.build_distance_bias_mask(T, visual_features.device, tau=4.0, gamma=0.5).to(visual_features.dtype)
+            else:
+                layer_mask = None
             f_a = layer(f_a, attn_mask=layer_mask, key_padding_mask=padding_mask)
 
         # Branch 3: Global Linear Context Aggregator
@@ -1596,7 +1614,7 @@ class MARUPA(nn.Module):
                  visual_width: int = 512,
                  visual_head: int = 4,
                  visual_layers: int = 2,
-                 attn_window: int = 0,
+                 attn_window: int = 8,
                  prompt_prefix: int = 10,
                  prompt_postfix: int = 10,
                  args = None,
