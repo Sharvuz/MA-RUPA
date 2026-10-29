@@ -57,7 +57,9 @@ parser.add_argument('--use-epts', default=True, type=str2bool, help='MA-RUPA v2:
 parser.add_argument('--use-tasl', default=True, type=str2bool, help='MA-RUPA v2: enable CLIP-Text-Anchored Semantic Audio Lifting (TASL)')
 parser.add_argument('--use-pcgrad', default=True, type=str2bool, help='MA-RUPA v2: enable Per-Snippet Multi-Objective PCGrad Junctions')
 parser.add_argument('--routing-mode', choices=['fixed', 'safe_gate'], default='safe_gate', type=str)
-parser.add_argument('--routing-gate-hidden', default=32, type=int, help='Hidden dimension of dynamic safe gate MLP')
+parser.add_argument('--routing-gate-hidden', default=8, type=int, help='Hidden dimension of dynamic safe gate MLP')
+parser.add_argument('--routing-gate-init', default=0.01, type=float, help='Initial value of routing gate')
+parser.add_argument('--routing-gate-max', default=1.0, type=float, help='Maximum scaling factor for routing gate')
 
 # Prior weights for XD-Violence (with Audio)
 parser.add_argument('--routing-det-weight', default=0.45, type=float, help='Prior weight for detector stream')

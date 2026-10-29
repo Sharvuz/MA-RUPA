@@ -51,13 +51,15 @@ parser.add_argument('--use-epts', default=True, type=str2bool, help='MA-RUPA v2:
 parser.add_argument('--use-tasl', default=True, type=str2bool, help='MA-RUPA v2: enable CLIP-Text-Anchored Semantic Lifting (TASL)')
 parser.add_argument('--use-pcgrad', default=True, type=str2bool, help='MA-RUPA v2: enable Per-Snippet Multi-Objective PCGrad Junctions')
 parser.add_argument('--routing-mode', choices=['fixed', 'safe_gate'], default='safe_gate', type=str)
-parser.add_argument('--routing-gate-hidden', default=32, type=int, help='Hidden dimension of dynamic safe gate MLP')
+parser.add_argument('--routing-gate-hidden', default=8, type=int, help='Hidden dimension of dynamic safe gate MLP')
+parser.add_argument('--routing-gate-init', default=0.01, type=float, help='Initial value of routing gate (starts near 0.01 for smooth warmup)')
+parser.add_argument('--routing-gate-max', default=1.0, type=float, help='Maximum scaling factor for routing gate')
 
-# Prior weights for UCF-Crime
-parser.add_argument('--routing-det-weight', default=0.50, type=float, help='Prior weight for detector stream')
-parser.add_argument('--routing-rec-weight', default=0.05, type=float, help='Prior weight for reconstruction stream')
-parser.add_argument('--routing-sem-weight', default=0.38, type=float, help='Prior weight for semantic stream')
-parser.add_argument('--routing-aux-weight', default=0.07, type=float, help='Prior weight for auxiliary motion stream')
+# Prior weights for UCF-Crime (DSANet Gold Standard: 0.90 detector + 0.10 normal reconstruction)
+parser.add_argument('--routing-det-weight', default=0.90, type=float, help='Prior weight for detector stream')
+parser.add_argument('--routing-rec-weight', default=0.10, type=float, help='Prior weight for reconstruction stream')
+parser.add_argument('--routing-sem-weight', default=0.00, type=float, help='Prior weight for semantic stream')
+parser.add_argument('--routing-aux-weight', default=0.00, type=float, help='Prior weight for auxiliary motion stream')
 
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for full dataset SOTA schedule ~2500 gradient steps)')

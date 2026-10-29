@@ -473,6 +473,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_dodo = roc_auc_score(gt_eval, frame_scores_dodo[:min_len])
     ap_dodo = average_precision_score(gt_eval, frame_scores_dodo[:min_len])
 
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Closed-Loop Safe-Gated Routing - DSANet Standard): {roc_routing * 100:.2f}% | AP: {ap_routing * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical BR-STB Backbone): {roc_det * 100:.2f}% | AP: {ap_det * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (Fine-Grained Semantic Alignment - TVSA): {roc_sem_rupa * 100:.2f}% | AP: {ap_sem_rupa * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (Dual-Stream Synergistic Fusion): {roc_ens_rupa * 100:.2f}% | AP: {ap_ens_rupa * 100:.2f}%", flush=True)
