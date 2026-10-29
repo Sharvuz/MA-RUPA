@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .masp_sinkhorn_mil import MASPSinkhornMILLoss, compute_masp_sinkhorn_mil_loss
+
 
 def get_curriculum_omega(epoch_idx: int, curriculum_epochs: float = 5.0, max_omega: float = 1.0) -> float:
     """Computes smooth S-curve Cosine Ramp-up factor omega(e) in [0.0, max_omega].
