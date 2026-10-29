@@ -7,6 +7,7 @@ smooth cosine curriculum warm-up, dynamic Top-K MIL, and rebalanced prototype lo
 import math
 import os
 import random
+import subprocess
 import sys
 import numpy as np
 import torch
@@ -316,6 +317,7 @@ def train(args):
             snip_drop = getattr(args, 'snippet_dropout', 0.15)
             use_epts_flag = getattr(args, 'use_epts', True)
             use_tasl_flag = getattr(args, 'use_tasl', True)
+            w_smooth = getattr(args, 'lambda_smooth', 0.0)
 
             # Pillar 1: Anti-Saturation Top-K MIL Loss (DSANet CLAS2 Standard)
             # Guarantees healthy, non-vanishing gradient flow (loss hovers stably at 0.035 - 0.055 across all 10 epochs)
@@ -415,7 +417,7 @@ def train(args):
             loss_accum['orth'] += loss_orth.item()
             loss_accum['residual'] += loss_event.item()
             loss_accum['gate'] += loss_gate.item()
-            loss_accum['guide'] += (w_guide * loss_sem_guide).item()
+            loss_accum['guide'] += 0.0
             loss_accum['total'] += total_loss.item()
 
             log_interval = max(1, iters_per_epoch // 5)

@@ -7,6 +7,7 @@ interleaved multi-GPU batching, smooth cosine curriculum warm-up, and rebalanced
 import math
 import os
 import random
+import subprocess
 import sys
 import numpy as np
 import torch
@@ -343,6 +344,8 @@ def train(args):
             snip_drop = getattr(args, 'snippet_dropout', 0.15)
             use_epts_flag = getattr(args, 'use_epts', True)
             use_tasl_flag = getattr(args, 'use_tasl', True)
+            w_smooth = getattr(args, 'lambda_smooth', 0.0)
+            w_ahns = getattr(args, 'lambda_ahns', 0.10)
 
             # Pillar 1: Anti-Saturation Top-K MIL Loss (DSANet CLAS2 Standard)
             # Guarantees healthy, non-vanishing gradient flow (loss hovers stably at 0.035 - 0.055 across all 10 epochs)
@@ -460,7 +463,7 @@ def train(args):
             loss_accum['orth'] += loss_orth.item()
             loss_accum['residual'] += loss_event.item()
             loss_accum['gate'] += loss_gate.item()
-            loss_accum['guide'] += (w_guide * loss_sem_guide).item()
+            loss_accum['guide'] += 0.0
             loss_accum['total'] += total_loss.item()
 
             log_interval = max(1, iters_per_epoch // 5)
@@ -468,7 +471,7 @@ def train(args):
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | MIL: {loss_mil_det.item():.4f} "
-                      f"Aux: {loss_mil_aux.item():.4f} | Guide: {(w_guide * loss_sem_guide).item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"Aux: {loss_mil_aux.item():.4f} | ASPM: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
 
             # Mid-Epoch Evaluation & Peak-Catching (SOTA Benchmark Standard: every 50 iters)
             eval_interval_raw = getattr(args, 'eval_interval', 50)

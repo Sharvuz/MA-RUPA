@@ -1,14 +1,14 @@
 """
 InternLM Discovery (intern-s2) Client for MA-RUPA
 Supports OpenAI-compatible API for Shanghai AI Lab's intern-s2 reasoning model.
+Features real-time streaming, System 2 reasoning trace capture, and robust error handling.
 """
 
 import os
 import json
 import urllib.request
 import urllib.error
-from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 
 
 class InternS2Client:
@@ -19,7 +19,7 @@ class InternS2Client:
         api_key: Optional[str] = None,
         base_url: str = "https://discovery-api.intern-ai.org.cn/v1",
         model: str = "intern-s2",
-        timeout: int = 60
+        timeout: int = 180
     ):
         self.api_key = api_key or os.environ.get("INTERN_AI_API_KEY")
         self.base_url = base_url.rstrip("/")
@@ -32,7 +32,10 @@ class InternS2Client:
         thinking_mode: bool = True,
         temperature: float = 0.7,
         top_p: float = 0.95,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = 2048,
+        stream: bool = True,
+        on_reasoning_chunk: Optional[Callable[[str], None]] = None,
+        on_content_chunk: Optional[Callable[[str], None]] = None
     ) -> Dict[str, Any]:
         """Send chat completion request to intern-s2 model.
         
@@ -41,10 +44,13 @@ class InternS2Client:
             thinking_mode: Enable System 2 deep reasoning mode for intern-s2.
             temperature: Sampling temperature.
             top_p: Nucleus sampling parameter.
-            max_tokens: Maximum tokens to generate.
+            max_tokens: Maximum tokens to generate (defaults to 2048 to allow full reasoning trace).
+            stream: Use streaming to prevent HTTP read timeouts and display tokens live.
+            on_reasoning_chunk: Optional callback for streaming reasoning tokens.
+            on_content_chunk: Optional callback for streaming final content tokens.
         
         Returns:
-            Dict containing response or error details.
+            Dict containing 'success', 'reasoning', 'content', and raw details.
         """
         if not self.api_key:
             raise ValueError(
@@ -57,9 +63,7 @@ class InternS2Client:
             "messages": messages,
             "temperature": temperature,
             "top_p": top_p,
-            "extra_body": {
-                "thinking_mode": thinking_mode
-            }
+            "stream": stream,
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
@@ -68,34 +72,62 @@ class InternS2Client:
             endpoint,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MA-RUPA/2.0"
             },
             data=json.dumps(payload).encode("utf-8")
         )
 
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                choice = data["choices"][0]
-                msg = choice.get("message", {})
-                content = msg.get("content") or ""
-                reasoning = msg.get("reasoning_content") or ""
-                
-                # If content is empty/None but reasoning exists, keep reasoning accessible
-                full_text = content if content else reasoning
-                if reasoning and content:
-                    combined = f"<thinking>\n{reasoning}\n</thinking>\n\n{content}"
-                else:
-                    combined = full_text
+                if stream:
+                    reasoning_chunks: List[str] = []
+                    content_chunks: List[str] = []
+                    
+                    for raw_line in resp:
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk["choices"][0].get("delta", {})
+                            
+                            # Capture reasoning trace
+                            r_text = delta.get("reasoning_content") or delta.get("reasoning")
+                            if r_text:
+                                reasoning_chunks.append(r_text)
+                                if on_reasoning_chunk:
+                                    on_reasoning_chunk(r_text)
+                            
+                            # Capture main answer
+                            c_text = delta.get("content")
+                            if c_text:
+                                content_chunks.append(c_text)
+                                if on_content_chunk:
+                                    on_content_chunk(c_text)
+                        except Exception:
+                            continue
 
-                return {
-                    "success": True,
-                    "content": combined,
-                    "answer": content,
-                    "reasoning": reasoning,
-                    "raw": data,
-                    "timestamp": datetime.now().isoformat()
-                }
+                    full_reasoning = "".join(reasoning_chunks).strip()
+                    full_content = "".join(content_chunks).strip()
+
+                    return {
+                        "success": True,
+                        "reasoning": full_reasoning,
+                        "content": full_content or full_reasoning,
+                    }
+                else:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    msg = data["choices"][0]["message"]
+                    return {
+                        "success": True,
+                        "reasoning": msg.get("reasoning_content", ""),
+                        "content": msg.get("content") or msg.get("reasoning_content", ""),
+                        "raw": data
+                    }
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="ignore")
             try:
@@ -120,18 +152,17 @@ class InternS2Client:
             f"For the anomaly category '{class_name}' in dataset '{dataset}', "
             f"provide 5 distinctive, concise visual descriptions of scenes and actions "
             f"characteristic of this anomaly. Each description should be a single clear sentence. "
-            f"Format your response as a JSON array of strings."
+            f"Format your response strictly as a JSON array of strings."
         )
         res = self.chat_completion(
             messages=[
-                {"role": "system", "content": "You are a precise computer vision research assistant."},
+                {"role": "system", "content": "You are a precise computer vision research assistant. Output strictly JSON."},
                 {"role": "user", "content": prompt}
             ],
-            thinking_mode=True
+            stream=True
         )
         if res.get("success"):
-            content = res["content"]
-            # Extract JSON list if present
+            content = res.get("content", "")
             try:
                 start = content.find("[")
                 end = content.rfind("]") + 1
@@ -139,5 +170,5 @@ class InternS2Client:
                     return json.loads(content[start:end])
             except Exception:
                 pass
-            return [line.strip("- *0123456789. ") for line in content.splitlines() if line.strip()]
+            return [line.strip("- *0123456789.\" ") for line in content.splitlines() if line.strip()]
         return []
