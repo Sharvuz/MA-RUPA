@@ -582,7 +582,7 @@ def compute_residual_event_loss(residual_logits: torch.Tensor,
 def compute_bkg_loss(logits4: torch.Tensor,
                      device: torch.device = None,
                      num_classes: int = 14,
-                     epsilon: float = 0.02) -> torch.Tensor:
+                     epsilon: float = 0.10) -> torch.Tensor:
     """Background-centric loss forcing reconstructed prototypes to classify as class 0 (Normal)."""
     if device is None:
         device = logits4.device
@@ -596,7 +596,7 @@ def compute_bkg_loss(logits4: torch.Tensor,
 def compute_event_loss(logits3: torch.Tensor,
                        labels: torch.Tensor,
                        device: torch.device = None,
-                       epsilon: float = 0.02) -> torch.Tensor:
+                       epsilon: float = 0.10) -> torch.Tensor:
     """Event-centric loss matching pooled anomaly features against true crime/violence class."""
     if device is None:
         device = logits3.device

@@ -389,8 +389,8 @@ def train(args):
             )
 
             # Pillar 3: Decoupled Contrastive Alignment (DCSA = Event + Background)
-            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
-            loss_event = compute_event_loss(logits3, one_hot_labels)
+            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text), epsilon=0.10)
+            loss_event = compute_event_loss(logits3, one_hot_labels, epsilon=0.10)
             loss_dcs = loss_event + loss_bkg
 
             # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency, Compactness & Stiefel Regularization
@@ -418,18 +418,20 @@ def train(args):
             loss_gate = torch.tensor(0.0, device=device)
 
             # SOTA Master Loss Engine for XD-Violence (Clean MIL + CLASM + ASPM + DCSA + EPTS + L_sep + AHNS + Stiefel Regularization)
+            # Rebalance weights per Intern-S2: Primary MIL (1.50) dominance + stable CLASM
             lambda_cons = min(0.10, getattr(args, 'lambda_consistency', 0.10))
-            w_clasm_base = getattr(args, 'loss2_weight', 1.00)
-            w_clasm = max(0.20, w_clasm_base * (0.85 ** (epoch_idx - 1)))
+            w_clasm_base = getattr(args, 'loss2_weight', 0.40)
+            w_clasm = max(0.10, w_clasm_base * (0.85 ** (epoch_idx - 1)))
             total_loss = (
-                1.00 * loss_mil_det
+                1.50 * loss_mil_det
                 + 0.30 * loss_mil_aux
                 + w_clasm * loss_clasm
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact
                 + 0.10 * loss_stiefel
-                + 0.30 * loss_dcs
-                + 0.20 * loss_sep
+                + 0.20 * loss_event
+                + 0.20 * loss_bkg
+                + 0.15 * loss_sep
                 + w_smooth * loss_smooth
                 + w_ahns * loss_ahns
             ).mean()

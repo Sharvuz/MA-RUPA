@@ -2342,17 +2342,19 @@ class MARUPA(nn.Module):
         }
 
         # Decoupled Contrastive Semantic Alignment (DCSA):
-        # Pool unified video representation f_main into F_event and F_bkg using S_det weights
+        # Pool video representations into F_event (from residual r_anom) and F_bkg (from reconstructed f_rec)
         prob_abn = 0.65 * s_det + 0.35 * s_sem_bb.detach()
-        abn_weights = ((scale * prob_abn).exp() - 1.0) * valid_mask
+        # Scale stabilization: clamp effective exponent to avoid 10^4 gradient spikes during backprop
+        eff_scale = min(float(scale), 2.0)
+        abn_weights = (torch.exp((eff_scale * prob_abn).clamp(max=4.0)) - 1.0).clamp_min(1e-6) * valid_mask
         abn_weights = F.normalize(abn_weights, p=1, dim=1)
 
-        nor_weights = ((scale * (1.0 - prob_abn)).exp() - 1.0) * valid_mask
+        nor_weights = (torch.exp((eff_scale * (1.0 - prob_abn)).clamp(max=4.0)) - 1.0).clamp_min(1e-6) * valid_mask
         nor_weights = F.normalize(nor_weights, p=1, dim=1)
 
-        abn_feat = torch.matmul(abn_weights.permute(0, 2, 1), f_main)  # [B, 1, D]
+        abn_feat = torch.matmul(abn_weights.permute(0, 2, 1), r_anom)  # [B, 1, D] - Residual event pooling
         abn_feat = abn_feat + alpha_ctx * self.mlp_event(abn_feat)
-        nor_feat = torch.matmul(nor_weights.permute(0, 2, 1), f_main)  # [B, 1, D]
+        nor_feat = torch.matmul(nor_weights.permute(0, 2, 1), f_rec)  # [B, 1, D] - Reconstructed background pooling
 
         abn_feat_norm = F.normalize(abn_feat, dim=-1)
         nor_feat_norm = F.normalize(nor_feat, dim=-1)

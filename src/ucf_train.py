@@ -341,9 +341,9 @@ def train(args):
                 peak_drop_prob=0.0
             )
 
-            # Pillar 3: Decoupled Contrastive Alignment (DCSA = Event + Background)
-            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text))
-            loss_event = compute_event_loss(logits3, one_hot_labels)
+            # Pillar 3: Decoupled Contrastive Alignment (DCSA = Residual Event + Background Normal)
+            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text), epsilon=0.10)
+            loss_event = compute_event_loss(logits3, one_hot_labels, epsilon=0.10)
             loss_dcs = loss_event + loss_bkg
 
             # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency, Compactness & Stiefel-Grassmann Regularization
@@ -372,18 +372,19 @@ def train(args):
             loss_geo = torch.tensor(0.0, device=device)
 
             # SOTA Master Loss Engine: ASPM + EPTS + Clean MIL + DCSA + L_sep + Stiefel Regularization
+            # Rebalance weights per Intern-S2: Boost primary MIL (1.50) so binary AUC gradient dominates auxiliary semantics
             lambda_cons = min(0.10, getattr(args, 'lambda_consistency', 0.10))
-            # Anneal CLASM weight: High at Epoch 1 (1.10) to bootstrap semantics, then decays to 0.15 to prevent background memorization
-            w_clasm_base = getattr(args, 'loss2_weight', 1.10)
-            w_clasm = max(0.15, w_clasm_base * (0.80 ** (epoch_idx - 1)))
+            w_clasm_base = getattr(args, 'loss2_weight', 0.40)
+            w_clasm = max(0.10, w_clasm_base * (0.85 ** (epoch_idx - 1)))
             total_loss = (
-                1.00 * loss_mil_det
+                1.50 * loss_mil_det
                 + w_clasm * loss_clasm
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact
                 + 0.10 * loss_stiefel
-                + 0.20 * loss_dcs
-                + 0.20 * loss_sep
+                + 0.20 * loss_event
+                + 0.20 * loss_bkg
+                + 0.15 * loss_sep
                 + w_smooth * loss_smooth
             ).mean()
 
