@@ -2308,11 +2308,13 @@ class MARUPA(nn.Module):
         # Step 3: Adaptive Stiefel Prototype Manifold (ASPM) Normality Modeling
         if hasattr(self, 'aspm') and self.aspm is not None:
             f_rec, r_anom, s_rec, l_compact = self.aspm(f_main, s_det)
+            u_basis = self.aspm.get_stiefel_basis()
         else:
             f_rec = f_main
             r_anom = torch.zeros_like(f_main)
             s_rec = torch.zeros_like(s_det)
             l_compact = torch.zeros(B, 1, device=target_device, dtype=visual.dtype)
+            u_basis = None
 
         logits1 = logits_det
         dnp_dict = {
@@ -2333,6 +2335,7 @@ class MARUPA(nn.Module):
             'reconstructed_features': f_rec,
             'residual_features': r_anom,
             'l_compact': l_compact,
+            'u_norm': u_basis,
             'g_loss': torch.zeros(B, 1, device=target_device),
             'orth_loss': torch.zeros(B, 1, device=target_device),
             'dnp_normal_loss': torch.zeros(B, 1, device=target_device),

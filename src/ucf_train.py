@@ -23,6 +23,7 @@ from utils.losses import (
     get_curriculum_omega,
     compute_maf_mil_loss,
     compute_anti_saturation_mil_loss,
+    compute_stiefel_grassmann_loss,
     compute_temporal_tv_loss,
     compute_epts_loss,
     compute_text_separation_loss,
@@ -97,8 +98,6 @@ def train(args):
             args.lambda_orth = 0.05
         if getattr(args, 'lambda_consistency', 0.10) > 0.15:
             args.lambda_consistency = 0.10
-        if getattr(args, 'loss2_weight', 1.2) < 0.8:
-            args.loss2_weight = 1.2
         if getattr(args, 'temp', 1.0) > 5.5:
             args.temp = 5.0
 
@@ -200,10 +199,10 @@ def train(args):
         else:
             backbone_params.append(p)
 
-    # DSANet-style decoupled regularizations: ASPM memory bank gets higher weight decay (1e-4) to prevent background memorization
+    # DSANet-style decoupled regularizations: ASPM memory bank gets higher learning rate (2.0x) to adapt manifold faster than backbone overfits
     optimizer = torch.optim.AdamW([
         {'params': backbone_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
-        {'params': aspm_params, 'lr': args.lr, 'weight_decay': 1e-4},
+        {'params': aspm_params, 'lr': args.lr * 2.0, 'weight_decay': 1e-4},
         {'params': adapter_params, 'lr': args.lr * 0.75, 'weight_decay': args.weight_decay},
         {'params': aux_gate_params, 'lr': args.lr * 0.45, 'weight_decay': args.weight_decay * 2.0},
     ], betas=(0.9, 0.999), amsgrad=True)
@@ -347,9 +346,14 @@ def train(args):
             loss_event = compute_event_loss(logits3, one_hot_labels)
             loss_dcs = loss_event + loss_bkg
 
-            # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency & Compactness
+            # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency, Compactness & Stiefel-Grassmann Regularization
             loss_consistency = F.mse_loss(s_det, dnp_dict['reconstruction_scores'])
             loss_compact = dnp_dict.get('l_compact', torch.tensor(0.0, device=device)).mean()
+            u_basis = dnp_dict.get('u_norm', None)
+            if u_basis is not None:
+                loss_stiefel = compute_stiefel_grassmann_loss(u_basis, lambda_stiefel=0.5, lambda_grassmann=0.25)
+            else:
+                loss_stiefel = torch.tensor(0.0, device=device)
 
             # Pillar 5: Edge-Preserving Temporal Sharpening (EPTS - Zero Peak Clipping)
             if w_smooth > 0.0:
@@ -363,17 +367,21 @@ def train(args):
             # Backward-compatible dummy logs
             loss_tasl = torch.tensor(0.0, device=device)
             loss_gather = torch.tensor(0.0, device=device)
-            loss_orth = torch.tensor(0.0, device=device)
+            loss_orth = loss_stiefel
             loss_gate = torch.tensor(0.0, device=device)
             loss_geo = torch.tensor(0.0, device=device)
 
-            # SOTA Master Loss Engine: ASPM + EPTS + Clean MIL + DCSA + L_sep
+            # SOTA Master Loss Engine: ASPM + EPTS + Clean MIL + DCSA + L_sep + Stiefel Regularization
             lambda_cons = min(0.10, getattr(args, 'lambda_consistency', 0.10))
+            # Anneal CLASM weight: High at Epoch 1 (1.10) to bootstrap semantics, then decays to 0.15 to prevent background memorization
+            w_clasm_base = getattr(args, 'loss2_weight', 1.10)
+            w_clasm = max(0.15, w_clasm_base * (0.80 ** (epoch_idx - 1)))
             total_loss = (
                 1.00 * loss_mil_det
-                + 1.10 * loss_clasm
+                + w_clasm * loss_clasm
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact
+                + 0.10 * loss_stiefel
                 + 0.20 * loss_dcs
                 + 0.20 * loss_sep
                 + w_smooth * loss_smooth

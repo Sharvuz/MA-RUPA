@@ -11,6 +11,14 @@ import sys
 import argparse
 from pathlib import Path
 
+# Force UTF-8 encoding on Windows console
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Add project root to sys.path
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(root_dir / "src"))
@@ -62,15 +70,17 @@ def main():
 
     def on_reasoning(chunk: str):
         if first_reasoning[0]:
-            print("\n🧠 [TƯ DUY SUY LUẬN / THINKING PROCESS - SYSTEM 2]:")
+            print("\n[THINKING PROCESS / TU DUY SUY LUAN S2]:")
             first_reasoning[0] = False
-        print(chunk, end="", flush=True)
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
 
     def on_content(chunk: str):
         if first_content[0]:
-            print("\n\n💬 [CÂU TRẢ LỜI CHÍNH THỨC]:")
+            print("\n\n[CAU TRA LOI CHINH THUC]:")
             first_content[0] = False
-        print(chunk, end="", flush=True)
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
 
     res = client.chat_completion(
         messages=[{"role": "user", "content": args.prompt}],
@@ -82,10 +92,10 @@ def main():
 
     print("\n" + "-" * 65)
     if res.get("success"):
-        print("✅ KẾT NỐI THÀNH CÔNG! MÔ HÌNH S2 ĐÃ HOẠT ĐỘNG HOÀN HẢO.")
+        print("[+] KET NOI THANH CONG! MO HINH S2 DA HOAT DONG HOAN HAO.")
     else:
-        print("❌ KẾT NỐI THẤT BẠI!")
-        print("Chi tiết lỗi:", res.get("error"))
+        print("[-] KET NOI THAT BAI!")
+        print("Chi tiet loi:", res.get("error"))
 
 
 if __name__ == "__main__":

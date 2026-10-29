@@ -84,7 +84,10 @@ class InternS2Client:
                     reasoning_chunks: List[str] = []
                     content_chunks: List[str] = []
                     
-                    for raw_line in resp:
+                    while True:
+                        raw_line = resp.readline()
+                        if not raw_line:
+                            break
                         line = raw_line.decode("utf-8", errors="ignore").strip()
                         if not line or not line.startswith("data:"):
                             continue
