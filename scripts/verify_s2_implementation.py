@@ -13,8 +13,8 @@ from utils.losses import (
 )
 print("  [OK] Losses imported successfully.")
 
-# Test AntiSaturationMILLoss
-criterion = AntiSaturationMILLoss(k_ratio=16, eps=0.030, beta=5.0, tau=0.35, use_self_paced=True)
+# Test AntiSaturationMILLoss (Clean Top-K MIL without self-paced gradient sink)
+criterion = AntiSaturationMILLoss(k_ratio=16, eps=1e-4, use_self_paced=False)
 
 # 1. Normal and Abnormal bags
 B, L = 4, 128

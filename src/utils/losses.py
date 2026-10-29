@@ -802,8 +802,8 @@ class AntiSaturationMILLoss(nn.Module):
        (h_i = 1 - |0.5 - p_i|/0.5, w_i = sigmoid(beta * (h_i - tau))) to prevent 1-frame memorization.
     3. Dynamic Top-K Selection: k = clamp(L // k_ratio + 1, 2, L) adaptive to video length.
     """
-    def __init__(self, k_ratio: int = 16, eps: float = 0.030, beta: float = 5.0,
-                 tau: float = 0.35, label_smoothing: float = 0.0, use_self_paced: bool = True):
+    def __init__(self, k_ratio: int = 16, eps: float = 1e-4, beta: float = 5.0,
+                 tau: float = 0.35, label_smoothing: float = 0.0, use_self_paced: bool = False):
         super().__init__()
         self.k_ratio = k_ratio
         self.eps = eps
@@ -811,7 +811,7 @@ class AntiSaturationMILLoss(nn.Module):
         self.tau = tau
         self.label_smoothing = label_smoothing
         self.use_self_paced = use_self_paced
-        self._min_loss_bound = -math.log(1.0 - eps)
+        self._min_loss_bound = -math.log(1.0 - max(1e-4, eps))
 
     def forward(self, scores: torch.Tensor, binary_labels: torch.Tensor,
                 lengths: torch.Tensor = None, epoch: float = 1.0):
@@ -827,7 +827,7 @@ class AntiSaturationMILLoss(nn.Module):
             L = int(lengths[b].item()) if lengths is not None else scores.shape[1]
             vid_s = scores[b, :L].squeeze(-1)  # [L]
             
-            # Anti-saturation likelihood clamping
+            # Anti-saturation likelihood clamping (wide dynamic range: [1e-4, 1.0 - 1e-4])
             s_clamped = torch.clamp(vid_s, self.eps, 1.0 - self.eps)
             
             k = max(2, min(int(L // self.k_ratio + 1), L))
@@ -855,9 +855,9 @@ class AntiSaturationMILLoss(nn.Module):
 
 def compute_anti_saturation_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
                                      lengths: torch.Tensor = None, k_ratio: int = 16,
-                                     eps: float = 0.030, label_smoothing: float = 0.0,
-                                     use_self_paced: bool = True) -> torch.Tensor:
-    """Convenience functional wrapper for Anti-Saturation Self-Paced Top-K MIL Loss."""
+                                     eps: float = 1e-4, label_smoothing: float = 0.0,
+                                     use_self_paced: bool = False) -> torch.Tensor:
+    """Convenience functional wrapper for Anti-Saturation Top-K MIL Loss (DSANet Gold Standard)."""
     criterion = AntiSaturationMILLoss(
         k_ratio=k_ratio, eps=eps, label_smoothing=label_smoothing, use_self_paced=use_self_paced
     )

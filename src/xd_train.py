@@ -444,14 +444,15 @@ def train(args):
             loss_gate = loss_route_anchor
 
             # SOTA Master Loss Engine for XD-Violence (Clean MIL + CLASM + ASPM + DCSA + EPTS + L_sep + AHNS + Stiefel Regularization)
-            # Rebalance weights per Intern-S2: Primary MIL + Routing dominance + stable CLASM
-            lambda_cons = min(0.10, getattr(args, 'lambda_consistency', 0.10))
+            # Dynamic annealing per Intern-S2: Primary MIL + Routing dominance without route anchor gradient sink
+            lambda_cons_base = getattr(args, 'lambda_consistency', 0.08)
+            lambda_cons = max(0.01, min(0.08, lambda_cons_base * (1.0 - 0.5 * (epoch_idx - 1) / max(1.0, args.max_epoch))))
             w_clasm_base = getattr(args, 'loss2_weight', 0.40)
             w_clasm = max(0.10, w_clasm_base * (0.85 ** (epoch_idx - 1)))
             total_loss = (
                 1.00 * loss_mil_det
                 + 1.00 * loss_mil_routing
-                + 0.10 * loss_route_anchor
+                + 0.00 * loss_route_anchor
                 + 0.30 * loss_mil_aux
                 + w_clasm * loss_clasm
                 + lambda_cons * loss_consistency

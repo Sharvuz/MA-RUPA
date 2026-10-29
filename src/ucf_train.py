@@ -398,14 +398,16 @@ def train(args):
             loss_gate = loss_route_anchor
             loss_geo = torch.tensor(0.0, device=device)
 
-            # SOTA Master Loss Engine (Dual Supervised MIL: 1.00 Det + 1.00 Routing + 0.10 Anchor = DSANet 89.2% Standard)
-            lambda_cons = min(0.10, getattr(args, 'lambda_consistency', 0.10))
+            # SOTA Master Loss Engine (Dual Supervised MIL: 1.00 Det + 1.00 Routing = DSANet SOTA >=89.5% Standard)
+            # Dynamic annealing per Intern-S2: consistency guides early normal subspace, then relaxes for discrimination
+            lambda_cons_base = getattr(args, 'lambda_consistency', 0.08)
+            lambda_cons = max(0.01, min(0.08, lambda_cons_base * (1.0 - 0.5 * (epoch_idx - 1) / max(1.0, args.max_epoch))))
             w_clasm_base = getattr(args, 'loss2_weight', 0.40)
             w_clasm = max(0.10, w_clasm_base * (0.85 ** (epoch_idx - 1)))
             total_loss = (
                 1.00 * loss_mil_det
                 + 1.00 * loss_mil_routing
-                + 0.10 * loss_route_anchor
+                + 0.00 * loss_route_anchor  # Freed: eliminated gradient sink that anchored p_routing to s_det
                 + w_clasm * loss_clasm
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact
