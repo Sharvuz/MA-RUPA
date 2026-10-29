@@ -32,3 +32,7 @@ run_config.json
 vggish-features/
 *AudioFeatures/
 *VGGishFeatures/
+
+.env
+.env.*
+!.env.example
