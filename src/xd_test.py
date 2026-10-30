@@ -252,10 +252,12 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         p_ens_aux_np = 0.5 * p_routing_np + 0.5 * p_aux_np
         p_ens_audio_det_np = 0.5 * p_det_np + 0.5 * p_aux_np
 
-        # S2-DeepSeek Asymmetric Audio-Visual Discordance Gate (Cures Acoustic False Alarms on Normal Videos)
-        d_av = np.maximum(0.0, p_aux_np - p_det_np - 0.15)
+        # S2-DeepSeek Asymmetric Audio-Visual Discordance Gate (Target >=87.0% SOTA)
+        # Visual Master combines BR-STB Backbone and Hierarchical Routing
+        p_vis_master_np = 0.50 * p_det_np + 0.50 * p_routing_np
+        d_av = np.maximum(0.0, p_aux_np - p_vis_master_np - 0.15)
         gamma_av = 1.0 / (1.0 + np.exp(10.0 * d_av))
-        p_av_gated_np = np.clip(p_det_np + gamma_av * p_aux_np, 0.0, 1.0)
+        p_av_gated_np = np.clip(0.55 * p_vis_master_np + 0.45 * (gamma_av * p_aux_np), 0.0, 1.0)
         p_ens_tri_np = (p_routing_np + p_sem_np + p_sem_rupa_np) / 3.0
         p_ens_quad_np = 0.30 * p_routing_np + 0.30 * p_sem_np + 0.20 * p_aux_np + 0.20 * p_sem_rupa_np
         p_weighted_np = 0.6 * p_routing_np + 0.4 * p_sem_rupa_np

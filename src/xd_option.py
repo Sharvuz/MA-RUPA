@@ -61,11 +61,11 @@ parser.add_argument('--routing-gate-hidden', default=8, type=int, help='Hidden d
 parser.add_argument('--routing-gate-init', default=0.01, type=float, help='Initial value of routing gate')
 parser.add_argument('--routing-gate-max', default=1.0, type=float, help='Maximum scaling factor for routing gate')
 
-# Prior weights for XD-Violence (with Audio)
-parser.add_argument('--routing-det-weight', default=0.45, type=float, help='Prior weight for detector stream')
-parser.add_argument('--routing-rec-weight', default=0.05, type=float, help='Prior weight for reconstruction stream')
-parser.add_argument('--routing-sem-weight', default=0.42, type=float, help='Prior weight for semantic stream')
-parser.add_argument('--routing-aux-weight', default=0.08, type=float, help='Prior weight for auxiliary audio-visual stream')
+# Prior weights for XD-Violence (with Audio) - Pareto Reformed
+parser.add_argument('--routing-det-weight', default=0.55, type=float, help='Prior weight for detector stream')
+parser.add_argument('--routing-rec-weight', default=0.00, type=float, help='Prior weight for reconstruction stream')
+parser.add_argument('--routing-sem-weight', default=0.00, type=float, help='Prior weight for semantic stream')
+parser.add_argument('--routing-aux-weight', default=0.45, type=float, help='Prior weight for auxiliary audio-visual stream')
 
 # Training & Optimization
 parser.add_argument('--max-epoch', default=10, type=int, help='Total training epochs (default 10 for full dataset SOTA schedule ~5930 gradient steps)')
@@ -101,11 +101,11 @@ parser.add_argument('--lambda-orth', type=float, default=0.05, help='Weight for 
 parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight for DNP subspace gather loss (default 0.12)')
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate KL regularization loss (default 0.01)')
-parser.add_argument('--loss2-weight', '--loss2_weight', dest='loss2_weight', type=float, default=1.40, help='Weight for VLM snippet classification loss (default 1.40)')
-parser.add_argument('--loss-sep-weight', '--loss_sep_weight', dest='loss_sep_weight', type=float, default=1.00, help='Weight for text orthogonality separation loss (default 1.00)')
+parser.add_argument('--loss2-weight', '--loss2_weight', dest='loss2_weight', type=float, default=0.20, help='Weight for VLM snippet classification loss (default 0.20 to prevent gradient dilution)')
+parser.add_argument('--loss-sep-weight', '--loss_sep_weight', dest='loss_sep_weight', type=float, default=0.00, help='Weight for text orthogonality separation loss (default 0.00)')
 parser.add_argument('--loss-routing-anchor-weight', '--loss_routing_anchor_weight', dest='loss_routing_anchor_weight', type=float, default=0.10, help='Weight for routing anchor loss (default 0.10)')
-parser.add_argument('--lambda-consistency', type=float, default=0.10, help='Weight for consistency loss between detector and reconstruction (default 0.10, matching DSANet benchmark)')
-parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss (default 0.5)')
+parser.add_argument('--lambda-consistency', type=float, default=0.00, help='Weight for consistency loss between detector and reconstruction (default 0.00 to avoid negative transfer)')
+parser.add_argument('--lambda-bkg', type=float, default=0.0, help='Weight for background normal loss (default 0.0)')
 
 # Data & Paths
 parser.add_argument('--train-list', default='list/xd_CLIP_rgb.csv', help='Path to training feature CSV list')

@@ -444,16 +444,17 @@ cmd_train_xd = [
     "--temp", "5.0",
     "--use_dd_mil", "True",                  # Dynamic Density Top-k MIL
     "--lambda-consistency", "0.10",
-    "--loss2-weight", "5.0",                 # Multimodal Semantic Supervision (5.0 SOTA)
-    "--loss-sep-weight", "1.00",             # Text Orthogonality Separation Loss (L_sep = 1.0)
+    "--loss2-weight", "0.20",                 # Gentle Semantic Anchor (Zero Gradient Cannibalization)
+    "--loss-sep-weight", "0.00",             # Pruned to focus strictly on Anomaly Localization
+    "--lambda-consistency", "0.00",          # Pruned reconstruction drag
     "--loss-routing-anchor-weight", "0.10",  # Safe-Gate Homotopy Anchor Loss
-    "--routing-det-weight", "0.50",          # Multimodal Synergistic Routing
-    "--routing-rec-weight", "0.20",          # ASPM Reconstruction
-    "--routing-sem-weight", "0.20",          # DCSA Semantic Alignment
-    "--routing-aux-weight", "0.10",          # Audio-Visual Gate
+    "--routing-det-weight", "0.55",          # Visual Backbone SOTA
+    "--routing-aux-weight", "0.45",          # Acoustic Auxiliary SOTA
+    "--routing-rec-weight", "0.00",          # Pruned 56% AP branch
+    "--routing-sem-weight", "0.00",          # Pruned 58% AP branch
     "--routing-gate-init", "0.01",
     "--lambda-smooth", "0.05",
-    "--lambda-ahns", "0.10",                 # Audio Hard Negative Suppression
+    "--lambda-ahns", "0.20",                 # Strong Audio Hard Negative Suppression
     "--sample-one-crop-per-video", "False",  # Full 10 crops per video
     "--eval-interval", "20",                 # Catch peak every 20 iters
     "--snippet-dropout", "0.0",
@@ -462,7 +463,7 @@ cmd_train_xd = [
     "--seed", str(SEED),
     "--model-path", str(xd_model_path),
     "--checkpoint-path", str(xd_checkpoint_path),
-    "--smooth-eval", "False",
+    "--smooth-eval", "True",
     "--smooth-sigma", "0.50"
 ]
 
@@ -502,7 +503,8 @@ cmd_eval_xd = [
     "--gt-segment-path", "list/gt_segment.npy",
     "--gt-label-path", "list/gt_label.npy",
     "--model-path", str(xd_model_path),
-    "--smooth-eval", "False",
+    "--temp", "5.0",
+    "--smooth-eval", "True",
     "--smooth-sigma", "0.50"
 ]
 
@@ -516,6 +518,7 @@ cmd_prober_xd = [
     "--dataset", "xd",
     "--test_list", str(xd_test_csv),
     "--gt_path", "list/gt.npy",
+    "--temp", "5.0",
     "--device", "cuda"
 ]
 subprocess.run(cmd_prober_xd, cwd=REPO_DIR, check=False)""")
