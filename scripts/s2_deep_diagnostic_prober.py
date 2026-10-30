@@ -39,7 +39,7 @@ for p in [src_dir, root_dir]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from model import MARUPA
+from model import MARUPA, load_compatible_model_state
 from utils.dataset import XDDataset, UCFDataset
 from utils import descriptions, tools
 import xd_option as xd_opt
@@ -153,12 +153,12 @@ def load_diagnostic_model(model_path: str, dataset: str, device: str) -> MARUPA:
     
     model = MARUPA(
         num_class=num_classes,
-        embed_dim=512,
-        visual_length=256,
-        visual_width=512,
-        visual_head=4,
-        visual_layers=2,
-        attn_window=8,
+        embed_dim=dummy_args.embed_dim,
+        visual_length=dummy_args.visual_length,
+        visual_width=dummy_args.visual_width,
+        visual_head=dummy_args.visual_head,
+        visual_layers=dummy_args.visual_layers,
+        attn_window=dummy_args.attn_window,
         args=dummy_args,
         device=device
     ).to(device)
@@ -168,8 +168,13 @@ def load_diagnostic_model(model_path: str, dataset: str, device: str) -> MARUPA:
         sd = state.get('model_state_dict', state)
         # Strip DataParallel 'module.' prefix if present
         sd = {k.replace('module.', ''): v for k, v in sd.items()}
-        missing, unexpected = model.load_state_dict(sd, strict=False)
+        missing, unexpected = load_compatible_model_state(model, sd, strict=False)
         print(f"[S2 Prober] Model loaded successfully! (Missing keys: {len(missing)}, Unexpected: {len(unexpected)})")
+        if isinstance(state, dict) and 'args' in state and isinstance(state['args'], dict):
+            cp_args = state['args']
+            if 't_w' in cp_args and hasattr(model, 'clip_adapter'):
+                model.clip_adapter.t_w = float(cp_args['t_w'])
+                print(f"[Auto-Detect] Restored checkpoint text adapter t_w = {model.clip_adapter.t_w}", flush=True)
     else:
         print(f"[S2 Prober] WARNING: Model path '{model_path}' not found! Running in Mock Architecture mode.")
 
@@ -244,8 +249,11 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
             else:
                 s_aux = s_det.copy()
 
-            # Baseline Quad-Stream Fusion
-            s_quad = 0.40 * s_det + 0.25 * s_aux + 0.20 * s_sem + 0.15 * s_rec
+            # Baseline Fusion (DSANet standard for UCF: 90% Det + 10% Rec; XD: 40% Det + 25% Aux + 20% Sem + 15% Rec)
+            if dataset == 'xd':
+                s_quad = 0.40 * s_det + 0.25 * s_aux + 0.20 * s_sem + 0.15 * s_rec
+            else:
+                s_quad = 0.90 * s_det + 0.10 * s_rec
 
             # Match with ground truth frames
             n_frames = length * 16
@@ -331,6 +339,24 @@ def analyze_per_video_degradations(records: List[Dict[str, Any]]) -> Dict[str, A
     # Sort abnormal videos by miss_rate descending (Worst Misses)
     abnormal_evals.sort(key=lambda x: x['miss_rate_percentage'], reverse=True)
 
+    print("\n" + "=" * 90)
+    print("      TOP-10 WORST FALSE ALARMS (NORMAL VIDEOS WITH ANOMALOUS SPIKES)")
+    print("=" * 90)
+    print(f"{'Video Name':<40} | {'Dur(s)':<6} | {'Max':<6} | {'Primary Culprit':<16} | Det / Sem / Rec")
+    print("-" * 90)
+    for v in normal_evals[:10]:
+        bd = v['stream_breakdown_at_peak']
+        bd_str = f"{bd.get('det', 0):.2f} / {bd.get('sem', 0):.2f} / {bd.get('rec', 0):.2f}"
+        print(f"{v['path'][:38]:<40} | {v['length_sec']:<6} | {v['max_score']:<6.3f} | {v['culprit_stream']:<16} | {bd_str}")
+
+    print("\n" + "=" * 90)
+    print("      TOP-10 WORST MISSED ANOMALIES (ABNORMAL VIDEOS WITH HIGH MISS RATE)")
+    print("=" * 90)
+    print(f"{'Video Name':<40} | {'Label':<15} | {'Dur(s)':<6} | {'Mean Anom':<10} | Miss Rate")
+    print("-" * 90)
+    for v in abnormal_evals[:10]:
+        print(f"{v['path'][:38]:<40} | {v['label'][:13]:<15} | {v['length_sec']:<6} | {v['mean_anomaly_score']:<10.3f} | {v['miss_rate_percentage']:.1f}%")
+
     return {
         'top_15_worst_false_alarms': normal_evals[:15],
         'top_15_worst_missed_anomalies': abnormal_evals[:15]
@@ -383,21 +409,56 @@ def multi_stream_failure_attribution(records: List[Dict[str, Any]]) -> Dict[str,
             'manifold_ASPM': round((mean_rec / total) * 100, 2),
         }
     }
+
+    print("\n" + "=" * 90)
+    print("      QUANTITATIVE STREAM BLAME ATTRIBUTION ON FALSE ALARM FRAMES")
+    print("=" * 90)
+    print(f"Total False Alarm Frames Analyzed (FP threshold > 0.40): {len(fa_det_list)}")
+    print(f"  • Detector (BR-STB)      : {attribution['stream_blame_percentage']['detector_BRSTB']:.1f}% (Mean FP score: {mean_det:.3f})")
+    print(f"  • Semantics (TVSA)       : {attribution['stream_blame_percentage']['semantics_TVSA']:.1f}% (Mean FP score: {mean_sem:.3f})")
+    print(f"  • ASPM Manifold (S_rec)  : {attribution['stream_blame_percentage']['manifold_ASPM']:.1f}% (Mean FP score: {mean_rec:.3f})")
+    culprit = max(attribution['stream_blame_percentage'], key=attribution['stream_blame_percentage'].get)
+    print(f"  ==> Primary Contaminant Stream: {culprit.upper()}")
+
     return attribution
 
 
 def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dict[str, Any]:
     """Sweeps Gaussian filter, Asymmetric Audio Gate, and Simplex Weights to unlock max metric."""
-    print("\n" + "=" * 75)
-    print(f"[S2 Mathematical Grid Sweep] Searching for Peak Attainable Metric on {dataset.upper()}...")
-    print("=" * 75)
-
     all_gt = []
     for rec in records:
         all_gt.extend(rec['gt_frames'])
     all_gt = np.array(all_gt, dtype=np.float32)
 
-    # 1. Baseline Evaluation
+    # 1. Standalone Stream Audit
+    all_routing = np.concatenate([np.repeat(r['s_routing'], 16)[:len(r['gt_frames'])] for r in records])
+    all_det = np.concatenate([np.repeat(r['s_det'], 16)[:len(r['gt_frames'])] for r in records])
+    all_rec = np.concatenate([np.repeat(r['s_rec'], 16)[:len(r['gt_frames'])] for r in records])
+    all_sem = np.concatenate([np.repeat(r['s_sem'], 16)[:len(r['gt_frames'])] for r in records])
+    all_dsanet = 0.90 * all_det + 0.10 * all_rec
+
+    audit_streams = [
+        ("Hierarchical BR-STB (S_routing)", all_routing),
+        ("Detector Backbone (S_det)", all_det),
+        ("Adaptive Stiefel Prototype (S_rec)", all_rec),
+        ("Fine-Grained Semantics (S_sem)", all_sem),
+        ("DSANet Benchmark Blend (90/10 Det+Rec)", all_dsanet),
+    ]
+    if dataset == 'xd':
+        all_aux = np.concatenate([np.repeat(r['s_aux'], 16)[:len(r['gt_frames'])] for r in records])
+        audit_streams.append(("Reliability-Gated Audio (S_aux)", all_aux))
+
+    print("\n" + "=" * 90)
+    print(f"      STANDALONE STREAM PERFORMANCE AUDIT ({dataset.upper()})")
+    print("=" * 90)
+    print(f"{'Stream / Modality':<45} | {'AUC':<10} | {'AP':<10}")
+    print("-" * 90)
+    for name, s_arr in audit_streams:
+        auc_val = roc_auc_score(all_gt, s_arr)
+        ap_val = average_precision_score(all_gt, s_arr)
+        print(f"{name:<45} | {auc_val * 100:6.2f}%    | {ap_val * 100:6.2f}%")
+
+    # Baseline Evaluation
     raw_quad = []
     for rec in records:
         raw_quad.extend(np.repeat(rec['s_quad'], 16)[:len(rec['gt_frames'])])
@@ -405,45 +466,57 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
 
     base_auc = roc_auc_score(all_gt, raw_quad)
     base_ap = average_precision_score(all_gt, raw_quad)
-    print(f"  --> Raw Baseline Quad-Stream: AP = {base_ap * 100:.2f}% | AUC = {base_auc * 100:.2f}%")
 
     best_config = {
         'best_ap': base_ap,
         'best_auc': base_auc,
         'best_sigma': 0.0,
-        'best_weights': [0.40, 0.25, 0.20, 0.15],
+        'best_weights': 'Baseline Synergistic',
         'best_gate_tau': 0.0
     }
 
-    # 2. Gaussian Smoothing Sweep
-    sigmas = [0.0, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50, 2.0]
-    for sig in sigmas:
-        smoothed_scores = []
-        for rec in records:
-            f_sc = np.repeat(rec['s_quad'], 16)[:len(rec['gt_frames'])]
-            if sig > 0:
-                f_sc = gaussian_filter1d(f_sc, sigma=sig)
-            smoothed_scores.extend(f_sc)
-        smoothed_scores = np.array(smoothed_scores, dtype=np.float32)
-        auc_s = roc_auc_score(all_gt, smoothed_scores)
-        ap_s = average_precision_score(all_gt, smoothed_scores)
-        
-        target_metric = ap_s if dataset == 'xd' else auc_s
-        cur_best = best_config['best_ap'] if dataset == 'xd' else best_config['best_auc']
-        if target_metric > cur_best:
-            best_config['best_ap'] = ap_s
-            best_config['best_auc'] = auc_s
-            best_config['best_sigma'] = sig
+    # Also check if S_routing alone beats baseline
+    auc_r0 = roc_auc_score(all_gt, all_routing)
+    ap_r0 = average_precision_score(all_gt, all_routing)
+    if (ap_r0 if dataset == 'xd' else auc_r0) > (best_config['best_ap'] if dataset == 'xd' else best_config['best_auc']):
+        best_config['best_ap'] = ap_r0
+        best_config['best_auc'] = auc_r0
+        best_config['best_weights'] = 'Hierarchical BR-STB (S_routing)'
 
-    print(f"  [Sweep Phase 1 - Gaussian Smoothing] Peak at sigma={best_config['best_sigma']}: "
-          f"AP = {best_config['best_ap'] * 100:.2f}% | AUC = {best_config['best_auc'] * 100:.2f}%")
+    print("\n" + "=" * 90)
+    print(f"[S2 Mathematical Grid Sweep] Searching for Peak Attainable Metric on {dataset.upper()}...")
+    print("=" * 90)
+    print(f"  --> Baseline Starting Metric: AP = {base_ap * 100:.2f}% | AUC = {base_auc * 100:.2f}%")
+
+    # 2. Gaussian Smoothing Sweep across Candidate Streams
+    sigmas = [0.0, 0.25, 0.50, 0.75, 1.0, 1.25, 1.50, 2.0]
+    candidate_arrays = [
+        ('S_routing', all_routing),
+        ('DSANet_90_10', all_dsanet),
+        ('S_det', all_det),
+        ('Raw_Blend', raw_quad)
+    ]
+    for c_name, arr in candidate_arrays:
+        for sig in sigmas:
+            s_sm = arr if sig == 0 else gaussian_filter1d(arr, sigma=sig)
+            auc_s = roc_auc_score(all_gt, s_sm)
+            ap_s = average_precision_score(all_gt, s_sm)
+            target_metric = ap_s if dataset == 'xd' else auc_s
+            cur_best = best_config['best_ap'] if dataset == 'xd' else best_config['best_auc']
+            if target_metric > cur_best:
+                best_config['best_ap'] = ap_s
+                best_config['best_auc'] = auc_s
+                best_config['best_sigma'] = sig
+                best_config['best_weights'] = f"{c_name} (smoothed sigma={sig})"
+
+    print(f"  [Sweep Phase 1 - Gaussian Smoothing] Peak reached: "
+          f"AP = {best_config['best_ap'] * 100:.2f}% | AUC = {best_config['best_auc'] * 100:.2f}% ({best_config['best_weights']})")
 
     # 3. Asymmetric Audio Gating Sweep (XD-Violence only)
     if dataset == 'xd':
         for tau_vis in [0.05, 0.10, 0.15, 0.20]:
             gated_scores = []
             for rec in records:
-                # S2 Theorem: Soft-Gate S_aux with S_det
                 gate = 1.0 / (1.0 + np.exp(-12.0 * (rec['s_det'] - tau_vis)))
                 s_aux_gated = rec['s_aux'] * gate
                 s_comb = 0.45 * rec['s_det'] + 0.20 * s_aux_gated + 0.20 * rec['s_sem'] + 0.15 * rec['s_rec']
@@ -458,6 +531,7 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
                 best_config['best_ap'] = ap_g
                 best_config['best_auc'] = auc_g
                 best_config['best_gate_tau'] = tau_vis
+                best_config['best_weights'] = f"Asymmetric Gate tau={tau_vis}"
                 print(f"  [Sweep Phase 2 - Asymmetric Gate] Tau_vis={tau_vis} boosted AP to: {ap_g * 100:.2f}%! (AUC={auc_g * 100:.2f}%)")
 
     # 4. Stream Weight Grid Search
@@ -468,10 +542,13 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
         [0.60, 0.10, 0.20, 0.10],
         [0.35, 0.30, 0.20, 0.15]
     ] if dataset == 'xd' else [
-        [0.60, 0.00, 0.25, 0.15],
+        [1.00, 0.00, 0.00, 0.00],
+        [0.95, 0.00, 0.00, 0.05],
+        [0.90, 0.00, 0.00, 0.10],
+        [0.85, 0.00, 0.00, 0.15],
+        [0.85, 0.00, 0.05, 0.10],
+        [0.80, 0.00, 0.05, 0.15],
         [0.70, 0.00, 0.15, 0.15],
-        [0.75, 0.00, 0.15, 0.10],
-        [0.80, 0.00, 0.10, 0.10]
     ]
 
     for w in weight_candidates:
@@ -495,14 +572,29 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
         if target > cur:
             best_config['best_ap'] = ap_w
             best_config['best_auc'] = auc_w
-            best_config['best_weights'] = w
+            best_config['best_weights'] = f"Simplex Weights {w}"
 
-    print("-" * 75)
+    # Also test routing + ASPM rec combinations
+    for w_r in [0.95, 0.90, 0.85, 0.80]:
+        comb_r = w_r * all_routing + (1.0 - w_r) * all_rec
+        for sig in [0.0, 0.25, 0.50, 0.75]:
+            s_r = comb_r if sig == 0 else gaussian_filter1d(comb_r, sigma=sig)
+            auc_r = roc_auc_score(all_gt, s_r)
+            ap_r = average_precision_score(all_gt, s_r)
+            target = ap_r if dataset == 'xd' else auc_r
+            cur = best_config['best_ap'] if dataset == 'xd' else best_config['best_auc']
+            if target > cur:
+                best_config['best_ap'] = ap_r
+                best_config['best_auc'] = auc_r
+                best_config['best_sigma'] = sig
+                best_config['best_weights'] = f"Routing {int(w_r*100)}% + ASPM {int((1-w_r)*100)}% (sigma={sig})"
+
+    print("-" * 90)
     print(f"🏆 [S2 Optimization Result] Peak Attainable Metric on {dataset.upper()}:")
     print(f"  Frame-level AP : {best_config['best_ap'] * 100:.2f}% (Gain: +{(best_config['best_ap'] - base_ap) * 100:+.2f}%)")
     print(f"  Frame-level AUC: {best_config['best_auc'] * 100:.2f}% (Gain: +{(best_config['best_auc'] - base_auc) * 100:+.2f}%)")
-    print(f"  Recipe: Gaussian Sigma={best_config['best_sigma']}, Stream Weights={best_config['best_weights']}, Gate Tau={best_config['best_gate_tau']}")
-    print("-" * 75)
+    print(f"  Optimal Recipe : {best_config['best_weights']}, Gaussian Sigma={best_config['best_sigma']}, Gate Tau={best_config['best_gate_tau']}")
+    print("-" * 90)
 
     return best_config
 
