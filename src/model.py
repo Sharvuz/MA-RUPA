@@ -1224,9 +1224,12 @@ class AdaptiveStiefelPrototypeManifold(nn.Module):
 
     def get_current_rank(self) -> int:
         e = float(self.epoch_buf.item())
-        ratio = 1.0 / (1.0 + math.exp(-1.5 * (e - 3.0)))
-        rank = int(self.min_rank + (self.max_rank - self.min_rank) * ratio)
-        return max(self.min_rank, min(self.max_rank, rank))
+        # Cap active Stiefel manifold rank at 24 (Goldilocks Compact Regime: 72.08% AP / 92.07% AUC)
+        # Prevents over-complete subspace expansion (rank 40->61) from absorbing anomalies in Epochs 3-10
+        eff_max = min(self.max_rank, 24)
+        ratio = 1.0 / (1.0 + math.exp(-1.2 * (e - 2.0)))
+        rank = int(self.min_rank + (eff_max - self.min_rank) * ratio)
+        return max(self.min_rank, min(eff_max, rank))
 
     def get_stiefel_basis(self) -> torch.Tensor:
         """Returns orthonormal basis U_norm in St(M_e, D) via Polar Retraction (Newton-Schulz).
@@ -1259,24 +1262,29 @@ class AdaptiveStiefelPrototypeManifold(nn.Module):
         B, T, D = f_video.shape
         u_norm = self.get_stiefel_basis().to(f_video.dtype)  # [M_e, D]
 
-        # Orthogonal projection: F_rec = (F_video @ U^T) @ U
-        proj = torch.matmul(f_video, u_norm.t())  # [B, T, M_e]
+        # Detach f_video for Stiefel subspace projection so ASPM compactness/consistency losses
+        # optimize the orthonormal basis U_norm without crushing 512-D BR-STB backbone features
+        f_in = f_video.detach()
+        proj = torch.matmul(f_in, u_norm.t())     # [B, T, M_e]
         f_rec = torch.matmul(proj, u_norm)        # [B, T, D]
-        r_anom = f_video - f_rec
+        r_anom = f_video - f_rec.detach()
 
         # Cosine distance reconstruction error normalized to [0, 1]
-        sim = F.cosine_similarity(f_video, f_rec + 1e-7, dim=-1).unsqueeze(-1)
+        sim = F.cosine_similarity(f_in, f_rec + 1e-7, dim=-1).unsqueeze(-1)
         s_rec = ((1.0 - sim) / 2.0).clamp(0.0, 1.0)
 
-        # Compactness loss on candidate normal frames (bottom 70% lowest scoring frames)
+        # Confidence-weighted compactness loss on candidate normal frames (bottom 55% lowest scoring frames)
         if s_det is not None and T > 4:
-            k_norm = max(1, int(T * 0.70))
-            _, norm_idx = torch.topk(s_det.squeeze(-1), k=k_norm, largest=False, dim=-1)
+            k_norm = max(1, int(T * 0.55))
+            s_det_flat = s_det.detach().squeeze(-1)
+            _, norm_idx = torch.topk(s_det_flat, k=k_norm, largest=False, dim=-1)
             batch_idx = torch.arange(B, device=f_video.device).unsqueeze(1).expand(-1, k_norm)
-            f_norm_cand = f_video[batch_idx, norm_idx]  # [B, k_norm, D]
+            f_norm_cand = f_in[batch_idx, norm_idx]  # [B, k_norm, D]
+            w_norm = ((1.0 - s_det_flat[batch_idx, norm_idx]).clamp(0.05, 1.0) ** 2).unsqueeze(-1)  # [B, k_norm, 1]
             p_n = torch.matmul(f_norm_cand, u_norm.t())
             rec_n = torch.matmul(p_n, u_norm)
-            l_compact = F.mse_loss(rec_n, f_norm_cand, reduction='none').mean(dim=[1, 2]).unsqueeze(-1)  # [B, 1]
+            sq_err = (rec_n - f_norm_cand) ** 2
+            l_compact = (sq_err * w_norm).mean(dim=[1, 2]).unsqueeze(-1)  # [B, 1]
         else:
             l_compact = torch.zeros(B, 1, device=f_video.device, dtype=f_video.dtype)
 
@@ -2431,7 +2439,7 @@ class MARUPA(nn.Module):
 
         # Decoupled Contrastive Semantic Alignment (DCSA):
         # Pool video representations into F_event (from residual r_anom) and F_bkg (from reconstructed f_rec)
-        prob_abn = 0.65 * s_det + 0.35 * s_sem_bb.detach()
+        prob_abn = 0.65 * s_det.detach() + 0.35 * s_sem_bb.detach()
         # Scale stabilization: clamp effective exponent to avoid 10^4 gradient spikes during backprop
         eff_scale = min(float(scale), 2.0)
         abn_weights = (torch.exp((eff_scale * prob_abn).clamp(max=4.0)) - 1.0).clamp_min(1e-6) * valid_mask

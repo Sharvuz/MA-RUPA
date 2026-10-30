@@ -432,15 +432,15 @@ def train(args):
                     s_det.detach().squeeze(-1)[mask_valid]
                 )
                 loss_consistency = F.mse_loss(
-                    s_det.squeeze(-1)[mask_valid],
-                    dnp_dict['reconstruction_scores'].squeeze(-1)[mask_valid]
+                    dnp_dict['reconstruction_scores'].squeeze(-1)[mask_valid],
+                    s_det.detach().squeeze(-1)[mask_valid]
                 )
             else:
                 loss_route_anchor = F.mse_loss(
                     p_routing.squeeze(-1),
                     s_det.detach().squeeze(-1)
                 )
-                loss_consistency = F.mse_loss(s_det, dnp_dict['reconstruction_scores'])
+                loss_consistency = F.mse_loss(dnp_dict['reconstruction_scores'], s_det.detach())
 
             # Train Multimodal Audio-Visual Stream (S_aux) with Anti-Saturation MIL on XD-Violence
             loss_mil_aux = compute_anti_saturation_mil_loss(
@@ -462,15 +462,17 @@ def train(args):
             )
 
             # Pillar 2: Multi-Class Action Classification on Semantics (CLASM, 6 violence classes)
+            clasm_eps = 0.02 if epoch < 2 else 0.05
+            clasm_drop = 0.0 if epoch < 2 else 0.15
             loss_clasm = compute_clasm_loss(
                 logits=logits2,
                 labels=one_hot_labels,
                 lengths=lengths_batch,
                 device=device,
                 k_ratio=16,
-                epsilon=0.02,
+                epsilon=clasm_eps,
                 is_training=True,
-                peak_drop_prob=0.0
+                peak_drop_prob=clasm_drop
             )
 
             # Pillar 3: Decoupled Contrastive Alignment (DCSA = Event + Background)
@@ -508,10 +510,12 @@ def train(args):
             loss_sep_weight = float(getattr(args, 'loss_sep_weight', 1.00))
             loss_anchor_weight = float(getattr(args, 'loss_routing_anchor_weight', 0.10))
 
-            # Intern-S2 Dynamic DCSA Gradient Annealing:
-            # Prevents DCSA contrastive loss (~1.20) from overpowering MIL Detector (~0.035 - 0.055)
+            # Intern-S2 Dynamic DCSA & Post-Warmup CLASM Gradient Annealing:
+            # Prevents DCSA contrastive loss (~1.20) and late-epoch CLASM from overpowering MIL Detector
             # in mid-to-late epochs, ensuring Detector gradients dominate visual backbone representation.
             dcsa_decay = max(0.25, 0.5 * (1.0 + math.cos(math.pi * epoch / max(args.max_epoch, 1))))
+            clasm_decay = 1.0 if epoch < 2 else max(0.50, 0.5 * (1.0 + math.cos(math.pi * (epoch - 1) / max(args.max_epoch - 1, 1))))
+            w_clasm_eff = w_clasm * clasm_decay
             w_dcsa_event = 0.20 * dcsa_decay
             w_dcsa_bkg = 0.20 * dcsa_decay
 
@@ -520,7 +524,7 @@ def train(args):
                 + 1.00 * loss_mil_routing
                 + loss_anchor_weight * loss_route_anchor
                 + 0.30 * loss_mil_aux
-                + w_clasm * loss_clasm
+                + w_clasm_eff * loss_clasm
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact
                 + 0.01 * loss_stiefel
