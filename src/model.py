@@ -2071,9 +2071,9 @@ class MARUPA(nn.Module):
         prior_weights = None
         if hasattr(args, 'routing_det_weight') and hasattr(args, 'routing_rec_weight'):
             prior_weights = [
-                getattr(args, 'routing_det_weight', 0.50 if dataset_type == 'ucf' else 0.50),
-                getattr(args, 'routing_rec_weight', 0.30 if dataset_type == 'ucf' else 0.25),
-                getattr(args, 'routing_sem_weight', 0.20 if dataset_type == 'ucf' else 0.25),
+                getattr(args, 'routing_det_weight', 0.90 if dataset_type == 'ucf' else 0.50),
+                getattr(args, 'routing_rec_weight', 0.10 if dataset_type == 'ucf' else 0.25),
+                getattr(args, 'routing_sem_weight', 0.00 if dataset_type == 'ucf' else 0.25),
                 getattr(args, 'routing_aux_weight', 0.00 if dataset_type == 'ucf' else 0.10)
             ]
         self.safegate = QuadSafeGate(
@@ -2085,9 +2085,9 @@ class MARUPA(nn.Module):
 
         # Closed-Loop Safe-Gated RUPA Routing (DSANet SOTA Breakthrough: >=89.5% AUC on UCF-Crime)
         self.rupa_use = getattr(args, 'rupa_use', True)
-        self.routing_det_weight = float(getattr(args, 'routing_det_weight', 0.50 if dataset_type == 'ucf' else 0.50))
-        self.routing_rec_weight = float(getattr(args, 'routing_rec_weight', 0.30 if dataset_type == 'ucf' else 0.25))
-        self.routing_sem_weight = float(getattr(args, 'routing_sem_weight', 0.20 if dataset_type == 'ucf' else 0.25))
+        self.routing_det_weight = float(getattr(args, 'routing_det_weight', 0.90 if dataset_type == 'ucf' else 0.50))
+        self.routing_rec_weight = float(getattr(args, 'routing_rec_weight', 0.10 if dataset_type == 'ucf' else 0.25))
+        self.routing_sem_weight = float(getattr(args, 'routing_sem_weight', 0.00 if dataset_type == 'ucf' else 0.25))
         rw_sum = self.routing_det_weight + self.routing_rec_weight + self.routing_sem_weight
         if rw_sum > 0:
             self.routing_det_weight /= rw_sum
@@ -2095,7 +2095,7 @@ class MARUPA(nn.Module):
             self.routing_sem_weight /= rw_sum
 
         self.routing_mode = getattr(args, 'routing_mode', 'safe_gate')
-        self.routing_gate_init = float(getattr(args, 'routing_gate_init', 0.85))
+        self.routing_gate_init = float(getattr(args, 'routing_gate_init', 0.01))
         self.routing_gate_max = float(getattr(args, 'routing_gate_max', 1.0))
         routing_gate_hidden = int(getattr(args, 'routing_gate_hidden', 8))
 

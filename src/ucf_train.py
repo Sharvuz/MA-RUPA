@@ -66,6 +66,26 @@ def safe_save_checkpoint(checkpoint_dict, path):
     torch.save(checkpoint_dict, path)
 
 
+from torch.optim.lr_scheduler import _LRScheduler
+
+class WarmCosineScheduler(_LRScheduler):
+    """Cosine learning rate scheduler with linear warm-up (DSANet SOTA standard)."""
+    def __init__(self, optimizer, base_value, final_value, total_iters, warmup_iters=0, start_warmup_value=0):
+        self.final_value = final_value
+        self.total_iters = total_iters
+        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
+        iters = np.arange(total_iters - warmup_iters)
+        schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / max(1, len(iters))))
+        self.schedule = np.concatenate((warmup_schedule, schedule))
+        super(WarmCosineScheduler, self).__init__(optimizer)
+
+    def get_lr(self):
+        if self.last_epoch >= self.total_iters:
+            return [self.final_value for _ in self.base_lrs]
+        else:
+            return [self.schedule[self.last_epoch] for _ in self.base_lrs]
+
+
 def train(args):
     try:
         import subprocess
@@ -183,42 +203,56 @@ def train(args):
         print(f"[Multi-GPU] Detected {torch.cuda.device_count()} GPUs ({', '.join(gpu_names)}). Activating DataParallel for T4x2!", flush=True)
         model = torch.nn.DataParallel(model)
 
-    # Single-stage End-to-End AdamW optimizer with Decoupled Parameter Groups
+    # DSANet Dual Decoupled Optimizer Architecture (Intern-S2 Theorem 1 & Hessian Decoupling)
+    from utils.StableAdamW import StableAdamW
+
     base_model = model.module if hasattr(model, 'module') else model
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    aspm_params, backbone_params, adapter_params, aux_gate_params = [], [], [], []
+    refiner_params, main_model_params = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if 'aspm' in name or 'dnp' in name or 'normal_bank' in name or 'rupa_gate' in name:
-            aspm_params.append(p)
-        elif 'modality_branch' in name or 'safegate' in name or 'av_fusion' in name:
-            aux_gate_params.append(p)
-        elif 'clip_adapter' in name:
-            adapter_params.append(p)
+        if any(k in name for k in ['aspm', 'dnp', 'normal_bank', 'rupa_gate', 'safegate', 'video_anomaly_refiner', 'modality_branch', 'av_fusion']):
+            refiner_params.append(p)
         else:
-            backbone_params.append(p)
+            main_model_params.append(p)
 
-    # DSANet-style decoupled regularizations: ASPM memory bank & RUPA Gate get higher LR (2.0x) and weight_decay=1e-4
-    optimizer = torch.optim.AdamW([
-        {'params': backbone_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
-        {'params': aspm_params, 'lr': args.lr * 2.0, 'weight_decay': 1e-4},
-        {'params': adapter_params, 'lr': args.lr * 0.75, 'weight_decay': args.weight_decay},
-        {'params': aux_gate_params, 'lr': args.lr * 0.45, 'weight_decay': args.weight_decay * 2.0},
-    ], betas=(0.9, 0.999), amsgrad=True)
+    main_lr = args.lr if getattr(args, 'main_lr', None) is None else args.main_lr
+    refiner_lr = args.lr if getattr(args, 'refiner_lr', None) is None else args.refiner_lr
 
+    # Optimizer 1 (Refiner/Routing/ASPM): StableAdamW (10x Tikhonov weight_decay=1e-4, amsgrad=True)
+    optimizer_refiner = StableAdamW(
+        [{'params': refiner_params}],
+        lr=refiner_lr,
+        betas=(0.9, 0.999),
+        weight_decay=1e-4,
+        amsgrad=True,
+        eps=1e-10
+    )
     iters_per_epoch = min(len(normal_loader), len(anomaly_loader))
     total_iters = max(1, args.max_epoch * iters_per_epoch)
-    # Fast Warmup: 50 steps (~1/5 of Epoch 1) matches DSANet standard so model trains at full LR from Epoch 1!
-    warmup_iters = min(100, max(20, int(0.02 * total_iters)))
+    scheduler_refiner = WarmCosineScheduler(
+        optimizer_refiner,
+        base_value=refiner_lr,
+        final_value=refiner_lr * 0.1,
+        total_iters=total_iters,
+        warmup_iters=min(100, max(0, total_iters - 1))
+    )
 
-    def lr_lambda(current_step: int):
-        if current_step < warmup_iters:
-            return float(current_step + 1) / float(warmup_iters)
-        progress = float(current_step - warmup_iters) / float(max(1, total_iters - warmup_iters))
-        return 0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    # Optimizer 2 (Main Backbone/Detector/Text): AdamW (lr=7e-5, wd=1e-5) with CosineAnnealingLR
+    optimizer_main = torch.optim.AdamW(
+        [{'params': main_model_params}],
+        lr=main_lr,
+        weight_decay=1e-5,
+    )
+    scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_main,
+        T_max=args.max_epoch
+    )
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    # Aliases for checkpointing and backward compatibility
+    optimizer = optimizer_main
+    scheduler = scheduler_main
 
     best_auc = 0.0
     best_ap = 0.0
@@ -230,8 +264,24 @@ def train(args):
         print(f"Resuming from checkpoint: {args.checkpoint_path}", flush=True)
         cp = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         load_compatible_model_state(model, cp['model_state_dict'], strict=False)
-        optimizer.load_state_dict(cp['optimizer_state_dict'])
-        scheduler.load_state_dict(cp['scheduler_state_dict'])
+        if 'optimizer_main_state_dict' in cp:
+            optimizer_main.load_state_dict(cp['optimizer_main_state_dict'])
+        elif 'optimizer_state_dict' in cp:
+            try:
+                optimizer_main.load_state_dict(cp['optimizer_state_dict'])
+            except Exception:
+                pass
+        if 'optimizer_refiner_state_dict' in cp:
+            optimizer_refiner.load_state_dict(cp['optimizer_refiner_state_dict'])
+        if 'scheduler_main_state_dict' in cp:
+            scheduler_main.load_state_dict(cp['scheduler_main_state_dict'])
+        elif 'scheduler_state_dict' in cp:
+            try:
+                scheduler_main.load_state_dict(cp['scheduler_state_dict'])
+            except Exception:
+                pass
+        if 'scheduler_refiner_state_dict' in cp:
+            scheduler_refiner.load_state_dict(cp['scheduler_refiner_state_dict'])
         start_epoch = cp['epoch'] + 1
         best_auc = cp.get('best_auc', 0.0)
         best_ap = cp.get('best_ap', 0.0)
@@ -399,33 +449,36 @@ def train(args):
             loss_geo = torch.tensor(0.0, device=device)
 
             # SOTA Master Loss Engine (Dual Supervised MIL: 1.00 Det + 1.00 Routing = DSANet SOTA >=89.5% Standard)
-            # Dynamic annealing per Intern-S2: consistency guides early normal subspace, then relaxes for discrimination
-            lambda_cons_base = getattr(args, 'lambda_consistency', 0.08)
-            lambda_cons = max(0.01, min(0.08, lambda_cons_base * (1.0 - 0.5 * (epoch_idx - 1) / max(1.0, args.max_epoch))))
-            w_clasm_base = getattr(args, 'loss2_weight', 0.40)
-            w_clasm = max(0.10, w_clasm_base * (0.85 ** (epoch_idx - 1)))
+            # Intern-S2 Breakthrough: Non-decaying strong semantic supervision (w_clasm = 1.10) + Full Text Separation (loss_sep = 1.0)
+            lambda_cons = float(getattr(args, 'lambda_consistency', 0.10))
+            w_clasm = float(getattr(args, 'loss2_weight', 1.10))
+            loss_sep_weight = float(getattr(args, 'loss_sep_weight', 1.00))
+            loss_anchor_weight = float(getattr(args, 'loss_routing_anchor_weight', 0.10))
+
             total_loss = (
                 1.00 * loss_mil_det
                 + 1.00 * loss_mil_routing
-                + 0.00 * loss_route_anchor  # Freed: eliminated gradient sink that anchored p_routing to s_det
+                + loss_anchor_weight * loss_route_anchor
                 + w_clasm * loss_clasm
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact
-                + 0.10 * loss_stiefel
+                + 0.01 * loss_stiefel
                 + 0.20 * loss_event
                 + 0.20 * loss_bkg
-                + 0.15 * loss_sep
-                + w_smooth * loss_smooth
+                + loss_sep_weight * loss_sep
+                + (w_smooth * loss_smooth if w_smooth > 0 else 0.0)
             ).mean()
 
-            optimizer.zero_grad()
+            optimizer_main.zero_grad()
+            optimizer_refiner.zero_grad()
             total_loss.backward()
 
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip)
 
-            optimizer.step()
-            scheduler.step()
+            optimizer_main.step()
+            optimizer_refiner.step()
+            scheduler_refiner.step()
 
             # Update Global Normal Memory Bank strictly from pure Normal bags on primary GPU
             if 'dynamic_normal_patterns' in dnp_dict:
@@ -489,8 +542,12 @@ def train(args):
                             'epoch': epoch,
                             'step': step_total,
                             'model_state_dict': {k: v.cpu() for k, v in eval_model.state_dict().items()},
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
+                            'optimizer_main_state_dict': optimizer_main.state_dict(),
+                            'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
+                            'scheduler_main_state_dict': scheduler_main.state_dict(),
+                            'scheduler_refiner_state_dict': scheduler_refiner.state_dict(),
+                            'optimizer_state_dict': optimizer_main.state_dict(),
+                            'scheduler_state_dict': scheduler_main.state_dict(),
                             'best_auc': best_auc,
                             'best_ap': best_ap,
                             'args': vars(args)
@@ -581,6 +638,9 @@ def train(args):
             mode_tag = "Polyak-EMA Checkpoint" if use_ema_best else "Active Checkpoint"
             print(f"[BEST MODEL] Best AUC: {best_auc * 100:.2f}% | AP: {best_ap * 100:.2f}% ({mode_tag}) saved compactly (~35MB in 0.2s) to {args.model_path}", flush=True)
 
+        # Step Main Backbone Scheduler at epoch boundary
+        scheduler_main.step()
+
         # Periodic checkpoint saving (every 5 epochs or final epoch) to avoid slow disk writes every epoch
         if (epoch + 1) % 5 == 0 or epoch == args.max_epoch - 1:
             saved_raw_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
@@ -588,8 +648,12 @@ def train(args):
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': compact_raw_state,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
+                'optimizer_main_state_dict': optimizer_main.state_dict(),
+                'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
+                'scheduler_main_state_dict': scheduler_main.state_dict(),
+                'scheduler_refiner_state_dict': scheduler_refiner.state_dict(),
+                'optimizer_state_dict': optimizer_main.state_dict(),
+                'scheduler_state_dict': scheduler_main.state_dict(),
                 'auc': eval_auc,
                 'ap': eval_ap,
                 'best_auc': best_auc,
