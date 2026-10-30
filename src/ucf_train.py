@@ -457,6 +457,13 @@ def train(args):
             loss_sep_weight = float(getattr(args, 'loss_sep_weight', 1.00))
             loss_anchor_weight = float(getattr(args, 'loss_routing_anchor_weight', 0.10))
 
+            # Intern-S2 Dynamic DCSA Gradient Annealing:
+            # Prevents DCSA contrastive loss (~1.20) from overpowering MIL Detector (~0.035 - 0.055)
+            # in mid-to-late epochs, ensuring Detector gradients dominate visual backbone representation.
+            dcsa_decay = max(0.25, 0.5 * (1.0 + math.cos(math.pi * epoch / max(args.max_epoch, 1))))
+            w_dcsa_event = 0.20 * dcsa_decay
+            w_dcsa_bkg = 0.20 * dcsa_decay
+
             total_loss = (
                 1.00 * loss_mil_det
                 + 1.00 * loss_mil_routing
@@ -465,8 +472,8 @@ def train(args):
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact
                 + 0.01 * loss_stiefel
-                + 0.20 * loss_event
-                + 0.20 * loss_bkg
+                + w_dcsa_event * loss_event
+                + w_dcsa_bkg * loss_bkg
                 + loss_sep_weight * loss_sep
                 + (w_smooth * loss_smooth if w_smooth > 0 else 0.0)
             ).mean()
