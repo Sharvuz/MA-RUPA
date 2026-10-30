@@ -2446,8 +2446,10 @@ class MARUPA(nn.Module):
 
         abn_feat_norm = F.normalize(abn_feat, dim=-1)
         nor_feat_norm = F.normalize(nor_feat, dim=-1)
-        logits3 = (abn_feat_norm @ text_mat) / 0.07
-        logits4 = (nor_feat_norm @ text_mat) / 0.07
+        # Detach text_mat in DCSA so coarse video-level pooling never distorts fine-grained TVSA text anchors
+        text_mat_anchor = text_mat.detach()
+        logits3 = (abn_feat_norm @ text_mat_anchor) / 0.07
+        logits4 = (nor_feat_norm @ text_mat_anchor) / 0.07
 
         if DNP_use:
             return text_features_ori, logits1, logits2, logits3, logits4, dnp_dict
