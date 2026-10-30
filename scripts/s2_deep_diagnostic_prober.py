@@ -50,19 +50,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Intern-S2 Deep Diagnostic Prober")
     parser.add_argument('--dataset', type=str, default='xd', choices=['xd', 'ucf'],
                         help="Target dataset: 'xd' (XD-Violence) or 'ucf' (UCF-Crime)")
-    parser.add_argument('--model-path', type=str, default='',
+    parser.add_argument('--model-path', '--model_path', dest='model_path', type=str, default='',
                         help="Path to trained checkpoint (.pth)")
-    parser.add_argument('--data-dir', type=str, default='',
+    parser.add_argument('--data-dir', '--data_dir', dest='data_dir', type=str, default='',
                         help="Path to pre-extracted CLIP visual features directory")
-    parser.add_argument('--audio-dir', type=str, default='',
+    parser.add_argument('--audio-dir', '--audio_dir', dest='audio_dir', type=str, default='',
                         help="Path to pre-extracted VGGish audio features directory (for XD)")
-    parser.add_argument('--test-file-path', type=str, default='',
+    parser.add_argument('--test-file-path', '--test_file_path', '--test-list', '--test_list', dest='test_file_path', type=str, default='',
                         help="Path to test CSV / text file")
-    parser.add_argument('--gt-path', type=str, default='',
+    parser.add_argument('--gt-path', '--gt_path', dest='gt_path', type=str, default='',
                         help="Path to ground truth frame-level binary numpy array (.npy)")
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--output-json', type=str, default='rupa_artifacts/s2_diagnostic_report.json')
-    parser.add_argument('--scan-inference', action='store_true', default=True,
+    parser.add_argument('--output-json', '--output_json', dest='output_json', type=str, default='rupa_artifacts/s2_diagnostic_report.json')
+    parser.add_argument('--scan-inference', '--scan_inference', dest='scan_inference', action='store_true', default=True,
                         help="Run multi-dimensional grid sweep over test-time post-processing")
     return parser.parse_args()
 
@@ -71,6 +71,8 @@ def resolve_default_paths(args):
     """Auto-detects paths on Kaggle, standard cluster, or local dev environment."""
     def find_first_existing(candidates, fallback):
         for c in candidates:
+            if not c:
+                continue
             # Check direct or relative to root_dir
             if os.path.exists(c):
                 return os.path.abspath(c)
@@ -91,21 +93,23 @@ def resolve_default_paths(args):
             ], '/kaggle/input/xdtestclipfeatures')
         if not args.audio_dir:
             args.audio_dir = find_first_existing([
+                '/kaggle/input/xdtestaudiovggfeatures',
                 '/kaggle/input/xd-vggish-features',
                 '/kaggle/input/xd-violence-features/vggish',
                 'data/XD-Violence/audio'
-            ], '/kaggle/input/xd-vggish-features')
+            ], '/kaggle/input/xdtestaudiovggfeatures')
         if not args.test_file_path or not os.path.exists(args.test_file_path):
             args.test_file_path = find_first_existing([
+                '/kaggle/working/rupa_artifacts/xd_test.csv',
                 'list/xd_CLIP_rgbtest.csv',
                 '/kaggle/working/MA-RUPA/list/xd_CLIP_rgbtest.csv',
                 'data/xd_test.csv',
                 'data/test.csv'
             ], 'list/xd_CLIP_rgbtest.csv')
-        if not args.gt_path or not os.path.exists(args.gt_path):
+        if not args.gt_path or not os.path.exists(args.gt_path) or 'gt_xd' in str(args.gt_path):
             args.gt_path = find_first_existing([
-                'list/gt.npy',
                 '/kaggle/working/MA-RUPA/list/gt.npy',
+                'list/gt.npy',
                 'data/xd_gt.npy',
                 'data/gt.npy'
             ], 'list/gt.npy')
@@ -124,6 +128,7 @@ def resolve_default_paths(args):
             ], '/kaggle/input/ucftestclipfeatures')
         if not args.test_file_path or not os.path.exists(args.test_file_path):
             args.test_file_path = find_first_existing([
+                '/kaggle/working/rupa_artifacts/ucf_test.csv',
                 'list/ucf_CLIP_rgbtest.csv',
                 '/kaggle/working/MA-RUPA/list/ucf_CLIP_rgbtest.csv',
                 'data/ucf_test.csv',
@@ -131,8 +136,8 @@ def resolve_default_paths(args):
             ], 'list/ucf_CLIP_rgbtest.csv')
         if not args.gt_path or not os.path.exists(args.gt_path):
             args.gt_path = find_first_existing([
-                'list/gt_ucf.npy',
                 '/kaggle/working/MA-RUPA/list/gt_ucf.npy',
+                'list/gt_ucf.npy',
                 'data/ucf_gt.npy',
                 'data/gt-ucf.npy'
             ], 'list/gt_ucf.npy')

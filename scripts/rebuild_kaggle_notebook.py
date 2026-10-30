@@ -507,7 +507,18 @@ cmd_eval_xd = [
 ]
 
 print("🔍 Đang đánh giá model XD-Violence tốt nhất với Asymmetric AV Discordance Gated Evaluation...", flush=True)
-subprocess.run(cmd_eval_xd, cwd=REPO_DIR, check=True)""")
+subprocess.run(cmd_eval_xd, cwd=REPO_DIR, check=True)
+
+print("\n🔬 Đang chạy Intern-S2 Deep Diagnostic Prober quét tối ưu suy luận cho XD-Violence...", flush=True)
+cmd_prober_xd = [
+    sys.executable, "-u", "scripts/s2_deep_diagnostic_prober.py",
+    "--model_path", str(xd_model_path),
+    "--dataset", "xd",
+    "--test_list", str(xd_test_csv),
+    "--gt_path", "list/gt.npy",
+    "--device", "cuda"
+]
+subprocess.run(cmd_prober_xd, cwd=REPO_DIR, check=False)""")
 
     # Cell 11: Ablation Studies
     add_md("""## 8. Ablation Studies (Phục vụ bài báo khoa học Q1)
