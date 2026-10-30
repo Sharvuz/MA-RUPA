@@ -530,8 +530,11 @@ def main():
 
     # Descriptions & Label Map
     if args.dataset == 'xd':
-        label_map = dict(A=0, B1=1, B2=2, B4=3, B5=4, B6=5, G=6)
-        prompt_text = [descriptions.DESCRIPTIONS_ORI_XD[k][0] for k in ["A", "B1", "B2", "B4", "B5", "B6", "G"]]
+        label_map = {
+            'A': 'normal', 'B1': 'fighting', 'B2': 'shooting',
+            'B4': 'riot', 'B5': 'abuse', 'B6': 'car accident', 'G': 'explosion'
+        }
+        prompt_text = tools.get_prompt_text(label_map)
         test_dataset = XDDataset(
             clip_dim=256,
             file_path=args.test_file_path,
@@ -541,12 +544,14 @@ def main():
             audio_dir=args.audio_dir
         )
     else:
-        label_map = dict(
-            Normal=0, Abuse=1, Arrest=2, Arson=3, Assault=4, Burglary=5,
-            Explosion=6, Fighting=7, RoadAccidents=8, Robbery=9, Shooting=10,
-            Shoplifting=11, Stealing=12, Vandalism=13
-        )
-        prompt_text = [descriptions.DESCRIPTIONS_ORI[k][0] for k in label_map.keys()]
+        label_map = {
+            'Normal': 'Normal', 'Abuse': 'Abuse', 'Arrest': 'Arrest', 'Arson': 'Arson',
+            'Assault': 'Assault', 'Burglary': 'Burglary', 'Explosion': 'Explosion',
+            'Fighting': 'Fighting', 'RoadAccidents': 'RoadAccidents', 'Robbery': 'Robbery',
+            'Shooting': 'Shooting', 'Shoplifting': 'Shoplifting', 'Stealing': 'Stealing',
+            'Vandalism': 'Vandalism'
+        }
+        prompt_text = tools.get_prompt_text(label_map)
         test_dataset = UCFDataset(
             clip_dim=256,
             file_path=args.test_file_path,
@@ -556,7 +561,12 @@ def main():
         )
 
     test_loader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=tools.xd_test_collate_fn if args.dataset == 'xd' else None
     )
 
     # Load Model
