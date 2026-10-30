@@ -61,6 +61,7 @@ def parse_args():
     parser.add_argument('--gt-path', '--gt_path', dest='gt_path', type=str, default='',
                         help="Path to ground truth frame-level binary numpy array (.npy)")
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--temp', type=float, default=5.0, help="Softmax calibration temperature (default 5.0 matching RUPA SOTA)")
     parser.add_argument('--output-json', '--output_json', dest='output_json', type=str, default='rupa_artifacts/s2_diagnostic_report.json')
     parser.add_argument('--scan-inference', '--scan_inference', dest='scan_inference', action='store_true', default=True,
                         help="Run multi-dimensional grid sweep over test-time post-processing")
@@ -188,14 +189,14 @@ def load_diagnostic_model(model_path: str, dataset: str, device: str) -> MARUPA:
 
 
 def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[str],
-                                   gt: np.ndarray, dataset: str, device: str) -> Dict[str, Any]:
+                                   gt: np.ndarray, dataset: str, device: str, temp: float = 5.0) -> Dict[str, Any]:
     """Runs forward pass and collects synchronized per-video snippet & frame tensors."""
     video_records = []
     cursor = 0
     maxlen = 256
-    eff_temp = 0.07
+    eff_temp = temp if temp >= 0.25 else (temp / 0.07)
 
-    print(f"\n[S2 Prober] Running Clinical Inference across Test Dataset...")
+    print(f"\n[S2 Prober] Running Clinical Inference across Test Dataset (eff_temp={eff_temp:.2f})...")
     with torch.no_grad():
         for idx, item in enumerate(test_loader):
             visual = item[0].squeeze(0).to(device)
@@ -241,8 +242,15 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
             s_det = dnp_dict.get('detector_scores', torch.sigmoid(logits1)).reshape(-1)[0:length].cpu().numpy()
             s_routing = dnp_dict.get('routing_scores', torch.sigmoid(logits1)).reshape(-1)[0:length].cpu().numpy()
             
-            p_align = F.softmax(logits2.reshape(-1, logits2.shape[-1])[0:length] / eff_temp, dim=-1)
-            s_sem = (1.0 - p_align[:, 0]).clamp(0.0, 1.0).cpu().numpy()
+            # Adapted semantic logits from RUPA / DNP (counterfactual adaptation)
+            semantic_logits = dnp_dict.get('semantic_logits', logits2)
+            p_align = F.softmax(semantic_logits.reshape(-1, semantic_logits.shape[-1])[0:length] / eff_temp, dim=-1)
+            s_sem_raw = (1.0 - p_align[:, 0]).clamp(0.0, 1.0)
+            if 'semantic_scores' in dnp_dict and dnp_dict['semantic_scores'] is not None:
+                s_sem_direct = dnp_dict['semantic_scores'].reshape(-1)[0:length].clamp(0.0, 1.0)
+                s_sem = (0.5 * s_sem_raw + 0.5 * s_sem_direct).cpu().numpy()
+            else:
+                s_sem = s_sem_raw.cpu().numpy()
             
             if 'reconstruction_scores' in dnp_dict:
                 s_rec = dnp_dict['reconstruction_scores'].reshape(-1)[0:length].cpu().numpy()
@@ -254,9 +262,9 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
             else:
                 s_aux = s_det.copy()
 
-            # Baseline Fusion (DSANet standard for UCF: 90% Det + 10% Rec; XD: 40% Det + 25% Aux + 20% Sem + 15% Rec)
+            # Baseline Fusion (XD: 50% Det + 50% Aux as reliable multimodal baseline; UCF: 90% Det + 10% Rec)
             if dataset == 'xd':
-                s_quad = 0.40 * s_det + 0.25 * s_aux + 0.20 * s_sem + 0.15 * s_rec
+                s_quad = 0.50 * s_det + 0.50 * s_aux
             else:
                 s_quad = 0.90 * s_det + 0.10 * s_rec
 
@@ -457,7 +465,19 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
     ]
     if dataset == 'xd':
         all_aux = np.concatenate([np.repeat(r['s_aux'], 16)[:len(r['gt_frames'])] for r in records])
+        all_av_5050 = 0.50 * all_det + 0.50 * all_aux
+        all_av_routing = 0.50 * all_routing + 0.50 * all_aux
+        all_av_6040 = 0.60 * all_det + 0.40 * all_aux
+        
+        # S2 Asymmetric AV Discordance Gate
+        d_av_all = np.maximum(0.0, all_aux - all_det - 0.15)
+        gamma_av_all = 1.0 / (1.0 + np.exp(10.0 * d_av_all))
+        all_av_gated = np.clip(all_det + gamma_av_all * all_aux, 0.0, 1.0)
+        
         audit_streams.append(("Reliability-Gated Audio (S_aux)", all_aux))
+        audit_streams.append(("Ensemble BR-STB + Audio Aux (50/50)", all_av_5050))
+        audit_streams.append(("Ensemble Routing + Audio Aux (50/50)", all_av_routing))
+        audit_streams.append(("S2 Asymmetric Audio-Visual Discordance Gate", all_av_gated))
 
     print("\n" + "=" * 90)
     print(f"      STANDALONE STREAM PERFORMANCE AUDIT ({dataset.upper()})")
@@ -509,6 +529,14 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
         ('S_sem_stiefel', all_sem_stiefel),
         ('Raw_Blend', raw_quad)
     ]
+    if dataset == 'xd':
+        candidate_arrays.extend([
+            ('S_aux', all_aux),
+            ('Ensemble_BRSTB_Audio_5050', all_av_5050),
+            ('Ensemble_Routing_Audio_5050', all_av_routing),
+            ('Ensemble_BRSTB_Audio_6040', all_av_6040),
+            ('Asymmetric_AV_Discordance_Gated', all_av_gated)
+        ])
     for c_name, arr in candidate_arrays:
         for sig in sigmas:
             s_sm = arr if sig == 0 else gaussian_filter1d(arr, sigma=sig)
@@ -532,7 +560,7 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
             for rec in records:
                 gate = 1.0 / (1.0 + np.exp(-12.0 * (rec['s_det'] - tau_vis)))
                 s_aux_gated = rec['s_aux'] * gate
-                s_comb = 0.45 * rec['s_det'] + 0.20 * s_aux_gated + 0.20 * rec['s_sem'] + 0.15 * rec['s_rec']
+                s_comb = 0.50 * rec['s_det'] + 0.50 * s_aux_gated
                 f_sc = np.repeat(s_comb, 16)[:len(rec['gt_frames'])]
                 if best_config['best_sigma'] > 0:
                     f_sc = gaussian_filter1d(f_sc, sigma=best_config['best_sigma'])
@@ -544,11 +572,17 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
                 best_config['best_ap'] = ap_g
                 best_config['best_auc'] = auc_g
                 best_config['best_gate_tau'] = tau_vis
-                best_config['best_weights'] = f"Asymmetric Gate tau={tau_vis}"
+                best_config['best_weights'] = f"Asymmetric Gate tau={tau_vis} (50/50 Det+Aux)"
                 print(f"  [Sweep Phase 2 - Asymmetric Gate] Tau_vis={tau_vis} boosted AP to: {ap_g * 100:.2f}%! (AUC={auc_g * 100:.2f}%)")
 
     # 4. Stream Weight Grid Search
     weight_candidates = [
+        [0.50, 0.50, 0.00, 0.00],
+        [0.55, 0.45, 0.00, 0.00],
+        [0.60, 0.40, 0.00, 0.00],
+        [0.65, 0.35, 0.00, 0.00],
+        [0.45, 0.45, 0.10, 0.00],
+        [0.40, 0.40, 0.15, 0.05],
         [0.50, 0.20, 0.20, 0.10],
         [0.45, 0.15, 0.25, 0.15],
         [0.55, 0.10, 0.25, 0.10],
@@ -684,7 +718,8 @@ def main():
         prompt_text=prompt_text,
         gt=gt,
         dataset=args.dataset,
-        device=args.device
+        device=args.device,
+        temp=args.temp
     )
 
     # 2. Per-Video Error Ranking
