@@ -164,7 +164,7 @@ def load_diagnostic_model(model_path: str, dataset: str, device: str) -> MARUPA:
     ).to(device)
 
     if os.path.exists(model_path):
-        state = torch.load(model_path, map_location=device)
+        state = tools.safe_load_checkpoint(model_path, map_location=device)
         sd = state.get('model_state_dict', state)
         # Strip DataParallel 'module.' prefix if present
         sd = {k.replace('module.', ''): v for k, v in sd.items()}
