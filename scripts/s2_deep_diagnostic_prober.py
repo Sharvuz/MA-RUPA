@@ -69,71 +69,79 @@ def parse_args():
 
 def resolve_default_paths(args):
     """Auto-detects paths on Kaggle, standard cluster, or local dev environment."""
+    def find_first_existing(candidates, fallback):
+        for c in candidates:
+            # Check direct or relative to root_dir
+            if os.path.exists(c):
+                return os.path.abspath(c)
+            p_rel = os.path.join(root_dir, c)
+            if os.path.exists(p_rel):
+                return os.path.abspath(p_rel)
+        fallback_rel = os.path.join(root_dir, fallback)
+        if os.path.exists(fallback_rel):
+            return os.path.abspath(fallback_rel)
+        return fallback
+
     if args.dataset == 'xd':
         if not args.data_dir:
-            candidates = [
+            args.data_dir = find_first_existing([
                 '/kaggle/input/xdtestclipfeatures',
                 '/kaggle/input/xd-violence-features/XDTestClipFeatures',
                 'data/XD-Violence/features'
-            ]
-            args.data_dir = next((c for c in candidates if os.path.exists(c)), candidates[0])
+            ], '/kaggle/input/xdtestclipfeatures')
         if not args.audio_dir:
-            candidates = [
+            args.audio_dir = find_first_existing([
                 '/kaggle/input/xd-vggish-features',
                 '/kaggle/input/xd-violence-features/vggish',
                 'data/XD-Violence/audio'
-            ]
-            args.audio_dir = next((c for c in candidates if os.path.exists(c)), candidates[0])
-        if not args.test_file_path:
-            candidates = [
+            ], '/kaggle/input/xd-vggish-features')
+        if not args.test_file_path or not os.path.exists(args.test_file_path):
+            args.test_file_path = find_first_existing([
+                'list/xd_CLIP_rgbtest.csv',
+                '/kaggle/working/MA-RUPA/list/xd_CLIP_rgbtest.csv',
                 'data/xd_test.csv',
-                'data/test.csv',
-                '/kaggle/working/MA-RUPA/data/xd_test.csv'
-            ]
-            args.test_file_path = next((c for c in candidates if os.path.exists(c)), 'data/xd_test.csv')
-        if not args.gt_path:
-            candidates = [
+                'data/test.csv'
+            ], 'list/xd_CLIP_rgbtest.csv')
+        if not args.gt_path or not os.path.exists(args.gt_path):
+            args.gt_path = find_first_existing([
+                'list/gt.npy',
+                '/kaggle/working/MA-RUPA/list/gt.npy',
                 'data/xd_gt.npy',
-                'data/gt.npy',
-                '/kaggle/working/MA-RUPA/data/xd_gt.npy'
-            ]
-            args.gt_path = next((c for c in candidates if os.path.exists(c)), 'data/xd_gt.npy')
-        if not args.model_path:
-            candidates = [
+                'data/gt.npy'
+            ], 'list/gt.npy')
+        if not args.model_path or not os.path.exists(args.model_path):
+            args.model_path = find_first_existing([
                 '/kaggle/working/rupa_artifacts/model_xd_best.pth',
                 'rupa_artifacts/model_xd_best.pth',
                 'checkpoints/model_xd_best.pth'
-            ]
-            args.model_path = next((c for c in candidates if os.path.exists(c)), 'rupa_artifacts/model_xd_best.pth')
+            ], 'rupa_artifacts/model_xd_best.pth')
     else:  # UCF-Crime
         if not args.data_dir:
-            candidates = [
+            args.data_dir = find_first_existing([
                 '/kaggle/input/ucftestclipfeatures',
                 '/kaggle/input/ucf-crime-features/UCFTestClipFeatures',
                 'data/UCF-Crime/features'
-            ]
-            args.data_dir = next((c for c in candidates if os.path.exists(c)), candidates[0])
-        if not args.test_file_path:
-            candidates = [
+            ], '/kaggle/input/ucftestclipfeatures')
+        if not args.test_file_path or not os.path.exists(args.test_file_path):
+            args.test_file_path = find_first_existing([
+                'list/ucf_CLIP_rgbtest.csv',
+                '/kaggle/working/MA-RUPA/list/ucf_CLIP_rgbtest.csv',
                 'data/ucf_test.csv',
-                'data/ucf_test.txt',
-                '/kaggle/working/MA-RUPA/data/ucf_test.csv'
-            ]
-            args.test_file_path = next((c for c in candidates if os.path.exists(c)), 'data/ucf_test.csv')
-        if not args.gt_path:
-            candidates = [
+                'data/ucf_test.txt'
+            ], 'list/ucf_CLIP_rgbtest.csv')
+        if not args.gt_path or not os.path.exists(args.gt_path):
+            args.gt_path = find_first_existing([
+                'list/gt_ucf.npy',
+                '/kaggle/working/MA-RUPA/list/gt_ucf.npy',
                 'data/ucf_gt.npy',
-                'data/gt-ucf.npy',
-                '/kaggle/working/MA-RUPA/data/ucf_gt.npy'
-            ]
-            args.gt_path = next((c for c in candidates if os.path.exists(c)), 'data/ucf_gt.npy')
-        if not args.model_path:
-            candidates = [
+                'data/gt-ucf.npy'
+            ], 'list/gt_ucf.npy')
+        if not args.model_path or not os.path.exists(args.model_path):
+            args.model_path = find_first_existing([
                 '/kaggle/working/rupa_artifacts/model_ucf_best.pth',
                 'rupa_artifacts/model_ucf_best.pth',
                 'checkpoints/model_ucf_best.pth'
-            ]
-            args.model_path = next((c for c in candidates if os.path.exists(c)), 'rupa_artifacts/model_ucf_best.pth')
+            ], 'rupa_artifacts/model_ucf_best.pth')
 
 
 def load_diagnostic_model(model_path: str, dataset: str, device: str) -> MARUPA:
