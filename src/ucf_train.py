@@ -375,14 +375,16 @@ def train(args):
                 scores=s_det,
                 binary_labels=binary_labels,
                 lengths=lengths_batch,
-                k_ratio=topk_r
+                k_ratio=topk_r,
+                eps=0.030
             )
             # Pillar 1B: Anti-Saturation Top-K MIL Loss on Closed-Loop Safe-Gated Routing (DSANet route_loss standard: >=89.2% AUC)
             loss_mil_routing = compute_anti_saturation_mil_loss(
                 scores=p_routing,
                 binary_labels=binary_labels,
                 lengths=lengths_batch,
-                k_ratio=topk_r
+                k_ratio=topk_r,
+                eps=0.030
             )
             loss_mil_aux = torch.tensor(0.0, device=device)
 

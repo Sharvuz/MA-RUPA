@@ -409,14 +409,16 @@ def train(args):
                 scores=s_det,
                 binary_labels=binary_labels,
                 lengths=lengths_batch,
-                k_ratio=topk_r
+                k_ratio=topk_r,
+                eps=0.030
             )
             # Pillar 1B: Anti-Saturation Top-K MIL Loss on Closed-Loop Safe-Gated Routing (DSANet route_loss standard)
             loss_mil_routing = compute_anti_saturation_mil_loss(
                 scores=p_routing,
                 binary_labels=binary_labels,
                 lengths=lengths_batch,
-                k_ratio=topk_r
+                k_ratio=topk_r,
+                eps=0.030
             )
 
             # Pillar 1C: Routing Anchor Loss
@@ -445,7 +447,8 @@ def train(args):
                 scores=s_aux,
                 binary_labels=binary_labels,
                 lengths=lengths_batch,
-                k_ratio=topk_r
+                k_ratio=topk_r,
+                eps=0.030
             )
 
             # Audio Hard Negative Suppression (AHNS): Suppresses false acoustic activations on normal bags

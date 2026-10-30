@@ -804,7 +804,7 @@ class AntiSaturationMILLoss(nn.Module):
        (h_i = 1 - |0.5 - p_i|/0.5, w_i = sigmoid(beta * (h_i - tau))) to prevent 1-frame memorization.
     3. Dynamic Top-K Selection: k = clamp(L // k_ratio + 1, 2, L) adaptive to video length.
     """
-    def __init__(self, k_ratio: int = 16, eps: float = 1e-4, beta: float = 5.0,
+    def __init__(self, k_ratio: int = 16, eps: float = 0.030, beta: float = 5.0,
                  tau: float = 0.35, label_smoothing: float = 0.0, use_self_paced: bool = False):
         super().__init__()
         self.k_ratio = k_ratio
@@ -857,7 +857,7 @@ class AntiSaturationMILLoss(nn.Module):
 
 def compute_anti_saturation_mil_loss(scores: torch.Tensor, binary_labels: torch.Tensor,
                                      lengths: torch.Tensor = None, k_ratio: int = 16,
-                                     eps: float = 1e-4, label_smoothing: float = 0.0,
+                                     eps: float = 0.030, label_smoothing: float = 0.0,
                                      use_self_paced: bool = False) -> torch.Tensor:
     """Convenience functional wrapper for Anti-Saturation Top-K MIL Loss (DSANet Gold Standard)."""
     criterion = AntiSaturationMILLoss(
