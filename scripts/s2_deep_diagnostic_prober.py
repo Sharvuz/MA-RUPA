@@ -32,14 +32,18 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.ndimage import gaussian_filter1d
 
-# Add project root to sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Ensure project root and src/ directory are in sys.path
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+src_dir = os.path.join(root_dir, 'src')
+for p in [src_dir, root_dir]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
-from src.model import MARUPA
-from src.utils.dataset import XDDataset, UCFDataset
-from src.utils import descriptions, tools
-import src.xd_option as xd_opt
-import src.ucf_option as ucf_opt
+from model import MARUPA
+from utils.dataset import XDDataset, UCFDataset
+from utils import descriptions, tools
+import xd_option as xd_opt
+import ucf_option as ucf_opt
 
 
 def parse_args():
