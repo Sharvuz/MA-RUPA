@@ -2360,7 +2360,11 @@ class MARUPA(nn.Module):
         # Normal class (0) from reconstructed normal background f_rec;
         # Crime categories (1..C-1) from anomalous residual event r_anom
         f_rec_norm = F.normalize(f_rec, dim=-1)
-        r_anom_norm = F.normalize(r_anom, dim=-1)
+        r_mag = torch.norm(r_anom, dim=-1, keepdim=True).clamp_min(1e-6)
+        # S2 Asymmetric Residual Gating: prevents unit-normalization of near-zero residual noise
+        # on normal frames from hallucinating crime logits in late epochs
+        gate_res = torch.tanh(r_mag / 0.35)
+        r_anom_norm = gate_res * F.normalize(r_anom, dim=-1)
         logits_rec_c0 = (torch.bmm(f_rec_norm, text_enh.transpose(1, 2)) / 0.07)[:, :, :1]
         logits_res_crime = (torch.bmm(r_anom_norm, text_enh.transpose(1, 2)) / 0.07)[:, :, 1:]
         logits2_dcsa = torch.cat([logits_rec_c0, logits_res_crime], dim=-1)
