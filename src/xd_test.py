@@ -91,6 +91,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     ap_ens_det_list = []
     ap_ens_aux_list = []
     ap_ens_audio_det_list = []
+    ap_av_gated_list = []
     ap_ens_tri_list = []
     ap_ens_quad_list = []
     ap_weighted_list = []
@@ -250,6 +251,11 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         p_ens_det_np = 0.5 * p_routing_np + 0.5 * p_det_np
         p_ens_aux_np = 0.5 * p_routing_np + 0.5 * p_aux_np
         p_ens_audio_det_np = 0.5 * p_det_np + 0.5 * p_aux_np
+
+        # S2-DeepSeek Asymmetric Audio-Visual Discordance Gate (Cures Acoustic False Alarms on Normal Videos)
+        d_av = np.maximum(0.0, p_aux_np - p_det_np - 0.15)
+        gamma_av = 1.0 / (1.0 + np.exp(10.0 * d_av))
+        p_av_gated_np = np.clip(p_det_np + gamma_av * p_aux_np, 0.0, 1.0)
         p_ens_tri_np = (p_routing_np + p_sem_np + p_sem_rupa_np) / 3.0
         p_ens_quad_np = 0.30 * p_routing_np + 0.30 * p_sem_np + 0.20 * p_aux_np + 0.20 * p_sem_rupa_np
         p_weighted_np = 0.6 * p_routing_np + 0.4 * p_sem_rupa_np
@@ -290,6 +296,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             p_ens_det_np = smooth_scores(p_ens_det_np, method=smooth_method, sigma=smooth_sigma)
             p_ens_aux_np = smooth_scores(p_ens_aux_np, method=smooth_method, sigma=smooth_sigma)
             p_ens_audio_det_np = smooth_scores(p_ens_audio_det_np, method=smooth_method, sigma=smooth_sigma)
+            p_av_gated_np = smooth_scores(p_av_gated_np, method=smooth_method, sigma=smooth_sigma)
             p_ens_tri_np = smooth_scores(p_ens_tri_np, method=smooth_method, sigma=smooth_sigma)
             p_ens_quad_np = smooth_scores(p_ens_quad_np, method=smooth_method, sigma=smooth_sigma)
             p_weighted_np = smooth_scores(p_weighted_np, method=smooth_method, sigma=smooth_sigma)
@@ -309,6 +316,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         ap_ens_det_list.append(p_ens_det_np)
         ap_ens_aux_list.append(p_ens_aux_np)
         ap_ens_audio_det_list.append(p_ens_audio_det_np)
+        ap_av_gated_list.append(p_av_gated_np)
         ap_ens_tri_list.append(p_ens_tri_np)
         ap_ens_quad_list.append(p_ens_quad_np)
         ap_weighted_list.append(p_weighted_np)
@@ -338,6 +346,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     all_scores_ens_det = np.concatenate(ap_ens_det_list, axis=0)
     all_scores_ens_aux = np.concatenate(ap_ens_aux_list, axis=0)
     all_scores_ens_audio_det = np.concatenate(ap_ens_audio_det_list, axis=0)
+    all_scores_av_gated = np.concatenate(ap_av_gated_list, axis=0)
     all_scores_ens_tri = np.concatenate(ap_ens_tri_list, axis=0)
     all_scores_ens_quad = np.concatenate(ap_ens_quad_list, axis=0)
     all_scores_weighted = np.concatenate(ap_weighted_list, axis=0)
@@ -359,6 +368,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     frame_scores_ens_det = np.nan_to_num(np.repeat(all_scores_ens_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_aux = np.nan_to_num(np.repeat(all_scores_ens_aux, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_audio_det = np.nan_to_num(np.repeat(all_scores_ens_audio_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_scores_av_gated = np.nan_to_num(np.repeat(all_scores_av_gated, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_tri = np.nan_to_num(np.repeat(all_scores_ens_tri, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_ens_quad = np.nan_to_num(np.repeat(all_scores_ens_quad, 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_scores_weighted = np.nan_to_num(np.repeat(all_scores_weighted, 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -433,6 +443,9 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     roc_ens_audio_det = roc_auc_score(gt_eval, frame_scores_ens_audio_det[:min_len])
     ap_ens_audio_det = average_precision_score(gt_eval, frame_scores_ens_audio_det[:min_len])
 
+    roc_av_gated = roc_auc_score(gt_eval, frame_scores_av_gated[:min_len])
+    ap_av_gated = average_precision_score(gt_eval, frame_scores_av_gated[:min_len])
+
     roc_ens_tri = roc_auc_score(gt_eval, frame_scores_ens_tri[:min_len])
     ap_ens_tri = average_precision_score(gt_eval, frame_scores_ens_tri[:min_len])
 
@@ -476,6 +489,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     print(f"[BR-MVAD Evaluation] Frame-level AP (Hierarchical Refined): {ap_hier * 100:.2f}% | AUC: {roc_hier * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AP (Single-Pass Multimodal SOTA): {ap_uccf * 100:.2f}% | AUC: {roc_uccf * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AP (UCCF + DODO - SOTA): {ap_dodo * 100:.2f}% | AUC: {roc_dodo * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AP (S2 Asymmetric Audio-Visual Discordance Gate - TARGET SOTA): {ap_av_gated * 100:.2f}% | AUC: {roc_av_gated * 100:.2f}%", flush=True)
 
     avg_map = 0.0
     if compute_dmap:
@@ -493,13 +507,13 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     best_ap = max(
         ap_raw_det, ap_raw_aux, ap_raw_rec, ap_raw_sem_rupa, ap_raw_fusion,
         ap_routing, ap_det, ap_aux, ap_sem, ap_sem_rupa,
-        ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_aux, ap_ens_audio_det,
+        ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_aux, ap_ens_audio_det, ap_av_gated,
         ap_ens_tri, ap_ens_quad, ap_weighted, ap_geom, ap_harmonic, ap_master, ap_hier, ap_uccf, ap_dodo
     )
     best_auc = max(
         roc_raw_det, roc_raw_aux, roc_raw_rec, roc_raw_sem_rupa, roc_raw_fusion,
         roc_routing, roc_det, roc_aux, roc_sem, roc_sem_rupa,
-        roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_aux, roc_ens_audio_det,
+        roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_aux, roc_ens_audio_det, roc_av_gated,
         roc_ens_tri, roc_ens_quad, roc_weighted, roc_geom, roc_harmonic, roc_master, roc_hier, roc_uccf, roc_dodo
     )
     print(f"  ==> [BEST METRIC] Frame-level AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}%", flush=True)

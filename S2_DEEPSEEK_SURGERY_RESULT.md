@@ -1,68 +1,75 @@
 # S2-DEEPSEEK COLLABORATIVE SURGERY RESULT
-**Project:** MA-RUPA / BR-MVAD v2 (Weakly-Supervised Video Anomaly Detection)  
-**Diagnostician (Bác sĩ bắt bệnh):** `intern-s2` (Shanghai AI Lab, System-2 Reasoning)  
-**Code Surgeon (Bác sĩ mổ xẻ code):** `deepseek-v4` (Elite Principal PyTorch Coder)  
-**Local Integrator (Kỹ sư thi công):** Antigravity  
 
----
+## 1. S2 Diagnosis & Mathematical Formulation (Intern-S2)
 
-## 1. S2 Diagnosis (Bác Sĩ Bắt Bệnh: Intern-S2)
 
-### Bệnh án:
-1. **Critical Bottleneck:** Việc thiếu vắng hoàn toàn cơ chế *self-paced sink* trong Top-K Anti-Saturation MIL trên tập dữ liệu đa phương thức **XD-Violence** (vốn có các phân đoạn bạo lực cực kỳ thưa thớt, mất cân bằng nặng giữa tín hiệu hình ảnh và âm thanh).
-2. **Hậu quả:** Việc chọn cứng Top-K ở các epoch đầu tiên dễ chọn nhầm các mẫu "dương tính giả" (noisy pseudo-positives), gây xung đột gradient trực tiếp với đa tạp Stiefel ASPM, giam hãm AP ở mức ~85–86%. Nhánh `ModalityAdaptiveBranch` thiếu cơ chế đồng thuận có cổng nhiệt độ, khiến các phân đoạn âm thanh không bạo lực gây ô nhiễm tín hiệu định tuyến của video bạo lực thị giác.
 
-### Đơn thuốc Toán học (Prescription):
-Tích hợp **Modality-Adaptive Self-Paced Sinkhorn (MASP) Sink** vào hàm mất mát MIL, thay thế Top-K cứng bằng thuật toán Vận tải Tối ưu (Optimal Transport) khả vi, có điều tiết tiến trình (curriculum-gated):
+# Mathematical Prescriptions for MA-RUPA Rectification
 
-1. **Modality-Adaptive Temperature Scaling:**
-   $$\tau^m = \text{softplus}(W_m \cdot h_{\text{pool}} + b_m), \quad m \in \{v, a\}, \quad \tilde{s}_i^m = s_i^m / \tau^m$$
-2. **Consensus Score:**
-   $$\tilde{s}_i = \alpha^v \tilde{s}_i^v + \alpha^a \tilde{s}_i^a$$
-3. **Self-Paced Curriculum Gate:**
-   $$\ell_i = -\log \sigma(\tilde{s}_i), \quad v_i = \text{clip}\left(\frac{\lambda - \ell_i}{\gamma}, 0, 1\right)$$
-4. **Log-Domain Sinkhorn Transport Plan (Differentiable Top-K):**
-   $$K = -C / \tau, \quad u = \log a - \text{logsumexp}(K + v, \text{dim}=2), \quad v = \log b - \text{logsumexp}(K + u, \text{dim}=1)$$
-   $$P = \exp(K + u + v)$$
-5. **MASP-MIL Loss:**
-   $$\mathcal{L}_{\text{MASP}} = \sum_{k=1}^K P_{:, k}^\top \ell_{:, k} + \lambda_{\text{sink}} \text{KL}(P \,\|\, M_{\text{prior}}) + \lambda_{\text{mod}} \|\alpha^v - \alpha^a\|_1$$
+## 1. Dynamic Density Top-k MIL (Pathology 1 Remedy)
+To mitigate signal dilution of transient anomalies, replace fixed $k$ with density-adaptive selection. Let $\mathbf{s} = \{s_t\}_{t=1}^T$ denote snippet-level anomaly scores for a video of $T$ snippets.
 
----
+**Otsu Thresholding:** Compute optimal threshold $\tau^*$ maximizing inter-class variance between high-score (anomaly) and low-score (normal) distributions:
+$$
+\tau^* = \arg\max_{\tau} \left[ \omega_0(\tau)\omega_1(\tau)\left(\mu_0(\tau) - \mu_1(\tau)\right)^2 \right]
+$$
+where $\omega_{0,1}$ are class probabilities and $\mu_{0,1}$ are means induced by $\tau$.
 
-## 2. DeepSeek Code Surgery (Bác Sĩ Mổ Xẻ Code: DeepSeek v4)
+**Adaptive Window Size:**
+$$
+k(\mathbf{s}) = \text{clamp}\left( \sum_{t=1}^T \mathbb{I}(s_t > \tau^*), \; k_{\min}=2, \; k_{\max}=\left\lfloor \frac{T}{12} \right\rfloor \right)
+$$
 
-DeepSeek đã thực thi thành công mã nguồn PyTorch hoàn chỉnh tại [`src/utils/masp_sinkhorn_mil.py`](file:///c:/Users/huynh/Downloads/MA-RUPA/src/utils/masp_sinkhorn_mil.py):
+**Dynamic MIL Loss:** Let $\{s_{(j)}\}_{j=1}^{k}$ be the top-$k$ scores sorted descending. The bag-level probability is aggregated via:
+$$
+\mathcal{L}_{\text{DD-MIL}} = -\frac{1}{k(\mathbf{s})} \sum_{j=1}^{k(\mathbf{s})} \log \sigma(s_{(j)})
+$$
+This ensures transient events (2 snippets) dominate the gradient rather than being averaged into silence.
 
-```python
-import math
-from typing import List, Optional, Sequence, Tuple, Union
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+## 2. Stiefel Normality Anti-FA Gate (Pathology 2 Remedy)
+To suppress semantic hallucinations ($S_{\text{sem}}$) when manifold geometry ($S_{\text{rec}}$) indicates normality, define a confidence gate based on ASPM reconstruction error.
 
-class MASPSinkhornMILLoss(nn.Module):
-    """Modality-Adaptive Self-Paced Sinkhorn Multiple-Instance Learning Loss (MASP-MIL)."""
+**Gate Function:**
+$$
+G_{\text{Stiefel}} = \tanh\left( \frac{S_{\text{rec}}}{\beta} \right), \quad \beta = 0.50
+$$
+Since $S_{\text{rec}} \approx 0$ for normal geometry, $G_{\text{Stiefel}} \to 0$, nulling semantic noise. For anomalies, $S_{\text{rec}}$ rises, allowing $G_{\text{Stiefel}} \to 1$.
 
-    def __init__(
-        self,
-        num_scales: int = 1,
-        tau: float = 0.10,
-        sinkhorn_iters: int = 30,
-        pos_mass: float = 0.50,
-        neg_mass: float = 1e-3,
-        label_smoothing: float = 0.0,
-        adaptive_scales: str = "entropy",   # "entropy" | "learnable" | "none"
-        scale_temperature: float = 0.50,
-        sparse_reg: float = 0.0,
-        video_bce_weight: float = 0.0,
-        eps: float = 1e-8,
-        reduction: str = "mean",
-    ):
-        super().__init__()
-        ...
-```
+**Corrected Semantic Score:**
+$$
+S_{\text{sem}}^{\prime} = S_{\text{sem}} \cdot G_{\text{Stiefel}}
+$$
 
-### Điểm Sáng Kỹ Thuật Do DeepSeek Giải Quyết:
-1. **Khắc phục Suy biến Ma trận:** Giải thuật Sinkhorn chuẩn trong miền log (`K = -C / tau`) với cập nhật thế đối ngẫu $u, v$ giúp ngăn chặn tràn số (underflow/overflow) và đảm bảo phân bổ khối lượng bất thường $\rho_{\text{pos}} = 0.50$ cho video tội phạm và $\rho_{\text{neg}} = 10^{-3}$ cho video bình thường.
-2. **Độ sắc nét tự thích ứng (Plan Confidence):** Đo lường entropy của kế hoạch vận tải $H(P)$ để tự động cân bằng trọng số giữa các quy mô thời gian (multi-scale temporal windows).
-3. **Tương thích GPU T4 x 2:** Toàn bộ tensor được xử lý theo dạng vector hóa khối (`batch-parallel`), tương thích 100% với `torch.nn.DataParallel`.
+**Consistency Regularization:** Enforce alignment between reconstruction and semantic branches during training:
+$$
+\mathcal{L}_{\text{geo-sem}} = \left\| S_{\text{rec}} - S_{\text{sem}}^{\prime} \right\|_2^2 \cdot \mathbb{I}(y_{\text{normal}})
+$$
+
+## 3. Asymmetric Audio-Visual Discordance Gate (Pathology 3 Remedy)
+To prevent acoustic transients from triggering false alarms in the absence of visual evidence, introduce an asymmetric suppression mechanism. Let $S_{\text{vis}}$ be the visual anomaly score and $S_{\text{aux}}$ be the audio anomaly score.
+
+**Discordance Metric:**
+$$
+D_{\text{av}} = \max\left(0, \; S_{\text{aux}} - S_{\text{vis}} - \delta \right), \quad \delta = 0.15
+$$
+
+**Audio Suppression Factor:**
+$$
+\gamma = \sigma\left( -\eta \cdot D_{\text{av}} \right), \quad \eta = 10
+$$
+If audio exceeds visual evidence by margin $\delta$, $\gamma \to 0$, suppressing the audio contribution.
+
+**Multimodal Fusion:**
+$$
+S_{\text{final}} = S_{\text{vis}} + \gamma \cdot S_{\text{aux}}
+$$
+
+## 4. Composite Objective Function
+The total training objective integrates the adaptive MIL, geometric consistency, and standard reconstruction losses:
+$$
+\mathcal{L}_{\text{total}} = \lambda_1 \mathcal{L}_{\text{DD-MIL}} + \lambda_2 \mathcal{L}_{\text{rec}} + \lambda_3 \mathcal{L}_{\text{geo-sem}} + \lambda_4 \mathcal{L}_{\text{rank}}
+$$
+where $\mathcal{L}_{\text{rank}}$ enforces anomaly score ordering between abnormal and normal bags. Hyperparameters $\{\lambda_i\}$ are tuned via Pareto frontier analysis on validation AUC/AP.
+
+## 2. DeepSeek Code Surgery (DeepSeek v4 Pro)
+

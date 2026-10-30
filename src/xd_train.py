@@ -23,6 +23,10 @@ from utils.losses import (
     get_curriculum_omega,
     compute_maf_mil_loss,
     compute_anti_saturation_mil_loss,
+    compute_dynamic_density_topk_mil_loss,
+    compute_stiefel_gated_semantic_loss,
+    apply_asymmetric_av_discordance_gate,
+    compute_pairwise_ranking_loss,
     compute_stiefel_grassmann_loss,
     compute_ahns_loss,
     compute_temporal_tv_loss,
@@ -403,23 +407,40 @@ def train(args):
             w_smooth = getattr(args, 'lambda_smooth', 0.0)
             w_ahns = getattr(args, 'lambda_ahns', 0.10)
 
-            # Pillar 1A: Anti-Saturation Top-K MIL Loss on Raw Detector (DSANet loss1 standard)
-            # Guarantees healthy, non-vanishing gradient flow (loss hovers stably at 0.035 - 0.055 across all 10 epochs)
-            loss_mil_det = compute_anti_saturation_mil_loss(
-                scores=s_det,
-                binary_labels=binary_labels,
-                lengths=lengths_batch,
-                k_ratio=topk_r,
-                eps=0.030
-            )
-            # Pillar 1B: Anti-Saturation Top-K MIL Loss on Closed-Loop Safe-Gated Routing (DSANet route_loss standard)
-            loss_mil_routing = compute_anti_saturation_mil_loss(
-                scores=p_routing,
-                binary_labels=binary_labels,
-                lengths=lengths_batch,
-                k_ratio=topk_r,
-                eps=0.030
-            )
+            # S2-DeepSeek Surgical Pillar 1: Dynamic Density Top-K MIL Loss (Vectorized Otsu Adaptation)
+            use_dd_mil = getattr(args, 'use_dd_mil', True)
+            if use_dd_mil:
+                loss_mil_det = compute_dynamic_density_topk_mil_loss(
+                    scores=s_det,
+                    binary_labels=binary_labels,
+                    lengths=lengths_batch,
+                    k_min=2,
+                    k_max_div=12,
+                    eps=0.030
+                )
+                loss_mil_routing = compute_dynamic_density_topk_mil_loss(
+                    scores=p_routing,
+                    binary_labels=binary_labels,
+                    lengths=lengths_batch,
+                    k_min=2,
+                    k_max_div=12,
+                    eps=0.030
+                )
+            else:
+                loss_mil_det = compute_anti_saturation_mil_loss(
+                    scores=s_det,
+                    binary_labels=binary_labels,
+                    lengths=lengths_batch,
+                    k_ratio=topk_r,
+                    eps=0.030
+                )
+                loss_mil_routing = compute_anti_saturation_mil_loss(
+                    scores=p_routing,
+                    binary_labels=binary_labels,
+                    lengths=lengths_batch,
+                    k_ratio=topk_r,
+                    eps=0.030
+                )
 
             # Pillar 1C: Routing Anchor Loss
             if lengths_batch is not None:
@@ -442,12 +463,40 @@ def train(args):
                 )
                 loss_consistency = F.mse_loss(dnp_dict['reconstruction_scores'], s_det.detach())
 
-            # Train Multimodal Audio-Visual Stream (S_aux) with Anti-Saturation MIL on XD-Violence
-            loss_mil_aux = compute_anti_saturation_mil_loss(
-                scores=s_aux,
+            # Train Multimodal Audio-Visual Stream (S_aux) with Dynamic Density MIL on XD-Violence
+            if use_dd_mil:
+                loss_mil_aux = compute_dynamic_density_topk_mil_loss(
+                    scores=s_aux,
+                    binary_labels=binary_labels,
+                    lengths=lengths_batch,
+                    k_min=2,
+                    k_max_div=12,
+                    eps=0.030
+                )
+            else:
+                loss_mil_aux = compute_anti_saturation_mil_loss(
+                    scores=s_aux,
+                    binary_labels=binary_labels,
+                    lengths=lengths_batch,
+                    k_ratio=topk_r,
+                    eps=0.030
+                )
+
+            # S2-DeepSeek Asymmetric Audio-Visual Discordance Gate (Cures Acoustic False Alarms):
+            # When audio spikes without visual confirmation (D_av > 0.15), aggressively suppresses acoustic FA:
+            # gamma = sigmoid(-10 * D_av), s_final = s_det + gamma * s_aux
+            s_fused_av, gamma_av, d_av = apply_asymmetric_av_discordance_gate(
+                s_vis=s_det,
+                s_aux=s_aux,
+                delta=0.15,
+                eta=10.0
+            )
+            loss_mil_av = compute_dynamic_density_topk_mil_loss(
+                scores=s_fused_av,
                 binary_labels=binary_labels,
                 lengths=lengths_batch,
-                k_ratio=topk_r,
+                k_min=2,
+                k_max_div=12,
                 eps=0.030
             )
 
@@ -488,6 +537,17 @@ def train(args):
             else:
                 loss_stiefel = torch.tensor(0.0, device=device)
 
+            # S2-DeepSeek Stiefel Normality Anti-FA Gate & Consistency Loss
+            s_rec = dnp_dict.get('reconstruction_scores', s_det)
+            s_sem = dnp_dict.get('semantic_scores', s_det)
+            loss_stiefel_sem, _, _ = compute_stiefel_gated_semantic_loss(
+                s_rec=s_rec,
+                s_sem=s_sem,
+                binary_labels=binary_labels,
+                lengths=lengths_batch,
+                beta=0.50
+            )
+
             # Pillar 5: Edge-Preserving Temporal Sharpening (EPTS - Zero Peak Clipping)
             if w_smooth > 0.0:
                 loss_smooth = compute_epts_loss(s_det, lengths_batch)
@@ -498,7 +558,7 @@ def train(args):
             loss_sep = compute_text_separation_loss(text_features)
 
             loss_tasl = torch.tensor(0.0, device=device)
-            loss_geo = torch.tensor(0.0, device=device)
+            loss_geo = loss_stiefel_sem
             loss_gather = torch.tensor(0.0, device=device)
             loss_orth = loss_stiefel
             loss_gate = loss_route_anchor
@@ -524,6 +584,8 @@ def train(args):
                 + 1.00 * loss_mil_routing
                 + loss_anchor_weight * loss_route_anchor
                 + 0.30 * loss_mil_aux
+                + 0.50 * loss_mil_av
+                + 0.50 * loss_stiefel_sem
                 + w_clasm_eff * loss_clasm
                 + lambda_cons * loss_consistency
                 + 0.10 * loss_compact

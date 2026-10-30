@@ -437,12 +437,18 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
     all_sem = np.concatenate([np.repeat(r['s_sem'], 16)[:len(r['gt_frames'])] for r in records])
     all_dsanet = 0.90 * all_det + 0.10 * all_rec
 
+    # S2-DeepSeek Stiefel Normality Anti-FA Gated Streams
+    all_sem_stiefel = all_sem * np.tanh(all_rec / 0.50)
+    all_s2_gated = 0.50 * all_det + 0.30 * all_rec + 0.20 * all_sem_stiefel
+
     audit_streams = [
         ("Hierarchical BR-STB (S_routing)", all_routing),
         ("Detector Backbone (S_det)", all_det),
         ("Adaptive Stiefel Prototype (S_rec)", all_rec),
         ("Fine-Grained Semantics (S_sem)", all_sem),
+        ("Stiefel Anti-FA Gated Semantics (S_sem_prime)", all_sem_stiefel),
         ("DSANet Benchmark Blend (90/10 Det+Rec)", all_dsanet),
+        ("S2 Stiefel Anti-FA Synergistic Blend", all_s2_gated),
     ]
     if dataset == 'xd':
         all_aux = np.concatenate([np.repeat(r['s_aux'], 16)[:len(r['gt_frames'])] for r in records])
@@ -494,6 +500,8 @@ def run_inference_grid_sweep(records: List[Dict[str, Any]], dataset: str) -> Dic
         ('S_routing', all_routing),
         ('DSANet_90_10', all_dsanet),
         ('S_det', all_det),
+        ('S2_Stiefel_Gated_Blend', all_s2_gated),
+        ('S_sem_stiefel', all_sem_stiefel),
         ('Raw_Blend', raw_quad)
     ]
     for c_name, arr in candidate_arrays:

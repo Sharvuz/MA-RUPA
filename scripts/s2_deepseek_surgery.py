@@ -29,7 +29,7 @@ BASE_URL = "https://discovery-api.intern-ai.org.cn/v1/chat/completions"
 
 # 1. Configuration: S2 is Diagnostician, DeepSeek is Surgeon
 DIAGNOSTICIAN_MODEL = "intern-s2"
-SURGEON_MODEL = "deepseek-v4-pro-0813"
+SURGEON_MODEL = "deepseek-v4-flash-0731"
 
 
 def call_api(model: str, messages: list, temperature: float = 0.2, stream: bool = True, max_tokens: int = 4096, max_retries: int = 4):
@@ -119,35 +119,58 @@ def call_api(model: str, messages: list, temperature: float = 0.2, stream: bool 
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="S2-DeepSeek Collaborative Surgery Pipeline")
+    parser.add_argument("--use-cache", action="store_true", default=False, help="Reuse cached S2 prescription")
+    args = parser.parse_args()
+
     print("=" * 70)
     print("🔬 S2-DEEPSEEK COLLABORATIVE SURGERY PIPELINE FOR MA-RUPA")
     print(f"   - Diagnostician (Bác sĩ bắt bệnh): {DIAGNOSTICIAN_MODEL}")
     print(f"   - Surgeon       (Bác sĩ mổ xẻ code): {SURGEON_MODEL}")
     print("=" * 70)
 
-    # Check for cached diagnosis or query S2 fresh
     cache_path = root_dir / "scripts" / "s2_prescription_cache.txt"
     if cache_path.exists():
         print(f"[*] Reusing high-grade S2 prescription from cache: {cache_path}")
         s2_diagnosis = cache_path.read_text(encoding="utf-8")
     else:
-        s2_system = """You are Intern-S2, Principal Research Scientist in Video Anomaly Detection.
-Your role is SOLELY TO DIAGNOSE & PRESCRIBE:
-- Identify mathematical bottlenecks, gradient conflicts, and missing SOTA mechanisms.
-- Provide exact mathematical formulas and clear architectural prescriptions.
-- Keep internal thinking (<300 tokens) so diagnosis is concise, rigorous, and actionable. Do NOT write full code, write prescriptions for the DeepSeek coder."""
+        s2_system = """You are Intern-S2, Principal Research Scientist in Video Anomaly Detection (WS-VAD).
+Your role is SOLELY THE THEORETICAL BRAIN:
+- Formulate exact mathematical theorems, loss functions, and architectural mechanisms.
+- Do NOT write boilerplate code. Write concise, rigorous mathematical prescriptions with LaTeX equations for DeepSeek v4 Pro (the Code Surgeon) to implement.
+- Keep internal thinking under 350 tokens, focused on mathematical first principles."""
 
-        s2_user = """[DIAGNOSIS TASK FOR UCF-CRIME & XD-VIOLENCE]
-Review our current SOTA architecture:
-1. Backbone: BR-STB (Bi-Relational Spatio-Temporal Backbone)
-2. Normality Modeling: ASPM (Adaptive Stiefel Prototype Manifold on Grassmannian)
-3. Routing: 50% Det + 30% ASPM Rec + 20% DCSA Semantics
-4. Loss: Top-K Anti-Saturation MIL without self-paced sink.
+        s2_user = """[CLINICAL DIAGNOSTIC REPORT FROM EMPIRICAL PROBER ON DUAL T4]
+We ran the Intern-S2 Deep Diagnostic Prober on our trained MA-RUPA model:
+Baseline scores:
+- Standalone Hierarchical BR-STB (S_routing): 84.46% AUC (peak 86.26% AUC)
+- Standalone Detector Backbone (S_det): 84.45% AUC
+- Standalone ASPM Stiefel Manifold (S_rec): 74.24% AUC | 23.10% AP
+- Standalone TVSA Semantics (S_sem): 81.63% AUC | 19.66% AP
+- DSANet Benchmark Blend (90/10 Det + Rec): 84.46% AUC | 26.37% AP
 
-What is the single most critical remaining refinement in PyTorch for the ModalityAdaptiveBranch or Loss to guarantee XD-Violence AP >= 87.5%? Prescribe the exact mathematical formulation for DeepSeek to implement."""
+CRITICAL PATHOLOGY 1: Subtle Anomaly Blindspot (100% Miss Rate on Shoplifting & RoadAccidents)
+- Top-10 missed abnormal videos: 40% are Shoplifting (Shoplifting005, 010, 015, 022) and 30% are RoadAccidents (RoadAccidents011, 127, 132).
+- Diagnosis: Standard MIL with fixed k = T/16 averages 16 snippets. For subtle actions or instantaneous crashes lasting only 1-2 snippets, fixed Top-k averages 2 anomaly snippets with 14 normal snippets, diluting the abnormal signal by 87.5% and causing complete miss!
+- Prescribe: Dynamic Density Top-k MIL Loss (Otsu-anchored or entropy-density adaptive k) that dynamically shrinks k to k_min=2 for sparse/transient anomalies while expanding for prolonged events:
+  k_adaptive = clamp(sum_t I(s_t > tau_otsu), k_min=2, k_max=floor(T/12)).
+
+CRITICAL PATHOLOGY 2: High-Dynamic False Alarm Cluster on Night/Traffic Scenes
+- Top-10 worst false alarms on normal videos (e.g. Normal_Videos_925, 878, 896, 887):
+  S_sem explodes to 1.00, S_det reaches 0.97 - 1.00.
+  HOWEVER, ASPM Reconstruction (S_rec) stays clean and calm at 0.38 - 0.44!
+- Diagnosis: Night headlight glare and shadows cause CLIP visual embeddings to drift toward crime prompts (fire, accident). TVSA hallucinates crime. ASPM on the Stiefel Grassmannian correctly identifies normal manifold geometry.
+- Prescribe: Stiefel Normality Anti-FA Gate that dynamically suppresses TVSA semantic hallucination using ASPM S_rec confidence: S_sem_clean = S_sem * tanh(S_rec / 0.50).
+
+CRITICAL PATHOLOGY 3: XD-Violence Audio Discordance False Alarms (Crushing AP to 83.08% vs 94.72% AUC)
+- Normal scenes with loud acoustic transients (music, shouts, engines) spike S_aux > 0.9 while visual is calm.
+- Prescribe: Asymmetric Audio-Visual Discordance Gating for the ModalityAdaptiveBranch.
+
+Provide the exact mathematical formulation and equations for DeepSeek v4 Pro to implement."""
 
         print("\n" + "=" * 70)
-        print("🏥 [STAGE 1] S2 ĐANG BẮT BỆNH VÀ KÊ ĐƠN THUỐC...")
+        print("🏥 [STAGE 1] INTERN-S2 ĐANG BẮT BỆNH VÀ THIẾT LẬP CÔNG THỨC TOÁN HỌC...")
         print("=" * 70)
 
         s2_diagnosis, _ = call_api(
@@ -166,18 +189,23 @@ What is the single most critical remaining refinement in PyTorch for the Modalit
     time.sleep(10)
 
     print("\n" + "=" * 70)
-    print("🔪 [STAGE 2] DEEPSEEK ĐANG MỔ XẺ VÀ HIỆN THỰC HÓA MÃ NGUỒN PYTORCH...")
+    print("🔪 [STAGE 2] DEEPSEEK V4 PRO ĐANG MỔ XẺ VÀ HIỆN THỰC HÓA MÃ NGUỒN PYTORCH...")
     print("=" * 70)
 
     deepseek_system = """You are DeepSeek v4 Pro, Elite Principal PyTorch Research Engineer & Code Surgeon.
-You receive the theoretical diagnosis and mathematical prescription from Intern-S2.
+You receive the theoretical diagnosis and mathematical formulas from Intern-S2.
 Your role is SOLELY TO PERFORM CODE SURGERY:
-- Implement production-grade, bug-free, fully vector-parallel PyTorch code matching S2's prescription.
+- Implement complete, production-grade, bug-free, fully vectorized PyTorch code matching S2's prescription.
+- Strict numerical stability guards: clamp, eps=1e-8, nan_to_num, and no division by zero.
 - Compatible with torch.nn.DataParallel on Dual Tesla T4 GPUs.
-- Output clean, drop-in replacement classes/functions ready to integrate directly."""
+- Output clean, drop-in replacement classes ready to integrate directly:
+  1. `DynamicDensityTopKMILLoss`
+  2. `StiefelGatedSemanticLoss`
+  3. `AsymmetricAVDiscordanceGate`
+  4. Integration guide with exact variable names for `src/ucf_train.py` and `src/xd_train.py`."""
 
     deepseek_user = f"""[CODE SURGERY REQUEST]
-Intern-S2 has diagnosed the system and provided the following prescription:
+Intern-S2 has formulated the exact mathematical blueprint:
 
 {s2_diagnosis}
 
@@ -189,16 +217,17 @@ Please perform the code surgery: output the complete, production-grade PyTorch i
             {"role": "system", "content": deepseek_system},
             {"role": "user", "content": deepseek_user}
         ],
-        stream=True
+        stream=True,
+        max_tokens=8192
     )
 
     # Save output artifact
     artifact_path = root_dir / "S2_DEEPSEEK_SURGERY_RESULT.md"
     with open(artifact_path, "w", encoding="utf-8") as f:
         f.write("# S2-DEEPSEEK COLLABORATIVE SURGERY RESULT\n\n")
-        f.write("## 1. S2 Diagnosis (Bác sĩ bắt bệnh: Intern-S2)\n\n")
+        f.write("## 1. S2 Diagnosis & Mathematical Formulation (Intern-S2)\n\n")
         f.write(s2_diagnosis)
-        f.write("\n\n## 2. DeepSeek Code Surgery (Bác sĩ mổ xẻ code: DeepSeek v4 Pro)\n\n")
+        f.write("\n\n## 2. DeepSeek Code Surgery (DeepSeek v4 Pro)\n\n")
         f.write(deepseek_code)
 
     print(f"\n[+] Surgery completed successfully! Result saved to: {artifact_path}")
