@@ -420,7 +420,7 @@ subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=Fa
 xd_train_csv = ARTIFACTS / "xd_train.csv" if (ARTIFACTS / "xd_train.csv").exists() else REPO_DIR / "list/xd_CLIP_rgb.csv"
 xd_test_csv = ARTIFACTS / "xd_test.csv" if (ARTIFACTS / "xd_test.csv").exists() else REPO_DIR / "list/xd_CLIP_rgbtest.csv"
 
-XD_BATCH_SIZE = 64  # Có thể nâng lên 96 nếu muốn bão hòa tối đa Dual T4
+XD_BATCH_SIZE = 96  # Bão hòa tối đa Dual GPU T4 (48 Normal + 48 Abnormal per batch)
 XD_EPOCHS = 10      # 10 epochs chuẩn SOTA
 XD_LR = 1e-4
 SEED = 234
@@ -443,7 +443,6 @@ cmd_train_xd = [
     "--visual-layers", "4",
     "--temp", "5.0",
     "--use_dd_mil", "True",                  # Dynamic Density Top-k MIL
-    "--lambda-consistency", "0.10",
     "--loss2-weight", "0.20",                 # Gentle Semantic Anchor (Zero Gradient Cannibalization)
     "--loss-sep-weight", "0.00",             # Pruned to focus strictly on Anomaly Localization
     "--lambda-consistency", "0.00",          # Pruned reconstruction drag

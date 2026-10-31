@@ -125,9 +125,9 @@ def train(args):
         if getattr(args, 'lambda_consistency', 0.15) > 0.25:
             args.lambda_consistency = 0.15
         if getattr(args, 'loss2_weight', 1.4) > 1.6 or getattr(args, 'loss2_weight', 1.4) < 0.8:
-            args.loss2_weight = 1.4
+            pass
         if getattr(args, 'temp', 1.0) > 1.2:
-            args.temp = 1.0
+            pass
 
     # Set random seeds
     random.seed(args.seed)
@@ -349,6 +349,7 @@ def train(args):
 
         normal_iter = iter(normal_loader)
         anomaly_iter = iter(anomaly_loader)
+        print(f"🚀 [Epoch {epoch_idx}/{args.max_epoch}] Bắt đầu vòng lặp huấn luyện ({iters_per_epoch} iters/epoch)...", flush=True)
 
         for step_idx in range(iters_per_epoch):
             n_vis, n_lbls, n_lens, n_aud = next(normal_iter)
@@ -627,17 +628,19 @@ def train(args):
             loss_accum['guide'] += 0.0
             loss_accum['total'] += total_loss.item()
 
-            log_interval = max(1, iters_per_epoch // 5)
-            if (step_idx + 1) % log_interval == 0 or (step_idx + 1) == iters_per_epoch:
+            log_interval = 10
+            if (step_idx + 1) <= 3 or (step_idx + 1) % log_interval == 0 or (step_idx + 1) == iters_per_epoch:
                 percent = ((step_idx + 1) / iters_per_epoch) * 100
                 print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
                       f"Total: {total_loss.item():.4f} | Det: {loss_mil_det.item():.4f} | Route: {loss_mil_routing.item():.4f} | "
-                      f"Aux: {loss_mil_aux.item():.4f} | ASPM: {loss_consistency.item():.4f} | DCSA: {(loss_event + loss_bkg).item():.4f} | omega: {omega:.2f}", flush=True)
+                      f"Aux: {loss_mil_aux.item():.4f} | AV-Gate: {loss_mil_av.item():.4f} | Clasm: {loss_clasm.item():.4f} | omega: {omega:.2f}", flush=True)
 
             # Mid-Epoch Evaluation & Peak-Catching (SOTA Benchmark Standard: every 50 iters)
             eval_interval_raw = getattr(args, 'eval_interval', 50)
             eval_interval_iters = eval_interval_raw if eval_interval_raw < 100 else max(1, eval_interval_raw // args.batch_size)
             if eval_interval_iters > 0 and (step_idx + 1) % eval_interval_iters == 0 and (step_idx + 1) < iters_per_epoch:
+                step_total = epoch * iters_per_epoch + (step_idx + 1)
+                print(f"\n🔍 [Mid-Epoch Eval] Đang đánh giá {len(test_loader)} test videos tại Step {step_total} (Iter {step_idx + 1}/{iters_per_epoch})...", flush=True)
                 eval_model = model.module if hasattr(model, 'module') else model
                 eval_model.eval()
                 eval_model._text_features_cache = None
@@ -645,7 +648,6 @@ def train(args):
                     eval_model, test_loader, args.visual_length, prompt_text, gt, gtsegments,
                     gtlabels, args.DNP_use, args, device, compute_dmap=False
                 )
-                step_total = epoch * iters_per_epoch + (step_idx + 1)
                 print(f"  --> [Step {step_total} / Iter {step_idx + 1}] Mid-Epoch AP: {mid_ap * 100:.2f}% | AUC: {mid_auc * 100:.2f}% (Peak AP: {best_ap * 100:.2f}%)", flush=True)
                 if mid_ap > best_ap or (abs(mid_ap - best_ap) < 1e-4 and mid_auc > best_auc):
                     best_ap = mid_ap

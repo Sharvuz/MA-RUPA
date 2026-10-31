@@ -88,6 +88,7 @@ parser.add_argument('--snippet-dropout', type=float, default=0.15, help='Snippet
 parser.add_argument('--sample-one-crop-per-video', default=False, type=str2bool, help='Train on full 10 crops per video (default False for Full 10-Epoch SOTA schedule ~593 iters/epoch)')
 parser.add_argument('--crops-per-video', default=2, type=int, help='DPSS crops when sample_one_crop_per_video is True')
 parser.add_argument('--vatk', default=True, type=str2bool, help='Whether to use Variance-Adaptive Top-K selection (default True)')
+parser.add_argument('--use-dd-mil', '--use_dd_mil', dest='use_dd_mil', default=True, type=str2bool, help='Dynamic Density Top-k MIL (default True)')
 parser.add_argument('--gamma-edge', default=5.0, type=float, help='Edge-preserving sensitivity for SA-EPTS smoothness loss (default 5.0)')
 parser.add_argument('--lambda-entropy', default=0.02, type=float, help='Soft maximum entropy regularization weight (default 0.02)')
 parser.add_argument('--lambda-ohnm', default=0.2, type=float, help='Online hard negative mining weight for normal bags (default 0.2)')

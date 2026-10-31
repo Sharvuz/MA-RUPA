@@ -118,6 +118,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     with torch.no_grad():
         for i, item in enumerate(testdataloader):
+            if (i + 1) % 200 == 0 or (i + 1) == len(testdataloader):
+                print(f"    [Test-Inference] Đang đánh giá {i + 1}/{len(testdataloader)} test videos...", flush=True)
             visual = item[0].squeeze(0)
             length = int(item[2])
             len_cur = length
