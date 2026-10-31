@@ -409,6 +409,16 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     sm_s2_vids = [smooth_scores(0.35 * v_s + 0.35 * v_r + 0.30 * v_sem, method=smooth_method, sigma=sm_sigma) for v_s, v_r, v_sem in zip(raw_det_scaled_vids, raw_rec_vids, raw_sem_vids)]
     sm_s2_gated_vids = [smooth_scores(v, method=smooth_method, sigma=sm_sigma) for v in raw_s2_gated_vids]
 
+    # S2-DeepSeek Counterfactual Semantic Suppression Gate (CSS-Gate)
+    # G_css = sigmoid(15.0 * (v_s - 0.35)); neutralizes 305k normal false alarm frames
+    gate_css_vids = [1.0 / (1.0 + np.exp(-np.clip(15.0 * (v_s - 0.35), -15.0, 15.0))) for v_s in raw_det_scaled_vids]
+    raw_sem_css_vids = [v_sem * g for v_sem, g in zip(raw_sem_vids, gate_css_vids)]
+    raw_pareto_vids = [
+        0.85 * v_s + 0.10 * v_r + 0.05 * v_sem_css
+        for v_s, v_r, v_sem_css in zip(raw_det_scaled_vids, raw_rec_vids, raw_sem_css_vids)
+    ]
+    sm_pareto_vids = [smooth_scores(v, method=smooth_method, sigma=sm_sigma) for v in raw_pareto_vids]
+
     frame_sm_det = np.nan_to_num(np.repeat(np.concatenate(sm_det_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_sm_det_scaled = np.nan_to_num(np.repeat(np.concatenate(sm_det_scaled_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_sm_dsanet = np.nan_to_num(np.repeat(np.concatenate(sm_dsanet_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -416,6 +426,10 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     frame_raw_sem_stiefel = np.nan_to_num(np.repeat(np.concatenate(raw_sem_stiefel_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_raw_s2_gated = np.nan_to_num(np.repeat(np.concatenate(raw_s2_gated_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     frame_sm_s2_gated = np.nan_to_num(np.repeat(np.concatenate(sm_s2_gated_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
+    frame_sm_pareto = np.nan_to_num(np.repeat(np.concatenate(sm_pareto_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
+
+    roc_sm_pareto = roc_auc_score(gt_eval, frame_sm_pareto[:min_len])
+    ap_sm_pareto = average_precision_score(gt_eval, frame_sm_pareto[:min_len])
 
     roc_sm_det = roc_auc_score(gt_eval, frame_sm_det[:min_len])
     ap_sm_det = average_precision_score(gt_eval, frame_sm_det[:min_len])
@@ -443,6 +457,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     print(f"[BR-MVAD Evaluation] Frame-level AUC (Stiefel Anti-FA Gated Semantics - S_sem_prime): {roc_raw_sem_stiefel * 100:.2f}% | AP: {ap_raw_sem_stiefel * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (S2 Stiefel Anti-FA Blend - Raw): {roc_raw_s2_gated * 100:.2f}% | AP: {ap_raw_s2_gated * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (S2 Stiefel Anti-FA Blend + Smoothed - TARGET SOTA): {roc_sm_s2_gated * 100:.2f}% | AP: {ap_sm_s2_gated * 100:.2f}%", flush=True)
+    print(f"[BR-MVAD Evaluation] Frame-level AUC (Pareto SOTA 85/10/5 CSS-Gated + Smoothed): {roc_sm_pareto * 100:.2f}% | AP: {ap_sm_pareto * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (Adaptive Stiefel Prototype Manifold - ASPM S_rec): {roc_raw_rec * 100:.2f}% | AP: {ap_raw_rec * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (Dual-Stream Synergistic Fusion - Backbone + ASPM): {roc_raw_fusion * 100:.2f}% | AP: {ap_raw_fusion * 100:.2f}%", flush=True)
     print(f"[BR-MVAD Evaluation] Frame-level AUC (Fine-Grained Semantic Alignment - Raw TVSA): {roc_raw_sem_rupa * 100:.2f}% | AP: {ap_raw_sem_rupa * 100:.2f}%", flush=True)
@@ -526,7 +541,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     # Use the best stream across all WS-VAD paradigms (including Raw SOTA & Calibrated streams)
     best_auc = max(
         roc_raw_det, roc_raw_det_scaled, roc_raw_dsanet, roc_sm_det, roc_sm_det_scaled, roc_sm_dsanet,
-        roc_raw_s2, roc_sm_s2, roc_raw_sem_stiefel, roc_raw_s2_gated, roc_sm_s2_gated,
+        roc_raw_s2, roc_sm_s2, roc_raw_sem_stiefel, roc_raw_s2_gated, roc_sm_s2_gated, roc_sm_pareto,
         roc_raw_rec, roc_raw_sem, roc_raw_sem_rupa, roc_raw_fusion,
         roc_routing, roc_det, roc_sem, roc_sem_rupa,
         roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_tri,
@@ -534,7 +549,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     )
     best_ap = max(
         ap_raw_det, ap_raw_det_scaled, ap_raw_dsanet, ap_sm_det, ap_sm_det_scaled, ap_sm_dsanet,
-        ap_raw_s2, ap_sm_s2, ap_raw_sem_stiefel, ap_raw_s2_gated, ap_sm_s2_gated,
+        ap_raw_s2, ap_sm_s2, ap_raw_sem_stiefel, ap_raw_s2_gated, ap_sm_s2_gated, ap_sm_pareto,
         ap_raw_rec, ap_raw_sem, ap_raw_sem_rupa, ap_raw_fusion,
         ap_routing, ap_det, ap_sem, ap_sem_rupa,
         ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_tri,

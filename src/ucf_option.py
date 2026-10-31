@@ -94,10 +94,10 @@ parser.add_argument('--lambda-orth', type=float, default=0.05, help='Weight for 
 parser.add_argument('--lambda-gather', type=float, default=0.12, help='Weight for DNP subspace gather loss (default 0.12)')
 parser.add_argument('--lambda-residual', type=float, default=0.05, help='Weight for residual fine-grained event alignment loss (default 0.05)')
 parser.add_argument('--lambda-gate', type=float, default=0.01, help='Weight for safe gate KL regularization loss (default 0.01)')
-parser.add_argument('--loss2-weight', '--loss2_weight', dest='loss2_weight', type=float, default=1.10, help='Weight for snippet multi-class classification loss (default 1.10)')
-parser.add_argument('--loss-sep-weight', '--loss_sep_weight', dest='loss_sep_weight', type=float, default=1.00, help='Weight for text orthogonality separation loss (default 1.00)')
+parser.add_argument('--loss2-weight', '--loss2_weight', dest='loss2_weight', type=float, default=0.20, help='Weight for snippet multi-class classification loss (Pareto calibrated: default 0.20)')
+parser.add_argument('--loss-sep-weight', '--loss_sep_weight', dest='loss_sep_weight', type=float, default=0.00, help='Weight for text orthogonality separation loss (default 0.00)')
 parser.add_argument('--loss-routing-anchor-weight', '--loss_routing_anchor_weight', dest='loss_routing_anchor_weight', type=float, default=0.10, help='Weight for routing anchor loss (default 0.10)')
-parser.add_argument('--lambda-consistency', type=float, default=0.10, help='Weight for consistency loss between detector and RUPA (default 0.10, matching DSANet benchmark)')
+parser.add_argument('--lambda-consistency', type=float, default=0.00, help='Weight for consistency loss between detector and RUPA (Pareto calibrated: default 0.00 to eliminate reconstruction drag)')
 parser.add_argument('--lambda-bkg', type=float, default=0.5, help='Weight for background normal loss (default 0.5)')
 
 # Data & Paths

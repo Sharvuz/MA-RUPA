@@ -331,9 +331,9 @@ cmd_train_ucf = [
     "--visual-layers", "4",
     "--temp", "5.0",                         # DSANet Hierarchical Temperature Calibration T=5.0
     "--use_dd_mil", "True",                  # S2-DeepSeek Dynamic Density Top-k MIL (Otsu adaptive)
-    "--lambda-consistency", "0.10",          # DSANet Benchmark: Consistency loss weight 0.10
-    "--loss2-weight", "1.10",                # Intern-S2 Breakthrough: 1.10 constant semantic supervision
-    "--loss-sep-weight", "1.00",             # Pillar 6: Text Orthogonality Separation Loss (L_sep = 1.0)
+    "--lambda-consistency", "0.00",          # Pareto SOTA: 0.00 to eliminate reconstruction drag
+    "--loss2-weight", "0.20",                # Pareto SOTA: 0.20 prevents semantic gradient cannibalization
+    "--loss-sep-weight", "0.00",             # Pareto SOTA: 0.00 prevents text separation distortion
     "--loss-routing-anchor-weight", "0.10",  # Safe-Gate Homotopy Anchor Loss (0.10 stabilizing spring)
     "--routing-det-weight", "0.90",          # 90% Base Detector (DSANet SOTA >=89.5% Standard)
     "--routing-rec-weight", "0.10",          # 10% ASPM Reconstruction
