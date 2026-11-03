@@ -98,8 +98,8 @@ parser.add_argument('--sample-one-crop-per-video', default=False, type=str2bool)
 parser.add_argument('--crops-per-video', default=1, type=int)
 
 # Evaluation & Multi-Crop Multimodal Inference
-parser.add_argument('--multi-crop-eval', default=True, type=str2bool, help='Aggregate all 5 spatial test crops (__0..__4) in parallel')
-parser.add_argument('--max-test-crops', default=5, type=int)
+parser.add_argument('--multi-crop-eval', default=True, type=str2bool, help='Aggregate available spatial test crops (__0..__9) in parallel')
+parser.add_argument('--max-test-crops', default=10, type=int, help='Maximum spatial test crops to search (default 10: auto-adapts to 5 or 10 depending on disk)')
 parser.add_argument('--collab-alpha', default=0.15, type=float, help='DeSC collaborative semantic consistency fusion weight')
 parser.add_argument('--aux-eval-alpha', default=0.10, type=float, help='Visual-gated acoustic auxiliary reinforcement weight')
 parser.add_argument('--smooth-eval', default=True, type=str2bool)

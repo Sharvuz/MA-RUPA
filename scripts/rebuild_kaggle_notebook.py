@@ -205,8 +205,10 @@ sys.path.insert(0, str(REPO_DIR / "src"))
 from utils.dataset import resolve_multicrop_paths
 ucf_sample_test = pd.read_csv(ucf_test_csv).iloc[0]['path']
 xd_sample_test = pd.read_csv(xd_test_csv).iloc[0]['path']
-print(f"🎯 Multi-Crop Check: UCF test video có {len(resolve_multicrop_paths(ucf_sample_test, max_crops=10))}/10 crops | "
-      f"XD test video có {len(resolve_multicrop_paths(xd_sample_test, max_crops=5))}/5 crops.")""")
+ucf_crops_found = len(resolve_multicrop_paths(ucf_sample_test, max_crops=10))
+xd_crops_found = len(resolve_multicrop_paths(xd_sample_test, max_crops=10))
+print(f"🎯 Multi-Crop Check: UCF test video có {ucf_crops_found}/10 crops | "
+      f"XD test video có {xd_crops_found} crops (tối đa 10).")""")
 
     # Cell 4: UCF-Crime Markdown
     add_md(r"""## 3. Huấn luyện SOTA trên UCF-Crime (Dual GPU Tesla T4 | Batch Size 64)
@@ -361,7 +363,7 @@ cmd_train_xd = [
     "--lambda-aux", "0.25",
     "--lambda-smooth", "0.02",
     "--multi-crop-eval", "True",
-    "--max-test-crops", "5",
+    "--max-test-crops", "10",
     "--collab-alpha", "0.15",
     "--aux-eval-alpha", "0.10",
     "--smooth-eval", "True",
@@ -400,7 +402,7 @@ subprocess.run([
     "--gt-label-path", "list/gt_label.npy",
     "--model-path", str(xd_model_path),
     "--multi-crop-eval", "True",
-    "--max-test-crops", "5",
+    "--max-test-crops", "10",
     "--collab-alpha", "0.15",
     "--aux-eval-alpha", "0.10",
     "--smooth-eval", "True",
