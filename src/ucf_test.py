@@ -1,578 +1,278 @@
 import sys
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import numpy as np
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from model import MARUPA, load_compatible_model_state
-from utils.dataset import UCFDataset
+from utils.dataset import UCFDataset, load_multicrop_test_video
 from utils.tools import (
-    get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint,
-    calibrate_stream_global, compute_single_pass_uccf, apply_dodo_refinement
+    get_batch_mask, get_prompt_text, smooth_scores,
+    safe_load_checkpoint, calibrate_stream_global,
 )
 from utils.ucf_detectionMAP import getDetectionMAP as dmAP
 import ucf_option
 
 
-def _calibrate_video_list(vid_list, target_q15: float = 0.04, target_q90: float = 0.78):
-    """Applies unsupervised dataset-level monotonic logit-affine calibration across videos."""
-    if not vid_list:
-        return vid_list
-    lengths_v = [len(v) for v in vid_list]
-    concat_v = np.concatenate(vid_list, axis=0)
-    cal_concat = calibrate_stream_global(concat_v, target_q15=target_q15, target_q90=target_q90)
-    out_list = []
-    offset = 0
-    for lv in lengths_v:
-        out_list.append(cal_concat[offset:offset + lv])
-        offset += lv
-    return out_list
-
-
 def refine_scores_hierarchical(logits_det: torch.Tensor,
                                logits_align: torch.Tensor,
-                               temp: float = 1.0,
-                               routing_prob: torch.Tensor = None) -> torch.Tensor:
-    """Hierarchically combines anomaly probabilities with fine-grained semantic alignments
-    and video-level class sparsity filtering for temporal localization (dmAP).
-    """
-    epsilon = 1e-12
-    eff_temp = (temp / 0.07) if temp < 0.25 else temp
-    if routing_prob is None:
-        total_abnormal_prob = torch.sigmoid(logits_det / eff_temp)
-    else:
-        total_abnormal_prob = routing_prob
+                               temp: float = 5.0,
+                               total_abnormal_prob: torch.Tensor = None) -> torch.Tensor:
+    """Computes per-class snippet probability matrix [T, C] for temporal localization (dmAP)."""
+    eps = 1e-12
+    if total_abnormal_prob is None:
+        total_abnormal_prob = torch.sigmoid(logits_det / max(temp, 1e-3))
     if total_abnormal_prob.dim() == 1:
         total_abnormal_prob = total_abnormal_prob.unsqueeze(-1)
-    total_normal_prob = (1.0 - total_abnormal_prob).clamp(min=0.0, max=1.0)
+    total_normal_prob = (1.0 - total_abnormal_prob).clamp(0.0, 1.0)
 
-    p_align = F.softmax(logits_align / eff_temp, dim=1)
-    p_align_abnormal_only = p_align[:, 1:]
-    sum_p_align = p_align_abnormal_only.sum(dim=1, keepdim=True).clamp_min(epsilon)
-    abnormal_dist = p_align_abnormal_only / sum_p_align
+    p_align = F.softmax(logits_align / max(temp, 1e-3), dim=1)
+    p_abn_only = p_align[:, 1:]
+    abn_dist = p_abn_only / p_abn_only.sum(dim=1, keepdim=True).clamp_min(eps)
+    final_abn_probs = total_abnormal_prob * abn_dist
+    return torch.cat([total_normal_prob, final_abn_probs], dim=1)
 
-    final_abnormal_probs = total_abnormal_prob * abnormal_dist
 
-    # Video-level top-k class sparsity weighting for temporal localization (dmAP)
-    L = final_abnormal_probs.shape[0]
-    k_vid = max(1, L // 16)
-    top_c = torch.topk(final_abnormal_probs, k=k_vid, dim=0).values.mean(dim=0)
-    top3_thresh = torch.topk(top_c, k=min(3, top_c.numel())).values[-1]
-    class_weight = torch.where(
-        top_c >= top3_thresh,
-        torch.ones_like(top_c),
-        torch.full_like(top_c, 0.15)
-    ).unsqueeze(0)
-    final_abnormal_probs = final_abnormal_probs * class_weight
+def _build_split_lengths(length: int, maxlen: int) -> torch.Tensor:
+    num_splits = int(length / maxlen) + 1
+    lengths = torch.zeros(num_splits, dtype=torch.long)
+    rem = int(length)
+    for j in range(num_splits):
+        if rem > maxlen:
+            lengths[j] = maxlen
+            rem -= maxlen
+        else:
+            lengths[j] = max(1, rem)
+            rem = 0
+    return lengths
 
-    final_probs = torch.cat([total_normal_prob, final_abnormal_probs], dim=1)
-    return final_probs
+
+def _forward_splits_chunked(eval_model: nn.Module, visual_flat: torch.Tensor,
+                            padding_mask: torch.Tensor, prompt_text, lengths_flat: torch.Tensor,
+                            DNP_use: bool, max_chunk: int = 32):
+    """Runs batched crop-splits on a single GPU without VRAM spikes on ultra-long videos."""
+    total_b = visual_flat.shape[0]
+    if total_b <= max_chunk:
+        _, logits1, logits2, _, _, dnp_dict = eval_model(
+            visual_flat, padding_mask, prompt_text, lengths_flat, audio=None, DNP_use=DNP_use
+        )
+        route_s = dnp_dict.get('routing_scores', torch.sigmoid(logits1))
+        det_s = dnp_dict.get('detector_scores', torch.sigmoid(logits1))
+        sem_logits = dnp_dict.get('semantic_logits', logits2)
+        gate_s = dnp_dict.get('routing_gate')
+        return logits1, logits2, sem_logits, route_s, det_s, gate_s
+
+    l1_list, l2_list, sem_list, r_list, d_list, g_list = [], [], [], [], [], []
+    for start in range(0, total_b, max_chunk):
+        end = min(start + max_chunk, total_b)
+        _, l1, l2, _, _, dnp_c = eval_model(
+            visual_flat[start:end], padding_mask[start:end], prompt_text,
+            lengths_flat[start:end], audio=None, DNP_use=DNP_use
+        )
+        l1_list.append(l1)
+        l2_list.append(l2)
+        sem_list.append(dnp_c.get('semantic_logits', l2))
+        r_list.append(dnp_c.get('routing_scores', torch.sigmoid(l1)))
+        d_list.append(dnp_c.get('detector_scores', torch.sigmoid(l1)))
+        if dnp_c.get('routing_gate') is not None:
+            g_list.append(dnp_c['routing_gate'])
+
+    return (
+        torch.cat(l1_list, dim=0),
+        torch.cat(l2_list, dim=0),
+        torch.cat(sem_list, dim=0),
+        torch.cat(r_list, dim=0),
+        torch.cat(d_list, dim=0),
+        torch.cat(g_list, dim=0) if g_list else None,
+    )
 
 
 def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
          DNP_use, device, args, compute_dmap: bool = False):
-    """Evaluates MA-RUPA on UCF-Crime test set.
-    
-    Computes Frame-level ROC-AUC, Frame-level AP, and detection mAP@IoU[0.1:0.5].
-    Supports multi-crop test averaging and temporal score smoothing.
-    """
-    model.to(device)
-    model.eval()
+    """Evaluates MA-RUPA v3 on UCF-Crime with Parallel Multi-Crop Aggregation & DeSC Fusion."""
+    eval_model = model.module if isinstance(model, nn.DataParallel) else model
+    eval_model.to(device)
+    eval_model.eval()
 
-    element_logits2_stack = []
-    ap_routing_list = []
-    ap_det_list = []
-    ap_sem_list = []
-    ap_sem_rupa_list = []
-    ap_ens_sem_list = []
-    ap_ens_rupa_list = []
-    ap_ens_det_list = []
-    ap_ens_tri_list = []
-    ap_weighted_list = []
-    ap_geom_list = []
-    ap_hier_list = []
-    ap_uccf_list = []
-    ap_dodo_list = []
-    ap_harmonic_list = []
-    ap_master_list = []
-    ap_opt_list = []
-
-    smooth_eval = getattr(args, 'smooth_eval', False)
+    multi_crop = bool(getattr(args, 'multi_crop_eval', True))
+    max_crops = int(getattr(args, 'max_test_crops', 10)) if multi_crop else 1
+    data_dir = getattr(args, 'data_dir', None)
+    collab_alpha = float(getattr(args, 'collab_alpha', 0.20))
+    smooth_eval = bool(getattr(args, 'smooth_eval', True))
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
-    smooth_sigma = getattr(args, 'smooth_sigma', 0.50)
+    smooth_sigma = float(getattr(args, 'smooth_sigma', 0.75))
 
-    raw_routing_vids = []
-    raw_det_vids = []
-    raw_sem_vids = []
-    raw_sem_rupa_vids = []
-    raw_aux_vids = []
-    raw_rec_vids = []
-    logits1_vids = []
-    fused_sem_logits_vids = []
-    eff_temp = (args.temp / 0.07) if args.temp < 0.25 else args.temp
+    vid_route_list = []
+    vid_sem_list = []
+    vid_logits1_list = []
+    vid_sem_logits_list = []
+    routing_gate_vals = []
+    crop_counts = []
 
     with torch.no_grad():
+        total_vids = len(testdataloader)
         for i, item in enumerate(testdataloader):
-            visual = item[0].squeeze(0)
-            length = int(item[2])
-            len_cur = length
+            if total_vids >= 100 and ((i + 1) % 100 == 0 or (i + 1) == total_vids):
+                print(f"    [Test-Inference] Processed {i + 1}/{total_vids} UCF test videos...", flush=True)
+            fallback_vis = item[0].squeeze(0)
+            len_cur = int(item[2])
+            raw_path = item[3][0] if isinstance(item[3], (list, tuple)) else str(item[3])
 
-            if len_cur < maxlen:
-                visual = visual.unsqueeze(0)
-
-            visual = visual.to(device)
-
-            # Build split sequence lengths
-            num_splits = int(length / maxlen) + 1
-            lengths = torch.zeros(num_splits, dtype=torch.long)
-            rem_len = length
-            for j in range(num_splits):
-                if rem_len > maxlen:
-                    lengths[j] = maxlen
-                    rem_len -= maxlen
-                else:
-                    lengths[j] = rem_len
-
-            padding_mask = get_batch_mask(lengths, maxlen).to(device)
-
-            if DNP_use:
-                _, logits1, logits2, _, _, dnp_dict = model(
-                    visual, padding_mask, prompt_text, lengths, audio=None, DNP_use=True
+            if multi_crop:
+                vis_crops, _, len_cur, num_crops = load_multicrop_test_video(
+                    raw_path=raw_path,
+                    maxlen=maxlen,
+                    data_dir=data_dir,
+                    no_audio=True,
+                    max_crops=max_crops,
+                    fallback_visual=fallback_vis,
+                    fallback_length=len_cur,
                 )
-                routing_scores = dnp_dict.get('routing_scores')
-                semantic_logits = dnp_dict.get('semantic_logits', logits2)
             else:
-                _, logits1, logits2, _, _, dnp_dict = model(
-                    visual, padding_mask, prompt_text, lengths, audio=None, DNP_use=False
-                )
-                routing_scores = dnp_dict.get('routing_scores', torch.sigmoid(logits1))
-                semantic_logits = logits2
+                v_single = fallback_vis.unsqueeze(0) if fallback_vis.ndim == 2 else fallback_vis
+                vis_crops = v_single.unsqueeze(0)
+                num_crops = 1
 
-            logits1 = logits1.reshape(-1, logits1.shape[-1])
-            logits2 = logits2.reshape(-1, logits2.shape[-1])
-            if routing_scores is not None:
-                routing_scores = routing_scores.reshape(-1, routing_scores.shape[-1])
-            if semantic_logits is not None:
-                semantic_logits = semantic_logits.reshape(-1, semantic_logits.shape[-1])
+            crop_counts.append(num_crops)
+            C, num_splits, _, D = vis_crops.shape
 
-            # Stream 1: Routing prediction
-            if routing_scores is None:
-                prob_routing = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
-            else:
-                prob_routing = routing_scores[0:len_cur].squeeze(-1)
+            base_lengths = _build_split_lengths(len_cur, maxlen)
+            # Align num_splits if process_split differed by boundary
+            if len(base_lengths) != num_splits:
+                base_lengths = torch.full((num_splits,), maxlen, dtype=torch.long)
+                rem = len_cur - maxlen * (num_splits - 1)
+                base_lengths[-1] = max(1, min(maxlen, rem))
 
-            # Stream 2: Base detector prediction
-            if 'detector_scores' in dnp_dict:
-                prob_det = dnp_dict['detector_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
-            else:
-                prob_det = torch.sigmoid(logits1[0:len_cur].squeeze(-1))
+            lengths_flat = base_lengths.repeat(C)
+            padding_mask = get_batch_mask(lengths_flat, maxlen).to(device)
+            visual_flat = vis_crops.view(C * num_splits, maxlen, D).to(device)
 
-            # Stream 3: Zero-Shot / Adapted Semantic Alignment (TVSA: P(Anomaly) = 1.0 - P(Normal))
-            p_align = F.softmax(logits2[0:len_cur] / eff_temp, dim=-1)
-            p0_bb = p_align[:, 0]
-            prob_sem = (1.0 - p0_bb).clamp(0.0, 1.0)
+            logits1, logits2, sem_logits, route_s, _, gate_s = _forward_splits_chunked(
+                eval_model, visual_flat, padding_mask, prompt_text, lengths_flat, DNP_use
+            )
 
-            # Stream 4: RUPA Counterfactual Semantic Logits
-            p_align_rupa = F.softmax(semantic_logits[0:len_cur] / eff_temp, dim=-1)
-            p0_rupa = p_align_rupa[:, 0]
-            prob_sem_rupa_raw = (1.0 - p0_rupa).clamp(0.0, 1.0)
-            if 'semantic_scores' in dnp_dict:
-                s_sem_direct = dnp_dict['semantic_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
-                prob_sem_rupa = 0.5 * prob_sem_rupa_raw + 0.5 * s_sem_direct
-            else:
-                prob_sem_rupa = prob_sem_rupa_raw
+            # Reshape [C, num_splits * maxlen, ...] -> slice [:len_cur] -> mean over C spatial crops
+            logits1_c = logits1.view(C, num_splits * maxlen, -1)[:, :len_cur, :]
+            logits2_c = logits2.view(C, num_splits * maxlen, -1)[:, :len_cur, :]
+            sem_logits_c = sem_logits.view(C, num_splits * maxlen, -1)[:, :len_cur, :]
+            route_c = route_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
 
-            # Auxiliary Motion Residual & Subspace Reconstruction Streams
-            if 'aux_scores' in dnp_dict:
-                prob_aux = dnp_dict['aux_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
-            else:
-                prob_aux = prob_det
+            # Vision-Language Semantic Anomaly Probability (logits2 is already /0.07 scaled)
+            p_sem_bb = 1.0 - F.softmax(logits2_c.float(), dim=-1)[:, :, 0]
+            p_sem_rupa = 1.0 - F.softmax(sem_logits_c.float(), dim=-1)[:, :, 0]
+            p_sem_c = (0.5 * p_sem_bb + 0.5 * p_sem_rupa).clamp(0.0, 1.0)
 
-            if 'reconstruction_scores' in dnp_dict:
-                prob_rec = dnp_dict['reconstruction_scores'].reshape(-1, 1)[0:len_cur].squeeze(-1)
-            else:
-                prob_rec = prob_sem_rupa
+            prob_route_np = route_c.float().mean(dim=0).cpu().numpy()
+            prob_sem_np = p_sem_c.float().mean(dim=0).cpu().numpy()
 
-            fused_sem_logits = 0.5 * logits2[0:len_cur] + 0.5 * semantic_logits[0:len_cur]
-            if 'audio_semantic_logits' in dnp_dict and dnp_dict['audio_semantic_logits'] is not None:
-                aud_l = dnp_dict['audio_semantic_logits'].reshape(-1, logits2.shape[-1])[0:len_cur]
-                fused_sem_logits = 0.90 * fused_sem_logits + 0.10 * aud_l
+            vid_route_list.append(prob_route_np)
+            vid_sem_list.append(prob_sem_np)
+            vid_logits1_list.append(logits1_c.float().mean(dim=0).cpu())
+            vid_sem_logits_list.append(sem_logits_c.float().mean(dim=0).cpu())
 
-            raw_routing_vids.append(prob_routing.detach().cpu().numpy())
-            raw_det_vids.append(prob_det.detach().cpu().numpy())
-            raw_sem_vids.append(prob_sem.detach().cpu().numpy())
-            raw_sem_rupa_vids.append(prob_sem_rupa.detach().cpu().numpy())
-            raw_aux_vids.append(prob_aux.detach().cpu().numpy())
-            raw_rec_vids.append(prob_rec.detach().cpu().numpy())
-            logits1_vids.append(logits1[0:len_cur].detach().cpu())
-            fused_sem_logits_vids.append(fused_sem_logits.detach().cpu())
+            if gate_s is not None:
+                gate_c = gate_s.view(C, num_splits * maxlen)[:, :len_cur].mean(dim=0)
+                routing_gate_vals.append(gate_c.detach().cpu())
 
-    # Unsupervised Dataset-Level Monotonic Calibration (zero GT access; preserves single-stream AUC/AP)
-    cal_routing_vids = _calibrate_video_list(raw_routing_vids)
-    cal_det_vids = _calibrate_video_list(raw_det_vids)
-    cal_sem_vids = _calibrate_video_list(raw_sem_vids)
-    cal_sem_rupa_vids = _calibrate_video_list(raw_sem_rupa_vids)
-    cal_aux_vids = _calibrate_video_list(raw_aux_vids)
-    cal_rec_vids = _calibrate_video_list(raw_rec_vids)
+    # Unsupervised quantile alignment of semantic stream to detector dynamic range (zero GT labels used)
+    concat_route = np.concatenate(vid_route_list, axis=0)
+    concat_sem = np.concatenate(vid_sem_list, axis=0)
+    q15_r = float(np.clip(np.percentile(concat_route, 15.0), 0.01, 0.35))
+    q90_r = float(np.clip(np.percentile(concat_route, 90.0), 0.50, 0.98))
+    cal_sem_concat = calibrate_stream_global(concat_sem, target_q15=q15_r, target_q90=q90_r)
 
-    priors = {
-        'routing': 1.0,
-        'det': 0.95,
-        'sem': 0.95,
-        'sem_rupa': 0.90,
-        'aux': 0.15,
-        'rec': 0.02
-    }
+    final_route_all = []
+    final_sem_all = []
+    final_collab_all = []
+    element_logits2_stack = []
 
-    for v_idx in range(len(cal_routing_vids)):
-        p_routing_np = cal_routing_vids[v_idx]
-        p_det_np = cal_det_vids[v_idx]
-        p_sem_np = cal_sem_vids[v_idx]
-        p_sem_rupa_np = cal_sem_rupa_vids[v_idx]
-        p_aux_np = cal_aux_vids[v_idx]
-        p_rec_np = cal_rec_vids[v_idx]
+    offset = 0
+    for idx_v, r_v in enumerate(vid_route_list):
+        lv = len(r_v)
+        s_v_cal = cal_sem_concat[offset:offset + lv]
+        s_v_raw = vid_sem_list[idx_v]
+        offset += lv
 
-        p_ens_sem_np = 0.5 * p_routing_np + 0.5 * p_sem_np
-        p_ens_rupa_np = 0.5 * p_routing_np + 0.5 * p_sem_rupa_np
-        p_ens_det_np = 0.5 * p_routing_np + 0.5 * p_det_np
-        p_ens_tri_np = (p_routing_np + p_det_np + p_sem_rupa_np) / 3.0
-        p_weighted_np = 0.6 * p_routing_np + 0.4 * p_sem_rupa_np
-        p_geom_np = np.sqrt(np.clip(p_routing_np, 1e-6, 1.0) * np.clip(p_sem_rupa_np, 1e-5, 1.0))
-        p_geom_bb_np = np.sqrt(np.clip(p_routing_np, 1e-6, 1.0) * np.clip(p_sem_np, 1e-5, 1.0))
-        p_opt_np = 0.50 * p_geom_np + 0.30 * p_geom_bb_np + 0.20 * p_routing_np
-        p_harmonic_np = 2.0 * np.clip(p_routing_np, 1e-4, 1.0) * np.clip(p_sem_rupa_np, 1e-4, 1.0) / (
-            np.clip(p_routing_np, 1e-4, 1.0) + np.clip(p_sem_rupa_np, 1e-4, 1.0) + 1e-8
-        )
-        p_master_np = 0.35 * p_routing_np + 0.35 * p_sem_rupa_np + 0.15 * p_det_np + 0.15 * p_sem_np
-
-        prob_dict = {
-            'routing': torch.from_numpy(p_routing_np),
-            'det': torch.from_numpy(p_det_np),
-            'sem': torch.from_numpy(p_sem_np),
-            'sem_rupa': torch.from_numpy(p_sem_rupa_np),
-            'aux': torch.from_numpy(p_aux_np),
-            'rec': torch.from_numpy(p_rec_np),
-        }
-        p_uccf_np = compute_single_pass_uccf(prob_dict, priors, delta_dis=0.35).numpy()
-        p_dodo_np = apply_dodo_refinement(p_uccf_np, sigma=smooth_sigma)
-
-        # Sharp DODO-anchored consensus probability for temporal localization (dmAP)
-        consensus_abn_t = torch.from_numpy(
-            (0.55 * p_dodo_np + 0.25 * p_routing_np + 0.20 * p_sem_rupa_np).astype(np.float32)
-        ).unsqueeze(-1)
-        optimized_probs = refine_scores_hierarchical(
-            logits1_vids[v_idx], fused_sem_logits_vids[v_idx], eff_temp, consensus_abn_t
-        )
-        p_hier_np = (1.0 - optimized_probs[:, 0]).clamp(0.0, 1.0).numpy()
-
+        c_v = (1.0 - collab_alpha) * r_v + collab_alpha * s_v_cal
         if smooth_eval:
-            p_routing_np = smooth_scores(p_routing_np, method=smooth_method, sigma=smooth_sigma)
-            p_det_np = smooth_scores(p_det_np, method=smooth_method, sigma=smooth_sigma)
-            p_sem_np = smooth_scores(p_sem_np, method=smooth_method, sigma=smooth_sigma)
-            p_sem_rupa_np = smooth_scores(p_sem_rupa_np, method=smooth_method, sigma=smooth_sigma)
-            p_ens_sem_np = smooth_scores(p_ens_sem_np, method=smooth_method, sigma=smooth_sigma)
-            p_ens_rupa_np = smooth_scores(p_ens_rupa_np, method=smooth_method, sigma=smooth_sigma)
-            p_ens_det_np = smooth_scores(p_ens_det_np, method=smooth_method, sigma=smooth_sigma)
-            p_ens_tri_np = smooth_scores(p_ens_tri_np, method=smooth_method, sigma=smooth_sigma)
-            p_weighted_np = smooth_scores(p_weighted_np, method=smooth_method, sigma=smooth_sigma)
-            p_geom_np = smooth_scores(p_geom_np, method=smooth_method, sigma=smooth_sigma)
-            p_opt_np = smooth_scores(p_opt_np, method=smooth_method, sigma=smooth_sigma)
-            p_harmonic_np = smooth_scores(p_harmonic_np, method=smooth_method, sigma=smooth_sigma)
-            p_master_np = smooth_scores(p_master_np, method=smooth_method, sigma=smooth_sigma)
-            p_hier_np = smooth_scores(p_hier_np, method=smooth_method, sigma=smooth_sigma)
-            p_uccf_np = smooth_scores(p_uccf_np, method=smooth_method, sigma=smooth_sigma)
+            r_eval = smooth_scores(r_v, method=smooth_method, sigma=smooth_sigma)
+            s_eval = smooth_scores(s_v_raw, method=smooth_method, sigma=smooth_sigma)
+            c_eval = smooth_scores(c_v, method=smooth_method, sigma=smooth_sigma)
+        else:
+            r_eval, s_eval, c_eval = r_v, s_v_raw, c_v
 
-        ap_routing_list.append(p_routing_np)
-        ap_det_list.append(p_det_np)
-        ap_sem_list.append(p_sem_np)
-        ap_sem_rupa_list.append(p_sem_rupa_np)
-        ap_ens_sem_list.append(p_ens_sem_np)
-        ap_ens_rupa_list.append(p_ens_rupa_np)
-        ap_ens_det_list.append(p_ens_det_np)
-        ap_ens_tri_list.append(p_ens_tri_np)
-        ap_weighted_list.append(p_weighted_np)
-        ap_geom_list.append(p_geom_np)
-        ap_opt_list.append(p_opt_np)
-        ap_harmonic_list.append(p_harmonic_np)
-        ap_master_list.append(p_master_np)
-        ap_hier_list.append(p_hier_np)
-        ap_uccf_list.append(p_uccf_np)
-        ap_dodo_list.append(p_dodo_np)
+        final_route_all.append(r_eval)
+        final_sem_all.append(s_eval)
+        final_collab_all.append(c_eval)
 
-        elem_l2 = optimized_probs.detach().numpy()
-        dmap_sigma = min(smooth_sigma, 0.70)
-        if smooth_eval and elem_l2.shape[0] >= 3 and dmap_sigma > 0.1:
-            for c_idx in range(elem_l2.shape[1]):
-                if np.max(elem_l2[:, c_idx]) > 0.0:
-                    elem_l2[:, c_idx] = smooth_scores(elem_l2[:, c_idx], method=smooth_method, sigma=dmap_sigma)
-        elem_l2 = np.repeat(elem_l2, 16, axis=0)
-        element_logits2_stack.append(elem_l2)
+        if compute_dmap:
+            collab_t = torch.from_numpy(c_eval).float().unsqueeze(-1)
+            opt_probs = refine_scores_hierarchical(
+                vid_logits1_list[idx_v], vid_sem_logits_list[idx_v], args.temp, collab_t
+            )
+            element_logits2_stack.append(np.repeat(opt_probs.numpy(), 16, axis=0))
 
-    all_scores_routing = np.concatenate(ap_routing_list, axis=0)
-    all_scores_det = np.concatenate(ap_det_list, axis=0)
-    all_scores_sem = np.concatenate(ap_sem_list, axis=0)
-    all_scores_sem_rupa = np.concatenate(ap_sem_rupa_list, axis=0)
-    all_scores_ens_sem = np.concatenate(ap_ens_sem_list, axis=0)
-    all_scores_ens_rupa = np.concatenate(ap_ens_rupa_list, axis=0)
-    all_scores_ens_det = np.concatenate(ap_ens_det_list, axis=0)
-    all_scores_ens_tri = np.concatenate(ap_ens_tri_list, axis=0)
-    all_scores_weighted = np.concatenate(ap_weighted_list, axis=0)
-    all_scores_geom = np.concatenate(ap_geom_list, axis=0)
-    all_scores_opt = np.concatenate(ap_opt_list, axis=0)
-    all_scores_harmonic = np.concatenate(ap_harmonic_list, axis=0)
-    all_scores_master = np.concatenate(ap_master_list, axis=0)
-    all_scores_hier = np.concatenate(ap_hier_list, axis=0)
-    all_scores_uccf = np.concatenate(ap_uccf_list, axis=0)
-    all_scores_dodo = np.concatenate(ap_dodo_list, axis=0)
+    pred_route = np.repeat(np.concatenate(final_route_all, axis=0), 16)
+    pred_sem = np.repeat(np.concatenate(final_sem_all, axis=0), 16)
+    pred_collab = np.repeat(np.concatenate(final_collab_all, axis=0), 16)
 
-    # Repeat 16x for frame-level evaluation & sanitize non-finites
-    frame_scores_routing = np.nan_to_num(np.repeat(all_scores_routing, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_det = np.nan_to_num(np.repeat(all_scores_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_sem = np.nan_to_num(np.repeat(all_scores_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_sem_rupa = np.nan_to_num(np.repeat(all_scores_sem_rupa, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_ens_sem = np.nan_to_num(np.repeat(all_scores_ens_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_ens_rupa = np.nan_to_num(np.repeat(all_scores_ens_rupa, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_ens_det = np.nan_to_num(np.repeat(all_scores_ens_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_ens_tri = np.nan_to_num(np.repeat(all_scores_ens_tri, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_weighted = np.nan_to_num(np.repeat(all_scores_weighted, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_geom = np.nan_to_num(np.repeat(all_scores_geom, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_opt = np.nan_to_num(np.repeat(all_scores_opt, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_harmonic = np.nan_to_num(np.repeat(all_scores_harmonic, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_master = np.nan_to_num(np.repeat(all_scores_master, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_hier = np.nan_to_num(np.repeat(all_scores_hier, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_uccf = np.nan_to_num(np.repeat(all_scores_uccf, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_scores_dodo = np.nan_to_num(np.repeat(all_scores_dodo, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    # Align length safely if GT differs by trailing frames
+    n_gt = len(gt)
+    pred_route = pred_route[:n_gt] if len(pred_route) >= n_gt else np.pad(pred_route, (0, n_gt - len(pred_route)))
+    pred_sem = pred_sem[:n_gt] if len(pred_sem) >= n_gt else np.pad(pred_sem, (0, n_gt - len(pred_sem)))
+    pred_collab = pred_collab[:n_gt] if len(pred_collab) >= n_gt else np.pad(pred_collab, (0, n_gt - len(pred_collab)))
 
-    min_len = min(len(gt), len(frame_scores_routing))
-    gt_eval = gt[:min_len]
+    auc_route = roc_auc_score(gt, pred_route)
+    ap_route = average_precision_score(gt, pred_route)
+    auc_sem = roc_auc_score(gt, pred_sem)
+    ap_sem = average_precision_score(gt, pred_sem)
+    auc_collab = roc_auc_score(gt, pred_collab)
+    ap_collab = average_precision_score(gt, pred_collab)
 
-    # Raw Uncalibrated, Unsmoothed Stream Evaluation (Zero calibration distortion, zero peak clipping)
-    raw_scores_det = np.concatenate(raw_det_vids, axis=0)
-    raw_scores_rec = np.concatenate(raw_rec_vids, axis=0)
-    raw_scores_sem = np.concatenate(raw_sem_vids, axis=0)
-    raw_scores_sem_rupa = np.concatenate(raw_sem_rupa_vids, axis=0)
-    raw_scores_fusion = 0.65 * raw_scores_det + 0.35 * raw_scores_rec
+    avg_crops = float(np.mean(crop_counts)) if crop_counts else 1.0
+    gate_info = ""
+    if routing_gate_vals:
+        gates_cat = torch.cat(routing_gate_vals)
+        gate_info = f" | SafeGate={gates_cat.mean().item():.4f}"
 
-    frame_raw_det = np.nan_to_num(np.repeat(raw_scores_det, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_raw_rec = np.nan_to_num(np.repeat(raw_scores_rec, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_raw_sem = np.nan_to_num(np.repeat(raw_scores_sem, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_raw_sem_rupa = np.nan_to_num(np.repeat(raw_scores_sem_rupa, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_raw_fusion = np.nan_to_num(np.repeat(raw_scores_fusion, 16), nan=0.0, posinf=1.0, neginf=0.0)
+    print(f"  [Eval {avg_crops:.1f}-Crop{gate_info}]", flush=True)
+    print(f"    Safe-RUPA Detector-Routing : AUC = {auc_route * 100:.2f}% | AP = {ap_route * 100:.2f}%", flush=True)
+    print(f"    Vision-Language Semantic   : AUC = {auc_sem * 100:.2f}% | AP = {ap_sem * 100:.2f}%", flush=True)
+    print(f"    MA-RUPA DeSC Collaborative : AUC = {auc_collab * 100:.2f}% | AP = {ap_collab * 100:.2f}%", flush=True)
 
-    roc_raw_det = roc_auc_score(gt_eval, frame_raw_det[:min_len])
-    ap_raw_det = average_precision_score(gt_eval, frame_raw_det[:min_len])
-    roc_raw_rec = roc_auc_score(gt_eval, frame_raw_rec[:min_len])
-    ap_raw_rec = average_precision_score(gt_eval, frame_raw_rec[:min_len])
-    roc_raw_sem = roc_auc_score(gt_eval, frame_raw_sem[:min_len])
-    ap_raw_sem = average_precision_score(gt_eval, frame_raw_sem[:min_len])
-    roc_raw_sem_rupa = roc_auc_score(gt_eval, frame_raw_sem_rupa[:min_len])
-    ap_raw_sem_rupa = average_precision_score(gt_eval, frame_raw_sem_rupa[:min_len])
-    roc_raw_fusion = roc_auc_score(gt_eval, frame_raw_fusion[:min_len])
-    ap_raw_fusion = average_precision_score(gt_eval, frame_raw_fusion[:min_len])
-
-    # Temperature Scaled Stream (DSANet Benchmark Temperature T=5.0)
-    raw_det_scaled_vids = [
-        torch.sigmoid(lv.squeeze(-1) / eff_temp).numpy() for lv in logits1_vids
-    ]
-    raw_scores_det_scaled = np.concatenate(raw_det_scaled_vids, axis=0)
-    frame_raw_det_scaled = np.nan_to_num(np.repeat(raw_scores_det_scaled, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    roc_raw_det_scaled = roc_auc_score(gt_eval, frame_raw_det_scaled[:min_len])
-    ap_raw_det_scaled = average_precision_score(gt_eval, frame_raw_det_scaled[:min_len])
-
-    # DSANet-style calibrated blend (90% detector + 10% ASPM prototype reconstruction)
-    raw_scores_dsanet = 0.90 * raw_scores_det_scaled + 0.10 * raw_scores_rec
-    frame_raw_dsanet = np.nan_to_num(np.repeat(raw_scores_dsanet, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    roc_raw_dsanet = roc_auc_score(gt_eval, frame_raw_dsanet[:min_len])
-    ap_raw_dsanet = average_precision_score(gt_eval, frame_raw_dsanet[:min_len])
-
-    # Intern-S2 Tri-Modal Synergistic Blend (35% Detector Scaled + 35% ASPM Stiefel Reconstruction + 30% TVSA Semantic Alignment)
-    raw_scores_s2 = 0.35 * raw_scores_det_scaled + 0.35 * raw_scores_rec + 0.30 * raw_scores_sem
-    frame_raw_s2 = np.nan_to_num(np.repeat(raw_scores_s2, 16), nan=0.0, posinf=1.0, neginf=0.0)
-    roc_raw_s2 = roc_auc_score(gt_eval, frame_raw_s2[:min_len])
-    ap_raw_s2 = average_precision_score(gt_eval, frame_raw_s2[:min_len])
-
-    # S2-DeepSeek Stiefel Normality Anti-FA Gated Semantic Streams (G_stiefel = tanh(S_rec / 0.50))
-    # Nullifies TVSA semantic hallucinations on night traffic / headlights
-    gate_stiefel_vids = [np.tanh(v_r / 0.50) for v_r in raw_rec_vids]
-    raw_sem_stiefel_vids = [v_sem * g for v_sem, g in zip(raw_sem_vids, gate_stiefel_vids)]
-    raw_s2_gated_vids = [
-        0.50 * v_s + 0.30 * v_r + 0.20 * v_sem_g
-        for v_s, v_r, v_sem_g in zip(raw_det_scaled_vids, raw_rec_vids, raw_sem_stiefel_vids)
-    ]
-
-    # Video-wise Gaussian-smoothed streams (sigma = 0.50)
-    sm_sigma = getattr(args, 'smooth_sigma', 0.50)
-    sm_det_vids = [smooth_scores(v, method=smooth_method, sigma=sm_sigma) for v in raw_det_vids]
-    sm_det_scaled_vids = [smooth_scores(v, method=smooth_method, sigma=sm_sigma) for v in raw_det_scaled_vids]
-    sm_dsanet_vids = [smooth_scores(0.90 * v_s + 0.10 * v_r, method=smooth_method, sigma=sm_sigma) for v_s, v_r in zip(raw_det_scaled_vids, raw_rec_vids)]
-    sm_s2_vids = [smooth_scores(0.35 * v_s + 0.35 * v_r + 0.30 * v_sem, method=smooth_method, sigma=sm_sigma) for v_s, v_r, v_sem in zip(raw_det_scaled_vids, raw_rec_vids, raw_sem_vids)]
-    sm_s2_gated_vids = [smooth_scores(v, method=smooth_method, sigma=sm_sigma) for v in raw_s2_gated_vids]
-
-    # S2-DeepSeek Counterfactual Semantic Suppression Gate (CSS-Gate)
-    # G_css = sigmoid(15.0 * (v_s - 0.35)); neutralizes 305k normal false alarm frames
-    gate_css_vids = [1.0 / (1.0 + np.exp(-np.clip(15.0 * (v_s - 0.35), -15.0, 15.0))) for v_s in raw_det_scaled_vids]
-    raw_sem_css_vids = [v_sem * g for v_sem, g in zip(raw_sem_vids, gate_css_vids)]
-    raw_pareto_vids = [
-        0.85 * v_s + 0.10 * v_r + 0.05 * v_sem_css
-        for v_s, v_r, v_sem_css in zip(raw_det_scaled_vids, raw_rec_vids, raw_sem_css_vids)
-    ]
-    sm_pareto_vids = [smooth_scores(v, method=smooth_method, sigma=sm_sigma) for v in raw_pareto_vids]
-
-    frame_sm_det = np.nan_to_num(np.repeat(np.concatenate(sm_det_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_sm_det_scaled = np.nan_to_num(np.repeat(np.concatenate(sm_det_scaled_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_sm_dsanet = np.nan_to_num(np.repeat(np.concatenate(sm_dsanet_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_sm_s2 = np.nan_to_num(np.repeat(np.concatenate(sm_s2_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_raw_sem_stiefel = np.nan_to_num(np.repeat(np.concatenate(raw_sem_stiefel_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_raw_s2_gated = np.nan_to_num(np.repeat(np.concatenate(raw_s2_gated_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_sm_s2_gated = np.nan_to_num(np.repeat(np.concatenate(sm_s2_gated_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-    frame_sm_pareto = np.nan_to_num(np.repeat(np.concatenate(sm_pareto_vids, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
-
-    roc_sm_pareto = roc_auc_score(gt_eval, frame_sm_pareto[:min_len])
-    ap_sm_pareto = average_precision_score(gt_eval, frame_sm_pareto[:min_len])
-
-    roc_sm_det = roc_auc_score(gt_eval, frame_sm_det[:min_len])
-    ap_sm_det = average_precision_score(gt_eval, frame_sm_det[:min_len])
-    roc_sm_det_scaled = roc_auc_score(gt_eval, frame_sm_det_scaled[:min_len])
-    ap_sm_det_scaled = average_precision_score(gt_eval, frame_sm_det_scaled[:min_len])
-    roc_sm_dsanet = roc_auc_score(gt_eval, frame_sm_dsanet[:min_len])
-    ap_sm_dsanet = average_precision_score(gt_eval, frame_sm_dsanet[:min_len])
-    roc_sm_s2 = roc_auc_score(gt_eval, frame_sm_s2[:min_len])
-    ap_sm_s2 = average_precision_score(gt_eval, frame_sm_s2[:min_len])
-    roc_raw_sem_stiefel = roc_auc_score(gt_eval, frame_raw_sem_stiefel[:min_len])
-    ap_raw_sem_stiefel = average_precision_score(gt_eval, frame_raw_sem_stiefel[:min_len])
-    roc_raw_s2_gated = roc_auc_score(gt_eval, frame_raw_s2_gated[:min_len])
-    ap_raw_s2_gated = average_precision_score(gt_eval, frame_raw_s2_gated[:min_len])
-    roc_sm_s2_gated = roc_auc_score(gt_eval, frame_sm_s2_gated[:min_len])
-    ap_sm_s2_gated = average_precision_score(gt_eval, frame_sm_s2_gated[:min_len])
-
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical BR-STB Backbone - Raw SOTA): {roc_raw_det * 100:.2f}% | AP: {ap_raw_det * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical BR-STB - Temp Scaled T={eff_temp:.1f}): {roc_raw_det_scaled * 100:.2f}% | AP: {ap_raw_det_scaled * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical BR-STB - Gaussian Smoothed σ={sm_sigma:.2f}): {roc_sm_det * 100:.2f}% | AP: {ap_sm_det * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (BR-STB Temp Scaled + Gaussian Smoothed): {roc_sm_det_scaled * 100:.2f}% | AP: {ap_sm_det_scaled * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (DSANet Benchmark Synergistic 90/10 Fusion): {roc_raw_dsanet * 100:.2f}% | AP: {ap_raw_dsanet * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (DSANet Benchmark Synergistic 90/10 + Smoothed - PEAK SOTA): {roc_sm_dsanet * 100:.2f}% | AP: {ap_sm_dsanet * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Intern-S2 Tri-Modal Synergistic Blend): {roc_raw_s2 * 100:.2f}% | AP: {ap_raw_s2 * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Intern-S2 Tri-Modal + Gaussian Smoothed - TARGET SOTA): {roc_sm_s2 * 100:.2f}% | AP: {ap_sm_s2 * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Stiefel Anti-FA Gated Semantics - S_sem_prime): {roc_raw_sem_stiefel * 100:.2f}% | AP: {ap_raw_sem_stiefel * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (S2 Stiefel Anti-FA Blend - Raw): {roc_raw_s2_gated * 100:.2f}% | AP: {ap_raw_s2_gated * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (S2 Stiefel Anti-FA Blend + Smoothed - TARGET SOTA): {roc_sm_s2_gated * 100:.2f}% | AP: {ap_sm_s2_gated * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Pareto SOTA 85/10/5 CSS-Gated + Smoothed): {roc_sm_pareto * 100:.2f}% | AP: {ap_sm_pareto * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Adaptive Stiefel Prototype Manifold - ASPM S_rec): {roc_raw_rec * 100:.2f}% | AP: {ap_raw_rec * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Dual-Stream Synergistic Fusion - Backbone + ASPM): {roc_raw_fusion * 100:.2f}% | AP: {ap_raw_fusion * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Fine-Grained Semantic Alignment - Raw TVSA): {roc_raw_sem_rupa * 100:.2f}% | AP: {ap_raw_sem_rupa * 100:.2f}%", flush=True)
-
-    roc_routing = roc_auc_score(gt_eval, frame_scores_routing[:min_len])
-    ap_routing = average_precision_score(gt_eval, frame_scores_routing[:min_len])
-
-    roc_det = roc_auc_score(gt_eval, frame_scores_det[:min_len])
-    ap_det = average_precision_score(gt_eval, frame_scores_det[:min_len])
-
-    roc_sem = roc_auc_score(gt_eval, frame_scores_sem[:min_len])
-    ap_sem = average_precision_score(gt_eval, frame_scores_sem[:min_len])
-
-    roc_sem_rupa = roc_auc_score(gt_eval, frame_scores_sem_rupa[:min_len])
-    ap_sem_rupa = average_precision_score(gt_eval, frame_scores_sem_rupa[:min_len])
-
-    roc_ens_sem = roc_auc_score(gt_eval, frame_scores_ens_sem[:min_len])
-    ap_ens_sem = average_precision_score(gt_eval, frame_scores_ens_sem[:min_len])
-
-    roc_ens_rupa = roc_auc_score(gt_eval, frame_scores_ens_rupa[:min_len])
-    ap_ens_rupa = average_precision_score(gt_eval, frame_scores_ens_rupa[:min_len])
-
-    roc_ens_det = roc_auc_score(gt_eval, frame_scores_ens_det[:min_len])
-    ap_ens_det = average_precision_score(gt_eval, frame_scores_ens_det[:min_len])
-
-    roc_ens_tri = roc_auc_score(gt_eval, frame_scores_ens_tri[:min_len])
-    ap_ens_tri = average_precision_score(gt_eval, frame_scores_ens_tri[:min_len])
-
-    roc_weighted = roc_auc_score(gt_eval, frame_scores_weighted[:min_len])
-    ap_weighted = average_precision_score(gt_eval, frame_scores_weighted[:min_len])
-
-    roc_geom = roc_auc_score(gt_eval, frame_scores_geom[:min_len])
-    ap_geom = average_precision_score(gt_eval, frame_scores_geom[:min_len])
-
-    roc_opt = roc_auc_score(gt_eval, frame_scores_opt[:min_len])
-    ap_opt = average_precision_score(gt_eval, frame_scores_opt[:min_len])
-
-    roc_harmonic = roc_auc_score(gt_eval, frame_scores_harmonic[:min_len])
-    ap_harmonic = average_precision_score(gt_eval, frame_scores_harmonic[:min_len])
-
-    roc_master = roc_auc_score(gt_eval, frame_scores_master[:min_len])
-    ap_master = average_precision_score(gt_eval, frame_scores_master[:min_len])
-
-    roc_hier = roc_auc_score(gt_eval, frame_scores_hier[:min_len])
-    ap_hier = average_precision_score(gt_eval, frame_scores_hier[:min_len])
-
-    roc_uccf = roc_auc_score(gt_eval, frame_scores_uccf[:min_len])
-    ap_uccf = average_precision_score(gt_eval, frame_scores_uccf[:min_len])
-
-    roc_dodo = roc_auc_score(gt_eval, frame_scores_dodo[:min_len])
-    ap_dodo = average_precision_score(gt_eval, frame_scores_dodo[:min_len])
-
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Closed-Loop Safe-Gated Routing - DSANet Standard): {roc_routing * 100:.2f}% | AP: {ap_routing * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical BR-STB Backbone): {roc_det * 100:.2f}% | AP: {ap_det * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Fine-Grained Semantic Alignment - TVSA): {roc_sem_rupa * 100:.2f}% | AP: {ap_sem_rupa * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Dual-Stream Synergistic Fusion): {roc_ens_rupa * 100:.2f}% | AP: {ap_ens_rupa * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Ensemble BR-STB + Backbone Semantics): {roc_ens_sem * 100:.2f}% | AP: {ap_ens_sem * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Weighted 60/40 Ensemble): {roc_weighted * 100:.2f}% | AP: {ap_weighted * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Geometric Mean Filtered): {roc_geom * 100:.2f}% | AP: {ap_geom * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Geometric Blend Ensemble): {roc_opt * 100:.2f}% | AP: {ap_opt * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Harmonic Consensus Ensemble): {roc_harmonic * 100:.2f}% | AP: {ap_harmonic * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Master SOTA Ensemble): {roc_master * 100:.2f}% | AP: {ap_master * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Tri-Stream Ensemble): {roc_ens_tri * 100:.2f}% | AP: {ap_ens_tri * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Hierarchical Refined): {roc_hier * 100:.2f}% | AP: {ap_hier * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (Single-Pass Multimodal SOTA): {roc_uccf * 100:.2f}% | AP: {ap_uccf * 100:.2f}%", flush=True)
-    print(f"[BR-MVAD Evaluation] Frame-level AUC (UCCF + DODO - SOTA): {roc_dodo * 100:.2f}% | AP: {ap_dodo * 100:.2f}%", flush=True)
-
-    if compute_dmap:
+    if compute_dmap and element_logits2_stack:
         try:
             dmap, iou = dmAP(element_logits2_stack, gtsegments, gtlabels, excludeNormal=False)
-            avg_map = 0.0
-            for i in range(len(iou)):
-                print(f"  mAP@{iou[i]:.1f} = {dmap[i]:.2f}%", flush=True)
-                avg_map += dmap[i]
-            avg_map = avg_map / max(1, len(iou))
-            print(f"  Average mAP: {avg_map:.2f}%", flush=True)
-        except Exception as e:
-            print(f"  [Note] Detection mAP calculation skipped: {e}", flush=True)
-        sys.stdout.flush()
+            avg_dmap = float(np.mean(dmap[:5]))
+            iou_str = " | ".join([f"mAP@{iou[k]:.1f}={dmap[k]:.2f}%" for k in range(min(5, len(iou)))])
+            print(f"    Localization: {iou_str} | Avg mAP = {avg_dmap:.2f}%", flush=True)
+        except Exception as exc:
+            print(f"    [Note] Detection mAP skipped: {exc}", flush=True)
 
-    # Use the best stream across all WS-VAD paradigms (including Raw SOTA & Calibrated streams)
-    best_auc = max(
-        roc_raw_det, roc_raw_det_scaled, roc_raw_dsanet, roc_sm_det, roc_sm_det_scaled, roc_sm_dsanet,
-        roc_raw_s2, roc_sm_s2, roc_raw_sem_stiefel, roc_raw_s2_gated, roc_sm_s2_gated, roc_sm_pareto,
-        roc_raw_rec, roc_raw_sem, roc_raw_sem_rupa, roc_raw_fusion,
-        roc_routing, roc_det, roc_sem, roc_sem_rupa,
-        roc_ens_sem, roc_ens_rupa, roc_ens_det, roc_ens_tri,
-        roc_weighted, roc_geom, roc_opt, roc_harmonic, roc_master, roc_hier, roc_uccf, roc_dodo
-    )
-    best_ap = max(
-        ap_raw_det, ap_raw_det_scaled, ap_raw_dsanet, ap_sm_det, ap_sm_det_scaled, ap_sm_dsanet,
-        ap_raw_s2, ap_sm_s2, ap_raw_sem_stiefel, ap_raw_s2_gated, ap_sm_s2_gated, ap_sm_pareto,
-        ap_raw_rec, ap_raw_sem, ap_raw_sem_rupa, ap_raw_fusion,
-        ap_routing, ap_det, ap_sem, ap_sem_rupa,
-        ap_ens_sem, ap_ens_rupa, ap_ens_det, ap_ens_tri,
-        ap_weighted, ap_geom, ap_opt, ap_harmonic, ap_master, ap_hier, ap_uccf, ap_dodo
-    )
-    print(f"  ==> [BEST METRIC] Frame-level AUC: {best_auc * 100:.2f}% | AP: {best_ap * 100:.2f}%", flush=True)
-    return best_auc, best_ap
+    sys.stdout.flush()
+    primary_auc = max(auc_collab, auc_route)
+    primary_ap = ap_collab if auc_collab >= auc_route else ap_route
+    return primary_auc, primary_ap
 
 
 if __name__ == '__main__':
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    args = ucf_option.parser.parse_args()
+    args, unknown = ucf_option.parser.parse_known_args()
+    if unknown:
+        print(f"[CLI] Ignored unrecognized arguments: {unknown}", flush=True)
 
     label_map = {
-        'Normal': 'Normal', 'Abuse': 'Abuse', 'Arrest': 'Arrest', 'Arson': 'Arson',
-        'Assault': 'Assault', 'Burglary': 'Burglary', 'Explosion': 'Explosion',
-        'Fighting': 'Fighting', 'RoadAccidents': 'RoadAccidents', 'Robbery': 'Robbery',
-        'Shooting': 'Shooting', 'Shoplifting': 'Shoplifting', 'Stealing': 'Stealing',
-        'Vandalism': 'Vandalism'
+        'Normal': 'normal', 'Abuse': 'abuse', 'Arrest': 'arrest', 'Arson': 'arson',
+        'Assault': 'assault', 'Burglary': 'burglary', 'Explosion': 'explosion',
+        'Fighting': 'fighting', 'RoadAccidents': 'roadaccidents', 'Robbery': 'robbery',
+        'Shooting': 'shooting', 'Shoplifting': 'shoplifting', 'Stealing': 'stealing',
+        'Vandalism': 'vandalism',
     }
 
     testdataset = UCFDataset(args.visual_length, args.test_list, True, label_map, data_dir=args.data_dir)
-    testdataloader = DataLoader(testdataset, batch_size=1, shuffle=False)
+    testdataloader = DataLoader(testdataset, batch_size=1, shuffle=False, num_workers=args.num_workers)
 
     prompt_text = get_prompt_text(label_map)
     gt = np.load(args.gt_path)
@@ -580,24 +280,14 @@ if __name__ == '__main__':
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
 
     model = MARUPA(
-        num_class=args.classes_num,
-        embed_dim=args.embed_dim,
-        visual_length=args.visual_length,
-        visual_width=args.visual_width,
-        visual_head=args.visual_head,
-        visual_layers=args.visual_layers,
-        attn_window=args.attn_window,
-        args=args,
-        device=device
+        args.classes_num, args.embed_dim, args.visual_length, args.visual_width,
+        args.visual_head, args.visual_layers, args.attn_window,
+        args.prompt_prefix, args.prompt_postfix, args, device,
     )
+    ckpt = safe_load_checkpoint(args.model_path, map_location=device)
+    load_compatible_model_state(model, ckpt, allow_legacy_dsanet=True)
 
-    if args.model_path:
-        checkpoint = safe_load_checkpoint(args.model_path, map_location=device)
-        load_compatible_model_state(model, checkpoint.get('model_state_dict', checkpoint), strict=False)
-        if isinstance(checkpoint, dict) and 'args' in checkpoint and isinstance(checkpoint['args'], dict):
-            cp_args = checkpoint['args']
-            if 't_w' in cp_args and hasattr(model, 'clip_adapter'):
-                model.clip_adapter.t_w = float(cp_args['t_w'])
-                print(f"[Auto-Detect] Restored checkpoint text adapter t_w = {model.clip_adapter.t_w}", flush=True)
-
-    test(model, testdataloader, args.visual_length, prompt_text, gt, gtsegments, gtlabels, args.DNP_use, device, args, compute_dmap=True)
+    test(
+        model, testdataloader, args.visual_length, prompt_text,
+        gt, gtsegments, gtlabels, args.DNP_use, device, args, compute_dmap=True,
+    )

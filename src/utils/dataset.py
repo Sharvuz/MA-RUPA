@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 import torch
@@ -28,7 +29,8 @@ def get_kaggle_file_maps():
             search_dirs.append(d)
 
     for root_dir in search_dirs:
-        for dirpath, _, filenames in os.walk(root_dir):
+        for dirpath, dirs, filenames in os.walk(root_dir):
+            dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', '.ipynb_checkpoints', '.cache'}]
             dir_lower = dirpath.lower()
             is_audio_dir = any(kw in dir_lower for kw in ['audio', 'vgg', 'clap', 'ast', 'sound', 'wav'])
             for fname in filenames:
@@ -39,7 +41,6 @@ def get_kaggle_file_maps():
                     if is_audio:
                         _KAGGLE_AUDIO_MAP[fname] = full_p
 
-                    # Map '#' and '+' equivalents for Kaggle filename safety
                     variants = [fname]
                     if '+' in fname:
                         variants.append(fname.replace('+', '#'))
@@ -54,7 +55,6 @@ def get_kaggle_file_maps():
                         if is_audio and v not in _KAGGLE_AUDIO_MAP:
                             _KAGGLE_AUDIO_MAP[v] = full_p
 
-                    # Also map variants with/without '__vggish' suffix for instant pairing
                     clean_stem = fname.replace('__vggish.npy', '.npy').replace('_vggish.npy', '.npy')
                     if clean_stem != fname:
                         extra_variants = [clean_stem, clean_stem.replace('+', '#'), clean_stem.replace('#', '+')]
@@ -93,7 +93,10 @@ def get_path_variants(path_or_name: str) -> list[str]:
 
 _RESOLVE_CACHE = {}
 _INFER_AUDIO_CACHE = {}
-_AUDIO_PATH_BY_BASEKEY = {}
+_MULTICROP_PATH_CACHE = {}
+_TEST_FEATURE_RAM_CACHE = {}
+_TEST_FEATURE_RAM_BYTES = 0
+_MAX_TEST_RAM_CACHE_BYTES = 2200 * 1024 * 1024  # 2.2 GB safe ceiling on 30 GB Kaggle RAM
 
 
 def resolve_feature_path(path: str, data_dir: str = None) -> str:
@@ -108,7 +111,6 @@ def resolve_feature_path(path: str, data_dir: str = None) -> str:
 
 
 def _resolve_feature_path_uncached(path: str, data_dir: str = None) -> str:
-    # 1. Direct path check with variants
     for v in get_path_variants(path):
         if os.path.exists(v):
             return v
@@ -116,20 +118,17 @@ def _resolve_feature_path_uncached(path: str, data_dir: str = None) -> str:
     base_name = os.path.basename(path)
     base_variants = get_path_variants(base_name)
 
-    # 2. Check in data_dir if provided
     if data_dir and os.path.exists(data_dir):
         for v in base_variants:
             cand = os.path.join(data_dir, v)
             if os.path.exists(cand):
                 return cand
-        # Also try relative path
         rel = path.lstrip('/\\')
         for v in get_path_variants(rel):
             cand = os.path.join(data_dir, v)
             if os.path.exists(cand):
                 return cand
 
-    # 3. Check in indexed Kaggle filesystem
     k_map = get_kaggle_file_map()
     for v in base_variants:
         if v in k_map and os.path.exists(k_map[v]):
@@ -139,7 +138,7 @@ def _resolve_feature_path_uncached(path: str, data_dir: str = None) -> str:
 
 
 def strip_crop_suffix(path_or_name: str) -> str:
-    """Strips __[0-9].npy crop suffix from XD-Violence visual path, preserving segment timestamps."""
+    """Strips __[0-9].npy crop suffix from visual path, preserving segment timestamps."""
     name = os.path.basename(path_or_name)
     for crop_idx in range(10):
         if f"__{crop_idx}.npy" in name:
@@ -148,10 +147,7 @@ def strip_crop_suffix(path_or_name: str) -> str:
 
 
 def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
-    """Infer the audio feature file path corresponding to a visual snippet feature.
-    
-    Handles 5-crop/10-crop suffix stripping, __vggish suffixes, and Kaggle '# <-> +' character replacements.
-    """
+    """Infer the audio feature file path corresponding to a visual snippet feature."""
     cache_key = (visual_path, audio_dir)
     if cache_key in _INFER_AUDIO_CACHE:
         return _INFER_AUDIO_CACHE[cache_key]
@@ -162,36 +158,43 @@ def infer_audio_path(visual_path: str, audio_dir: str = None) -> str:
 
 
 def _infer_audio_path_uncached(visual_path: str, audio_dir: str = None) -> str:
+    vis_abs = os.path.abspath(visual_path) if os.path.exists(visual_path) else None
     base_name = os.path.basename(visual_path)
     base_no_crop = strip_crop_suffix(base_name)
 
-    raw_names = get_path_variants(base_name) + get_path_variants(base_no_crop)
-    target_names = []
+    # Prioritize explicit __vggish / _vggish and crop-stripped names first so visual crops never self-match
+    raw_names = get_path_variants(base_no_crop) + get_path_variants(base_name)
+    explicit_vgg_names = []
+    plain_names = []
     for n in raw_names:
-        target_names.append(n)
         if n.endswith('.npy'):
-            target_names.append(n.replace('.npy', '__vggish.npy'))
-            target_names.append(n.replace('.npy', '_vggish.npy'))
-    target_names = list(dict.fromkeys(target_names))
+            explicit_vgg_names.append(n.replace('.npy', '__vggish.npy'))
+            explicit_vgg_names.append(n.replace('.npy', '_vggish.npy'))
+        plain_names.append(n)
+    target_names = list(dict.fromkeys(explicit_vgg_names + plain_names))
 
-    # 1. Check in explicit audio_dir
+    def _is_valid_audio_cand(cand_p: str) -> bool:
+        if not cand_p or not os.path.exists(cand_p):
+            return False
+        if vis_abs is not None and os.path.abspath(cand_p) == vis_abs:
+            return False
+        return True
+
     if audio_dir and os.path.exists(audio_dir):
         for name in target_names:
             candidate = os.path.join(audio_dir, name)
-            if os.path.exists(candidate):
+            if _is_valid_audio_cand(candidate):
                 return candidate
             for subdir in ['train', 'test', 'XDTrainAudioFeatures', 'XDTestAudioFeatures']:
                 sub_candidate = os.path.join(audio_dir, subdir, name)
-                if os.path.exists(sub_candidate):
+                if _is_valid_audio_cand(sub_candidate):
                     return sub_candidate
 
-    # 2. Check Kaggle audio-prioritized file map
     audio_map = get_kaggle_audio_map()
     for name in target_names:
-        if name in audio_map and os.path.exists(audio_map[name]):
+        if name in audio_map and _is_valid_audio_cand(audio_map[name]):
             return audio_map[name]
 
-    # 3. Common directory substitutions
     substitutions = [
         ('ClipFeatures', 'AudioFeatures'),
         ('clip_features', 'audio_features'),
@@ -212,9 +215,7 @@ def _infer_audio_path_uncached(visual_path: str, audio_dir: str = None) -> str:
             cand_no_crop = strip_crop_suffix(cand_base)
             cand_dir = os.path.dirname(cand_base)
 
-            candidates_to_check = []
-            for name in target_names:
-                candidates_to_check.append(os.path.join(cand_dir, name))
+            candidates_to_check = [os.path.join(cand_dir, name) for name in target_names]
             for v in get_path_variants(cand_base) + get_path_variants(cand_no_crop):
                 candidates_to_check.append(v)
                 if v.endswith('.npy'):
@@ -225,26 +226,166 @@ def _infer_audio_path_uncached(visual_path: str, audio_dir: str = None) -> str:
                 if os.path.exists(cand_p):
                     return cand_p
 
-    # 4. Check general Kaggle file map with audio keywords
     k_map = get_kaggle_file_map()
     for name in target_names:
         if name in k_map and os.path.exists(k_map[name]):
             cand = k_map[name]
-            cand_lower = cand.lower()
-            if any(kw in cand_lower for kw in ['audio', 'vgg', 'clap', 'ast', 'sound', 'wav']):
+            if any(kw in cand.lower() for kw in ['audio', 'vgg', 'clap', 'ast', 'sound', 'wav']):
                 return cand
 
     return None
 
 
-class UCFDataset(data.Dataset):
-    """UCF-Crime Dataset Loader.
-    
-    Loads pre-extracted 512-D CLIP visual features. UCF-Crime does not have audio,
-    so the architecture automatically operates in Missing-Modality / Motion-Residual Mode.
-    Automatically resolves file paths with '# <-> +' support on Kaggle.
-    Supports random single-crop selection per video per epoch to prevent overfitting/memorization.
+def _load_npy_cached_fp32(path: str):
+    """Loads a test .npy file with bounded float16 RAM caching for zero-I/O repeated evaluations."""
+    global _TEST_FEATURE_RAM_BYTES
+    if path in _TEST_FEATURE_RAM_CACHE:
+        return _TEST_FEATURE_RAM_CACHE[path].astype(np.float32)
+    if not path or not os.path.exists(path):
+        return None
+    arr = np.load(path)
+    arr_fp16 = np.asarray(arr, dtype=np.float16)
+    if _TEST_FEATURE_RAM_BYTES + arr_fp16.nbytes <= _MAX_TEST_RAM_CACHE_BYTES:
+        _TEST_FEATURE_RAM_CACHE[path] = arr_fp16
+        _TEST_FEATURE_RAM_BYTES += arr_fp16.nbytes
+    return np.asarray(arr, dtype=np.float32)
+
+
+def resolve_multicrop_paths(primary_path: str, data_dir: str = None, max_crops: int = 10) -> list[str]:
+    """Discovers all spatial crop .npy files (__0.npy .. __{max_crops-1}.npy) for a test video."""
+    cache_key = (primary_path, data_dir, max_crops)
+    if cache_key in _MULTICROP_PATH_CACHE:
+        return _MULTICROP_PATH_CACHE[cache_key]
+
+    resolved_primary = resolve_feature_path(primary_path, data_dir)
+    if max_crops <= 1:
+        res = [resolved_primary]
+        _MULTICROP_PATH_CACHE[cache_key] = res
+        return res
+
+    base_name = os.path.basename(resolved_primary)
+    primary_dir = os.path.dirname(resolved_primary)
+
+    stem_prefix = None
+    for k in range(10):
+        suffix = f"__{k}.npy"
+        if base_name.endswith(suffix):
+            stem_prefix = base_name[:-len(suffix)]
+            break
+
+    if stem_prefix is None:
+        res = [resolved_primary]
+        _MULTICROP_PATH_CACHE[cache_key] = res
+        return res
+
+    found_crops = []
+    seen = set()
+    for c_idx in range(max_crops):
+        cand_name = f"{stem_prefix}__{c_idx}.npy"
+        cand_full = None
+        if primary_dir:
+            for v_name in get_path_variants(cand_name):
+                direct_p = os.path.join(primary_dir, v_name)
+                if os.path.exists(direct_p):
+                    cand_full = direct_p
+                    break
+        if cand_full is None:
+            resolved_c = resolve_feature_path(cand_name, data_dir)
+            if os.path.exists(resolved_c):
+                cand_full = resolved_c
+        if cand_full is not None and cand_full not in seen:
+            seen.add(cand_full)
+            found_crops.append(cand_full)
+
+    if not found_crops:
+        found_crops = [resolved_primary]
+
+    _MULTICROP_PATH_CACHE[cache_key] = found_crops
+    return found_crops
+
+
+def load_multicrop_test_video(raw_path: str, maxlen: int, data_dir: str = None,
+                              audio_dir: str = None, no_audio: bool = True,
+                              max_crops: int = 10, fallback_visual: torch.Tensor = None,
+                              fallback_length: int = None, fallback_audio: torch.Tensor = None):
+    """Loads and batches all available spatial crops of a single test video for fast parallel GPU eval.
+
+    Returns:
+        visual_crops: Tensor [num_crops, num_splits, maxlen, D]
+        audio_crops: Tensor [num_crops, num_splits, maxlen, D_a] or None
+        clip_length: int (exact snippet length of primary crop)
+        num_crops: int
     """
+    crop_paths = resolve_multicrop_paths(raw_path, data_dir=data_dir, max_crops=max_crops)
+    valid_feats = []
+    for cp in crop_paths:
+        arr = _load_npy_cached_fp32(cp)
+        if arr is not None and arr.ndim == 2 and arr.shape[0] > 0:
+            valid_feats.append(arr)
+
+    if not valid_feats:
+        if fallback_visual is not None:
+            v = fallback_visual.float()
+            if v.ndim == 2:
+                v = v.unsqueeze(0)
+            a = None
+            if fallback_audio is not None and not no_audio:
+                a = fallback_audio.float()
+                if a.ndim == 2:
+                    a = a.unsqueeze(0)
+                a = a.unsqueeze(0)
+            return v.unsqueeze(0), a, int(fallback_length), 1
+        dummy = torch.zeros((1, 1, maxlen, 512), dtype=torch.float32)
+        return dummy, None, maxlen, 1
+
+    primary_len = int(fallback_length) if fallback_length is not None else int(valid_feats[0].shape[0])
+    split_crops = []
+    for arr in valid_feats:
+        if arr.shape[0] != primary_len:
+            t_arr = torch.from_numpy(arr).float().transpose(0, 1).unsqueeze(0)
+            arr = F.interpolate(t_arr, size=primary_len, mode='linear', align_corners=False).squeeze(0).transpose(0, 1).numpy()
+        split_v, _ = tools.process_split(arr, maxlen)
+        if split_v.ndim == 2:
+            split_v = split_v[np.newaxis, :, :]
+        split_crops.append(torch.from_numpy(split_v).float())
+
+    visual_crops = torch.stack(split_crops, dim=0)  # [C, num_splits, maxlen, 512]
+    num_crops = visual_crops.shape[0]
+
+    audio_crops = None
+    if not no_audio:
+        if fallback_audio is not None:
+            a = fallback_audio.float()
+            if a.ndim == 2:
+                a = a.unsqueeze(0)
+            if a.shape[0] != visual_crops.shape[1]:
+                a_flat = a.reshape(-1, a.shape[-1]).transpose(0, 1).unsqueeze(0)
+                a_interp = F.interpolate(
+                    a_flat, size=visual_crops.shape[1] * maxlen, mode='linear', align_corners=False
+                ).squeeze(0).transpose(0, 1)
+                a = a_interp.view(visual_crops.shape[1], maxlen, -1)
+            audio_crops = a.unsqueeze(0).expand(num_crops, -1, -1, -1).contiguous()
+        else:
+            a_path = infer_audio_path(crop_paths[0], audio_dir)
+            a_raw = _load_npy_cached_fp32(a_path) if a_path else None
+            if a_raw is not None:
+                if a_raw.ndim == 1:
+                    a_raw = a_raw.reshape(-1, 128)
+                if a_raw.shape[0] != primary_len:
+                    a_t = torch.from_numpy(a_raw).float().transpose(0, 1).unsqueeze(0)
+                    a_raw = F.interpolate(a_t, size=primary_len, mode='linear', align_corners=False).squeeze(0).transpose(0, 1).numpy()
+                split_a, _ = tools.process_split(a_raw, maxlen)
+                if split_a.ndim == 2:
+                    split_a = split_a[np.newaxis, :, :]
+                a_tensor = torch.from_numpy(split_a).float()
+                audio_crops = a_tensor.unsqueeze(0).expand(num_crops, -1, -1, -1).contiguous()
+
+    return visual_crops, audio_crops, primary_len, num_crops
+
+
+class UCFDataset(data.Dataset):
+    """UCF-Crime Dataset Loader (512-D CLIP ViT-B/16 snippet features)."""
+
     def __init__(self, clip_dim: int, file_path: str, test_mode: bool, label_map: dict,
                  normal: bool = False, data_dir: str = None, sample_one_crop_per_video: bool = False,
                  crops_per_video: int = 1):
@@ -266,10 +407,8 @@ class UCFDataset(data.Dataset):
         self.raw_paths = self.df['path'].tolist()
         self.labels = self.df['label'].tolist()
 
-        # Group crops by base video ID for healthy epoch sampling without bag memorization
         self.video_groups = []
         if self.sample_one_crop_per_video and not self.test_mode:
-            from collections import defaultdict
             grouped = defaultdict(list)
             for p, l in zip(self.raw_paths, self.labels):
                 base_id = os.path.basename(p).split('__')[0]
@@ -291,9 +430,8 @@ class UCFDataset(data.Dataset):
             label = self.labels[index]
 
         path = resolve_feature_path(raw_path, self.data_dir)
-
         if os.path.exists(path):
-            clip_feature = np.load(path)
+            clip_feature = _load_npy_cached_fp32(path) if self.test_mode else np.load(path)
         else:
             clip_feature = np.zeros((self.clip_dim, 512), dtype=np.float32)
 
@@ -306,19 +444,8 @@ class UCFDataset(data.Dataset):
 
 
 class XDDataset(data.Dataset):
-    """XD-Violence Multimodal Dataset Loader.
-    
-    Loads paired (visual_feature, audio_feature, label) tensors.
-    Supports pre-extracted CLIP visual features (512-D) and VGGish/CLAP/AST audio features.
-    
-    Fixes Applied:
-    1. Synchronized Audio-Visual Sampling: audio features are temporally aligned to visual length
-       BEFORE cropping/sampling/padding so valid frames [0 : seq_len] and zero-padding [seq_len : T_max]
-       are 100% in lockstep!
-    2. Balanced Normal/Abnormal Bag filtering (normal=True / normal=False).
-    3. Crop-Grouped Epoch Sampling (sample_one_crop_per_video) to prevent 10-crop memorization.
-    4. Startup audio-visual pairing audit log.
-    """
+    """XD-Violence Multimodal Dataset Loader (512-D CLIP Visual + Synchronized 128-D VGGish Audio)."""
+
     def __init__(self, clip_dim: int, file_path: str, test_mode: bool, label_map: dict,
                  audio_file_path: str = None, audio_dir: str = None,
                  data_dir: str = None, no_audio: bool = False,
@@ -335,10 +462,8 @@ class XDDataset(data.Dataset):
         self.sample_one_crop_per_video = sample_one_crop_per_video
         self.crops_per_video = max(1, crops_per_video)
 
-        # Filter normal / anomaly bags if requested
         if not test_mode and normal is not None:
             if normal:
-                # Class 'A' is normal in XD-Violence
                 self.df = self.df.loc[self.df['label'].astype(str).str.startswith('A')].reset_index(drop=True)
             else:
                 self.df = self.df.loc[~self.df['label'].astype(str).str.startswith('A')].reset_index(drop=True)
@@ -346,17 +471,14 @@ class XDDataset(data.Dataset):
         self.raw_paths = self.df['path'].tolist()
         self.labels = self.df['label'].tolist()
 
-        # Group crops by base video snippet ID for healthy epoch sampling without bag memorization
         self.video_groups = []
         if self.sample_one_crop_per_video and not self.test_mode:
-            from collections import defaultdict
             grouped = defaultdict(list)
             for p, l in zip(self.raw_paths, self.labels):
                 base_id = strip_crop_suffix(p)
                 grouped[base_id].append((p, l))
             self.video_groups = list(grouped.values())
 
-        # Audio mapping
         self.audio_dict = {}
         if audio_file_path and os.path.exists(audio_file_path):
             audio_df = pd.read_csv(audio_file_path)
@@ -371,12 +493,15 @@ class XDDataset(data.Dataset):
 
         self._audio_path_cache = {}
 
-        # Audio-Visual Synchronization Startup Audit Log
         if not test_mode and not no_audio and len(self.raw_paths) > 0:
             sample_n = min(len(self.raw_paths), 500)
             matched = sum(1 for p in self.raw_paths[:sample_n] if self.get_audio_path_quick(p) is not None)
             pct = (matched / max(1, sample_n)) * 100.0
-            print(f"[XDDataset] Audio-Visual synchronization audit: sampled {matched}/{sample_n} ({pct:.1f}%) videos successfully paired with audio features.", flush=True)
+            print(
+                f"[XDDataset] Audio-Visual synchronization audit: sampled {matched}/{sample_n} "
+                f"({pct:.1f}%) videos successfully paired with audio features.",
+                flush=True,
+            )
 
     def get_audio_path_quick(self, visual_path: str):
         base_key = strip_crop_suffix(visual_path)
@@ -410,42 +535,33 @@ class XDDataset(data.Dataset):
             label = self.labels[index]
 
         path = resolve_feature_path(raw_path, self.data_dir)
-
         if os.path.exists(path):
-            v_raw = np.load(path)
+            v_raw = _load_npy_cached_fp32(path) if self.test_mode else np.load(path)
         else:
             v_raw = np.zeros((self.clip_dim, 512), dtype=np.float32)
 
         v_len = v_raw.shape[0]
 
-        # Resolve and load raw audio
         a_raw = None
         if not self.no_audio:
             audio_path = self.get_audio_path_quick(path)
             if audio_path and os.path.exists(audio_path):
                 try:
-                    a_raw = np.load(audio_path)
-                    if a_raw.ndim == 1:
+                    a_raw = _load_npy_cached_fp32(audio_path) if self.test_mode else np.load(audio_path)
+                    if a_raw is not None and a_raw.ndim == 1:
                         a_raw = a_raw.reshape(-1, 128)
                 except Exception:
                     a_raw = None
 
-        # Fix 2: Step A - Temporally interpolate audio to match raw visual length Tv BEFORE sampling/padding
         if a_raw is not None and a_raw.shape[0] != v_len:
-            a_t = torch.from_numpy(a_raw).float().transpose(0, 1).unsqueeze(0)  # [1, D_a, T_a]
-            a_interp = F.interpolate(a_t, size=v_len, mode='linear', align_corners=False).squeeze(0).transpose(0, 1).numpy()
-            a_raw = a_interp
+            a_t = torch.from_numpy(a_raw).float().transpose(0, 1).unsqueeze(0)
+            a_raw = F.interpolate(a_t, size=v_len, mode='linear', align_corners=False).squeeze(0).transpose(0, 1).numpy()
 
-        # Fix 2: Step B - Apply the EXACT SAME sampling/cropping/padding to BOTH visual and audio
         if not self.test_mode:
             if v_len > self.clip_dim:
-                # Uniform extraction with identical segment intervals
                 r = np.linspace(0, v_len, self.clip_dim + 1, dtype=np.int32)
                 v_feat = np.zeros((self.clip_dim, v_raw.shape[1]), dtype=np.float32)
-                if a_raw is not None:
-                    a_feat = np.zeros((self.clip_dim, a_raw.shape[1]), dtype=np.float32)
-                else:
-                    a_feat = None
+                a_feat = np.zeros((self.clip_dim, a_raw.shape[1]), dtype=np.float32) if a_raw is not None else None
 
                 for i in range(self.clip_dim):
                     if r[i] != r[i + 1]:
@@ -459,10 +575,7 @@ class XDDataset(data.Dataset):
                 clip_length = self.clip_dim
             else:
                 v_feat = tools.pad(v_raw, self.clip_dim)
-                if a_raw is not None:
-                    a_feat = tools.pad(a_raw, self.clip_dim)
-                else:
-                    a_feat = None
+                a_feat = tools.pad(a_raw, self.clip_dim) if a_raw is not None else None
                 clip_length = v_len
 
             v_tensor = torch.tensor(v_feat, dtype=torch.float32)

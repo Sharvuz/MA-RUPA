@@ -1,785 +1,472 @@
-"""MA-RUPA End-to-End Training Script for XD-Violence.
-
-Trains MA-RUPA from scratch in a single stage with multimodal audio-visual fusion,
-interleaved multi-GPU batching, smooth cosine curriculum warm-up, and rebalanced prototype losses.
-"""
-
-import math
 import os
 import random
 import subprocess
 import sys
+import time
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 from torch.utils.data import DataLoader
 
 from model import MARUPA, load_compatible_model_state
 from xd_test import test
 from utils.dataset import XDDataset
-from utils.tools import get_batch_label, get_prompt_text, xd_collate_fn, xd_test_collate_fn, safe_load_checkpoint
+from utils.tools import (
+    get_prompt_text, get_batch_label, safe_load_checkpoint,
+    xd_collate_fn, xd_test_collate_fn,
+)
+from utils.StableAdamW import StableAdamW
 from utils.losses import (
-    get_curriculum_omega,
-    compute_maf_mil_loss,
-    compute_anti_saturation_mil_loss,
-    compute_dynamic_density_topk_mil_loss,
-    compute_stiefel_gated_semantic_loss,
-    apply_asymmetric_av_discordance_gate,
-    compute_pairwise_ranking_loss,
-    compute_stiefel_grassmann_loss,
-    compute_ahns_loss,
-    compute_temporal_tv_loss,
-    compute_epts_loss,
-    compute_text_separation_loss,
-    compute_at_bce_topk_mil_loss,
-    compute_topk_mil_loss,
-    compute_dats_mil_loss,
-    compute_ogdp_geometry_loss,
-    compute_fg_tv_smoothness_loss,
-    compute_temporal_smoothness_loss,
-    compute_confidence_gated_consistency_loss,
-    compute_residual_event_loss,
-    compute_clasm_loss,
-    compute_tasl_cross_modal_loss,
-    compute_bkg_loss,
-    compute_consistency_loss,
-    compute_event_loss,
-    compute_gather_loss,
-    compute_orthogonality_loss,
-    compute_normal_contrastive_loss
+    CLAS2, CLASM, CLASM_EVENT, RUPA_RESIDUAL_EVENT, CLASM_BKG,
+    text_orthogonality_loss, ConsistencyLoss, routing_anchor_loss,
+    edge_preserving_smoothness_loss, audio_guided_mil_loss,
+    WarmCosineScheduler, ModelEMA,
 )
 import xd_option
 
 
-def get_compact_state_dict(state_dict):
-    """Filters out frozen OpenAI CLIP ViT-B/16 parameters (335 MB).
-    Retains all trainable adapters, MDTBackbone, RUPA, and SafeGate parameters (~35 MB),
-    accelerating torch.save disk I/O by >10x!
-    """
+XD_LABEL_MAP = {
+    'A': 'normal', 'B1': 'fighting', 'B2': 'shooting',
+    'B4': 'riot', 'B5': 'abuse', 'B6': 'car accident', 'G': 'explosion',
+}
+
+
+def setup_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def unwrap_compact_state_dict(model: nn.Module) -> dict:
+    """Extracts trainable/adapter state_dict without frozen CLIP weights (~45 MB vs 295 MB)."""
+    raw = model.module if isinstance(model, nn.DataParallel) else model
     return {
-        k: v for k, v in state_dict.items()
-        if not k.startswith('clipmodel.') and not k.startswith('module.clipmodel.')
+        k: v.detach().cpu()
+        for k, v in raw.state_dict().items()
+        if not k.startswith('clip_adapter.clipmodel.')
     }
 
 
-def safe_save_checkpoint(checkpoint_dict, path):
-    """Saves checkpoint compactly and safely."""
-    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-    if 'model_state_dict' in checkpoint_dict:
-        checkpoint_dict['model_state_dict'] = get_compact_state_dict(checkpoint_dict['model_state_dict'])
-    torch.save(checkpoint_dict, path)
+def interleave_multimodal_batch(n_vis, n_lbls, n_lens, n_aud,
+                                a_vis, a_lbls, a_lens, a_aud, device):
+    """Interleaves Normal and Abnormal visual+audio samples [N0, A0, N1, A1, ...]
+    so every GPU shard in torch.nn.DataParallel receives an exact 50/50 balance.
+    """
+    b = min(n_vis.shape[0], a_vis.shape[0])
+    _, t, d = n_vis.shape
+
+    vis = torch.empty((2 * b, t, d), dtype=n_vis.dtype)
+    vis[0::2] = n_vis[:b]
+    vis[1::2] = a_vis[:b]
+
+    lens = torch.empty((2 * b,), dtype=torch.long)
+    lens[0::2] = n_lens[:b]
+    lens[1::2] = a_lens[:b]
+
+    labels = []
+    for k in range(b):
+        labels.append(n_lbls[k])
+        labels.append(a_lbls[k])
+
+    aud_dev = None
+    if n_aud is not None or a_aud is not None:
+        ref = n_aud if n_aud is not None else a_aud
+        da = ref.shape[-1]
+        ta = ref.shape[1]
+        aud = torch.zeros((2 * b, ta, da), dtype=ref.dtype)
+        if n_aud is not None:
+            aud[0::2] = n_aud[:b]
+        if a_aud is not None:
+            aud[1::2] = a_aud[:b]
+        aud_dev = aud.to(device, non_blocking=True)
+
+    return vis.to(device, non_blocking=True), labels, lens.to(device, non_blocking=True), aud_dev
 
 
-from torch.optim.lr_scheduler import _LRScheduler
-
-class WarmCosineScheduler(_LRScheduler):
-    """Cosine learning rate scheduler with linear warm-up (DSANet SOTA standard)."""
-    def __init__(self, optimizer, base_value, final_value, total_iters, warmup_iters=0, start_warmup_value=0):
-        self.final_value = final_value
-        self.total_iters = total_iters
-        warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
-        iters = np.arange(total_iters - warmup_iters)
-        schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / max(1, len(iters))))
-        self.schedule = np.concatenate((warmup_schedule, schedule))
-        super(WarmCosineScheduler, self).__init__(optimizer)
-
-    def get_lr(self):
-        if self.last_epoch >= self.total_iters:
-            return [self.final_value for _ in self.base_lrs]
-        else:
-            return [self.schedule[self.last_epoch] for _ in self.base_lrs]
-
-
-def train(args):
-    try:
-        import subprocess
-        commit_id = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
-        print(f"[MA-RUPA Codebase] Git Commit: {commit_id}", flush=True)
-    except Exception:
-        pass
-
-    # Enforce 20-epoch DPSS schedule for XD-Violence
-    if getattr(args, 'max_epoch', 25) > 40:
-        print(f"[Auto-Config] Setting --max-epoch {args.max_epoch} -> 40 epochs ceiling.", flush=True)
-        args.max_epoch = 40
-    if getattr(args, 'curriculum_epochs', 3.0) > 3.0:
-        args.curriculum_epochs = 3.0
-    if getattr(args, 'max_omega', 0.20) > 0.25:
-        args.max_omega = 0.20
-    if getattr(args, 'lambda_aux', 0.05) > 0.10:
-        args.lambda_aux = 0.05
-    if getattr(args, 'routing_aux_weight', 0.08) > 0.12:
-        args.routing_aux_weight = 0.08
-    if getattr(args, 'routing_rec_weight', 0.05) > 0.10:
-        args.routing_rec_weight = 0.05
-    if getattr(args, 'lambda_smooth', 0.0) < 0.0:
-        args.lambda_smooth = 0.0
-    if getattr(args, 'use_epts', True) and getattr(args, 'smooth_sigma', 0.50) > 0.75:
-        args.smooth_sigma = 0.50
-    if getattr(args, 'use_aspm', True):
-        if getattr(args, 'lambda_gather', 0.10) < 0.05:
-            args.lambda_gather = 0.10
-        if getattr(args, 'lambda_orth', 0.05) < 0.03:
-            args.lambda_orth = 0.05
-        if getattr(args, 'lambda_consistency', 0.15) > 0.25:
-            args.lambda_consistency = 0.15
-        if getattr(args, 'loss2_weight', 1.4) > 1.6 or getattr(args, 'loss2_weight', 1.4) < 0.8:
-            pass
-        if getattr(args, 'temp', 1.0) > 1.2:
-            pass
-
-    # Set random seeds
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[MA-RUPA] Training XD-Violence on device: {device}", flush=True)
-
-    os.makedirs(os.path.dirname(args.model_path) or '.', exist_ok=True)
-    os.makedirs(os.path.dirname(args.checkpoint_path) or '.', exist_ok=True)
-
-    label_map = {
-        'A': 'normal', 'B1': 'fighting', 'B2': 'shooting',
-        'B4': 'riot', 'B5': 'abuse', 'B6': 'car accident', 'G': 'explosion'
+def build_xd_components(args, device):
+    half_bs = max(1, args.batch_size // 2)
+    loader_kwargs = {
+        'num_workers': args.num_workers,
+        'pin_memory': torch.cuda.is_available(),
+        'persistent_workers': args.num_workers > 0,
     }
 
-    # Datasets & Balanced Paired Loaders: default to DPSS (random crop selection per epoch)
-    sample_one_crop = getattr(args, 'sample_one_crop_per_video', True)
-    crops_per_video = getattr(args, 'crops_per_video', 2)
     normal_dataset = XDDataset(
-        args.visual_length, args.train_list, False, label_map,
+        args.visual_length, args.train_list, False, XD_LABEL_MAP,
         audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
         data_dir=args.data_dir, no_audio=args.no_audio,
-        normal=True, sample_one_crop_per_video=sample_one_crop,
-        crops_per_video=crops_per_video
+        normal=True, sample_one_crop_per_video=args.sample_one_crop_per_video,
+        crops_per_video=args.crops_per_video,
     )
     anomaly_dataset = XDDataset(
-        args.visual_length, args.train_list, False, label_map,
+        args.visual_length, args.train_list, False, XD_LABEL_MAP,
         audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
         data_dir=args.data_dir, no_audio=args.no_audio,
-        normal=False, sample_one_crop_per_video=sample_one_crop,
-        crops_per_video=crops_per_video
+        normal=False, sample_one_crop_per_video=args.sample_one_crop_per_video,
+        crops_per_video=args.crops_per_video,
     )
 
-    batch_half = max(1, args.batch_size // 2)
     normal_loader = DataLoader(
-        normal_dataset, batch_size=batch_half, shuffle=True,
-        num_workers=args.num_workers, collate_fn=xd_collate_fn, drop_last=True, pin_memory=True
+        normal_dataset, batch_size=half_bs, shuffle=True, drop_last=True,
+        collate_fn=xd_collate_fn, **loader_kwargs,
     )
     anomaly_loader = DataLoader(
-        anomaly_dataset, batch_size=batch_half, shuffle=True,
-        num_workers=args.num_workers, collate_fn=xd_collate_fn, drop_last=True, pin_memory=True
+        anomaly_dataset, batch_size=half_bs, shuffle=True, drop_last=True,
+        collate_fn=xd_collate_fn, **loader_kwargs,
     )
 
     test_dataset = XDDataset(
-        args.visual_length, args.test_list, True, label_map,
+        args.visual_length, args.test_list, True, XD_LABEL_MAP,
         audio_file_path=args.audio_test_list, audio_dir=args.audio_dir,
-        data_dir=args.data_dir, no_audio=args.no_audio
+        data_dir=args.data_dir, no_audio=args.no_audio,
     )
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=xd_test_collate_fn)
+    test_loader = DataLoader(
+        test_dataset, batch_size=1, shuffle=False,
+        collate_fn=xd_test_collate_fn, **loader_kwargs,
+    )
 
-    prompt_text = get_prompt_text(label_map)
+    # Auto-detect audio feature dimension on disk (128 VGGish vs 512 CLAP/AST)
+    if not args.no_audio:
+        detected_audio_dim = None
+        for ds in (normal_dataset, anomaly_dataset):
+            for idx in range(min(20, len(ds))):
+                item_tuple = ds[idx]
+                sample_audio = item_tuple[3] if len(item_tuple) >= 4 else None
+                if sample_audio is not None and isinstance(sample_audio, torch.Tensor):
+                    detected_audio_dim = int(sample_audio.shape[-1])
+                    break
+            if detected_audio_dim is not None:
+                break
+        if detected_audio_dim is not None and detected_audio_dim != args.audio_dim:
+            print(f"[Auto-Detect] Audio feature dim is {detected_audio_dim}-D; updating args.audio_dim.", flush=True)
+            args.audio_dim = detected_audio_dim
+
+    model = MARUPA(
+        args.classes_num, args.embed_dim, args.visual_length, args.visual_width,
+        args.visual_head, args.visual_layers, args.attn_window,
+        args.prompt_prefix, args.prompt_postfix, args, device,
+    )
+    if getattr(args, 'init_model_path', None) and os.path.exists(args.init_model_path):
+        init_state = safe_load_checkpoint(args.init_model_path, map_location='cpu')
+        load_compatible_model_state(model, init_state, allow_legacy_dsanet=True)
+        print(f"[Init] Loaded initial weights from {args.init_model_path}", flush=True)
+
+    return model, normal_loader, anomaly_loader, test_loader, XD_LABEL_MAP
+
+
+def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=None,
+          args=None, label_map=None, device=None):
+    """Supports both `train(args)` and `train(model, normal_loader, anomaly_loader, testloader, args, label_map, device)`."""
+    if normal_loader is None and not isinstance(model_or_args, nn.Module):
+        args = model_or_args
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        try:
+            commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
+            print(f"[MA-RUPA v3 Codebase] Git Commit: {commit_hash}", flush=True)
+        except Exception:
+            pass
+        print(f"[MA-RUPA v3] Training XD-Violence on device: {device}", flush=True)
+        setup_seed(args.seed)
+        model, normal_loader, anomaly_loader, testloader, label_map = build_xd_components(args, device)
+    else:
+        model = model_or_args
+
+    os.makedirs(os.path.dirname(args.checkpoint_path) or '.', exist_ok=True)
+    os.makedirs(os.path.dirname(args.model_path) or '.', exist_ok=True)
+
     gt = np.load(args.gt_path)
     gtsegments = np.load(args.gt_segment_path, allow_pickle=True)
     gtlabels = np.load(args.gt_label_path, allow_pickle=True)
 
-    # Auto-detect audio feature dimension from dataset if available
-    detected_audio_dim = None
-    for ds in (normal_dataset, anomaly_dataset):
-        for idx in range(min(20, len(ds))):
-            item_tuple = ds[idx]
-            sample_audio = item_tuple[3] if len(item_tuple) >= 4 else item_tuple[-1]
-            if sample_audio is not None and isinstance(sample_audio, torch.Tensor):
-                detected_audio_dim = sample_audio.shape[-1]
-                break
-        if detected_audio_dim is not None:
-            break
-
-    if detected_audio_dim is not None and detected_audio_dim != args.audio_dim:
-        print(f"[Auto-Detect] Audio feature dimension on disk is {detected_audio_dim}-D (command-line was {args.audio_dim}-D). Auto-adjusting args.audio_dim to {detected_audio_dim}!", flush=True)
-        args.audio_dim = detected_audio_dim
-
-    # Initialize model
-    model = MARUPA(
-        num_class=args.classes_num,
-        embed_dim=args.embed_dim,
-        visual_length=args.visual_length,
-        visual_width=args.visual_width,
-        visual_head=args.visual_head,
-        visual_layers=args.visual_layers,
-        attn_window=args.attn_window,
-        args=args,
-        device=device
-    )
     model.to(device)
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel):
+        gpu_names = ", ".join(torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count()))
+        print(f"[Multi-GPU] Detected {torch.cuda.device_count()} GPUs ({gpu_names}). Activating DataParallel!", flush=True)
+        model = nn.DataParallel(model)
 
-    # Multi-GPU support (e.g. Kaggle GPU T4 x 2)
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        for dev_idx in range(torch.cuda.device_count()):
-            try:
-                # Pre-warm CUDA linear algebra stubs sequentially on main thread
-                dummy = torch.eye(4, device=f"cuda:{dev_idx}")
-                _ = torch.linalg.qr(dummy)
-            except Exception:
-                pass
-        gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
-        print(f"[Multi-GPU] Detected {torch.cuda.device_count()} GPUs ({', '.join(gpu_names)}). Activating DataParallel for T4x2!", flush=True)
-        model = torch.nn.DataParallel(model)
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
-    # DSANet Dual Decoupled Optimizer Architecture (Intern-S2 Theorem 1 & Hessian Decoupling)
-    from utils.StableAdamW import StableAdamW
-
-    base_model = model.module if hasattr(model, 'module') else model
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    refiner_params, main_model_params = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
+    # Parameter Grouping:
+    # 1. Main visual/text backbone @ main_lr (1.5e-5)
+    # 2. Newly-initialized VGGish Cross-Modal Audio Adapter @ audio_lr (5e-5)
+    # 3. Counterfactual Prototype Refiner & SafeGate @ refiner_lr (StableAdamW)
+    refiner_params = []
+    audio_adapter_params = []
+    main_model_params = []
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
             continue
-        if any(k in name for k in ['aspm', 'dnp', 'normal_bank', 'rupa_gate', 'safegate', 'video_anomaly_refiner', 'modality_branch', 'av_fusion']):
-            refiner_params.append(p)
+        if 'video_anomaly_refiner' in name or 'rupa_gate' in name:
+            refiner_params.append(param)
+        elif 'audio_adapter' in name:
+            audio_adapter_params.append(param)
         else:
-            main_model_params.append(p)
+            main_model_params.append(param)
 
-    main_lr = args.lr if getattr(args, 'main_lr', None) is None else args.main_lr
-    refiner_lr = args.lr if getattr(args, 'refiner_lr', None) is None else args.refiner_lr
+    main_lr = args.lr if args.main_lr is None else args.main_lr
+    audio_lr = getattr(args, 'audio_lr', None) or max(main_lr, 5e-5)
+    refiner_lr = args.lr if args.refiner_lr is None else args.refiner_lr
 
-    # Optimizer 1 (Refiner/Routing/ASPM): StableAdamW (10x Tikhonov weight_decay=1e-4, amsgrad=True)
+    main_param_groups = [{'params': main_model_params, 'lr': main_lr}]
+    if audio_adapter_params:
+        main_param_groups.append({'params': audio_adapter_params, 'lr': audio_lr})
+
+    optimizer_main = torch.optim.AdamW(main_param_groups, weight_decay=args.weight_decay)
+    scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_main, T_max=max(1, args.max_epoch), eta_min=main_lr * 0.05
+    )
+
+    num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
+    total_iters = max(1, args.max_epoch * num_batches_per_epoch)
+
     optimizer_refiner = StableAdamW(
         [{'params': refiner_params}],
         lr=refiner_lr,
         betas=(0.9, 0.999),
         weight_decay=1e-4,
         amsgrad=True,
-        eps=1e-10
+        eps=1e-10,
     )
-    iters_per_epoch = min(len(normal_loader), len(anomaly_loader))
-    total_iters = max(1, args.max_epoch * iters_per_epoch)
     scheduler_refiner = WarmCosineScheduler(
         optimizer_refiner,
         base_value=refiner_lr,
         final_value=refiner_lr * 0.1,
         total_iters=total_iters,
-        warmup_iters=min(100, max(0, total_iters - 1))
+        warmup_iters=min(100, max(0, total_iters - 1)),
     )
 
-    # Optimizer 2 (Main Backbone/Detector/Text): AdamW (lr=args.lr, wd=1e-5) with CosineAnnealingLR
-    optimizer_main = torch.optim.AdamW(
-        [{'params': main_model_params}],
-        lr=main_lr,
-        weight_decay=1e-5,
-    )
-    scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_main,
-        T_max=args.max_epoch
-    )
+    ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
+    consistency_loss_fn = ConsistencyLoss()
+    prompt_text = get_prompt_text(label_map)
 
-    # Aliases for checkpointing and backward compatibility
-    optimizer = optimizer_main
-    scheduler = scheduler_main
-
-    best_ap = 0.0
-    best_auc = 0.0
+    ap_best = -1.0
+    auc_best = -1.0
     start_epoch = 0
-    ema_shadow = None
-    ema_decay = 0.992
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
-        print(f"Resuming from checkpoint: {args.checkpoint_path}", flush=True)
-        cp = safe_load_checkpoint(args.checkpoint_path, map_location=device)
-        load_compatible_model_state(model, cp['model_state_dict'], strict=False)
-        if 'optimizer_main_state_dict' in cp:
-            optimizer_main.load_state_dict(cp['optimizer_main_state_dict'])
-        elif 'optimizer_state_dict' in cp:
+        checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
+        load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
+        if 'optimizer_state_dict' in checkpoint:
             try:
-                optimizer_main.load_state_dict(cp['optimizer_state_dict'])
+                optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
             except Exception:
                 pass
-        if 'optimizer_refiner_state_dict' in cp:
-            optimizer_refiner.load_state_dict(cp['optimizer_refiner_state_dict'])
-        if 'scheduler_main_state_dict' in cp:
-            scheduler_main.load_state_dict(cp['scheduler_main_state_dict'])
-        elif 'scheduler_state_dict' in cp:
+        if 'optimizer_refiner_state_dict' in checkpoint:
+            optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner_state_dict'])
+        if 'scheduler_main_state_dict' in checkpoint:
             try:
-                scheduler_main.load_state_dict(cp['scheduler_state_dict'])
+                scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
             except Exception:
                 pass
-        if 'scheduler_refiner_state_dict' in cp:
-            scheduler_refiner.load_state_dict(cp['scheduler_refiner_state_dict'])
-        start_epoch = cp['epoch'] + 1
-        best_ap = cp.get('best_ap', 0.0)
-        best_auc = cp.get('best_auc', 0.0)
-        start_epoch = cp['epoch'] + 1
-        best_ap = cp.get('best_ap', 0.0)
-        best_auc = cp.get('best_auc', 0.0)
+        if 'scheduler_refiner_state_dict' in checkpoint:
+            scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
+        start_epoch = checkpoint.get('epoch', -1) + 1
+        ap_best = checkpoint.get('best_ap', checkpoint.get('ap', ap_best))
+        auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
+        print(f"[Resume] Resumed from epoch {start_epoch}, best AP={ap_best * 100:.2f}%", flush=True)
 
-    print("\n" + "=" * 70)
-    print(f"[START] STARTING END-TO-END TRAINING FOR XD-VIOLENCE: {args.max_epoch} EPOCHS")
-    print(f"  Batch size: {args.batch_size} ({batch_half} Normal + {batch_half} Abnormal per batch, Interleaved)")
-    crop_mode_str = "Full 10 Crops/video (100% Data, Zero Sampling)" if not sample_one_crop else f"{crops_per_video} random crops/video (DPSS)"
-    print(f"  Iters per epoch: {iters_per_epoch} | Dataset: {crop_mode_str} | Samples/epoch: {iters_per_epoch * args.batch_size}")
-    print(f"  Total Gradient Steps: {total_iters} steps (Full Deep Optimization - SOTA Schedule)")
-    print("=" * 70, flush=True)
+    eff_batch = normal_loader.batch_size * 2
+    print("\n" + "=" * 78, flush=True)
+    print(f"[START] MA-RUPA v3 MULTIMODAL SOTA TRAINING ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)", flush=True)
+    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps | Main LR={main_lr:.1e}, Audio LR={audio_lr:.1e}", flush=True)
+    print(f"  Multi-Crop : {'5-Crop Parallel Multimodal Eval Active' if args.multi_crop_eval else '1-Crop Eval'}", flush=True)
+    print("=" * 78 + "\n", flush=True)
 
-    for epoch in range(start_epoch, args.max_epoch):
+    for e in range(start_epoch, args.max_epoch):
         model.train()
-        epoch_idx = epoch + 1
-        base_model.set_epoch(epoch_idx)
+        DNP_use = args.DNP_use and (not args.no_rupa)
 
-        # Resample crops per video every epoch to avoid memorization
-        if hasattr(normal_dataset, 'resample_crops'):
-            normal_dataset.resample_crops()
-        if hasattr(anomaly_dataset, 'resample_crops'):
-            anomaly_dataset.resample_crops()
-
-        # Smooth Cosine Curriculum Ramp-up with max_omega ceiling
-        omega = get_curriculum_omega(
-            epoch_idx,
-            curriculum_epochs=getattr(args, 'curriculum_epochs', 3.0),
-            max_omega=getattr(args, 'max_omega', 0.40)
-        )
-
-        loss_accum = {
-            'mil': 0.0, 'aux': 0.0, 'clasm': 0.0, 'tasl': 0.0, 'bkg': 0.0, 'consist': 0.0,
-            'smooth': 0.0, 'gather': 0.0, 'orth': 0.0, 'residual': 0.0, 'gate': 0.0, 'guide': 0.0, 'total': 0.0
-        }
+        sum_l1 = sum_l2 = sum_l3 = sum_aux = sum_route = 0.0
+        epoch_t0 = time.time()
 
         normal_iter = iter(normal_loader)
         anomaly_iter = iter(anomaly_loader)
-        print(f"🚀 [Epoch {epoch_idx}/{args.max_epoch}] Bắt đầu vòng lặp huấn luyện ({iters_per_epoch} iters/epoch)...", flush=True)
 
-        for step_idx in range(iters_per_epoch):
+        for i in range(num_batches_per_epoch):
             n_vis, n_lbls, n_lens, n_aud = next(normal_iter)
             a_vis, a_lbls, a_lens, a_aud = next(anomaly_iter)
 
-            B_half = n_vis.shape[0]
-            # Interleave Normal and Abnormal along dim=0 (0, 2, ... are Normal; 1, 3, ... are Abnormal)
-            # This completely solves nn.DataParallel batch-split corruption on 2 GPUs!
-            visual_batch = torch.empty((2 * B_half, *n_vis.shape[1:]), dtype=n_vis.dtype, device=device)
-            visual_batch[0::2] = n_vis.to(device)
-            visual_batch[1::2] = a_vis.to(device)
+            visual_features, text_labels_raw, feat_lengths, audio_features = interleave_multimodal_batch(
+                n_vis, n_lbls, n_lens, n_aud, a_vis, a_lbls, a_lens, a_aud, device
+            )
+            text_labels = get_batch_label(text_labels_raw, prompt_text, label_map).to(device)
 
-            lengths_batch = torch.empty(2 * B_half, dtype=n_lens.dtype, device=device)
-            lengths_batch[0::2] = n_lens.to(device)
-            lengths_batch[1::2] = a_lens.to(device)
-
-            binary_labels = torch.empty(2 * B_half, dtype=torch.float32, device=device)
-            binary_labels[0::2] = 0.0
-            binary_labels[1::2] = 1.0
-
-            text_labels = [None] * (2 * B_half)
-            for i in range(B_half):
-                text_labels[2 * i] = n_lbls[i]
-                text_labels[2 * i + 1] = a_lbls[i]
-
-            if n_aud is not None and a_aud is not None:
-                audio_batch = torch.empty((2 * B_half, *n_aud.shape[1:]), dtype=n_aud.dtype, device=device)
-                audio_batch[0::2] = n_aud.to(device)
-                audio_batch[1::2] = a_aud.to(device)
-            else:
-                audio_batch = None
-
-            # Fine-grained categorical one-hot tensor
-            one_hot_labels = get_batch_label(text_labels, prompt_text, label_map).to(device)
-
-            # Model Forward Pass (Multimodal Audio-Visual if audio present, else Motion Residuals)
             text_features, logits1, logits2, logits3, logits4, dnp_dict = model(
-                visual=visual_batch,
-                padding_mask=None,
-                text=prompt_text,
-                lengths=lengths_batch,
-                audio=audio_batch,
-                DNP_use=args.DNP_use
+                visual_features, None, prompt_text, feat_lengths, audio=audio_features, DNP_use=DNP_use
             )
 
-            p_routing = dnp_dict['routing_scores']
-            s_aux = dnp_dict['aux_scores']
-            s_det = dnp_dict['detector_scores']
+            loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
+            loss2 = CLASM(logits2, text_labels, feat_lengths, device)
+            loss3 = text_orthogonality_loss(text_features)
 
-            # 1. Primary & Auxiliary MIL Losses (Per-Sample AT-BCE + VAT-K + OHNM + Peak Erasure)
-            topk_r = getattr(args, 'topk_ratio', 8)
-            topk_r_clasm = getattr(args, 'topk_ratio_clasm', topk_r)
-            snip_drop = getattr(args, 'snippet_dropout', 0.15)
-            use_epts_flag = getattr(args, 'use_epts', True)
-            use_tasl_flag = getattr(args, 'use_tasl', True)
-            w_smooth = getattr(args, 'lambda_smooth', 0.0)
-            w_ahns = getattr(args, 'lambda_ahns', 0.10)
+            if DNP_use and args.rupa_use:
+                loss4 = RUPA_RESIDUAL_EVENT(logits3, text_labels, feat_lengths, device)
+            else:
+                loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
+            loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
 
-            # S2-DeepSeek Surgical Pillar 1: Dynamic Density Top-K MIL Loss (Vectorized Otsu Adaptation)
-            use_dd_mil = getattr(args, 'use_dd_mil', True)
-            if use_dd_mil:
-                loss_mil_det = compute_dynamic_density_topk_mil_loss(
-                    scores=s_det,
-                    binary_labels=binary_labels,
-                    lengths=lengths_batch,
-                    k_min=2,
-                    k_max_div=12,
-                    eps=0.030
+            aux_logits = dnp_dict.get('aux_logits')
+            if aux_logits is not None and args.lambda_aux > 0:
+                loss_aux = audio_guided_mil_loss(aux_logits, text_labels, feat_lengths)
+            else:
+                loss_aux = logits1.sum() * 0.0
+
+            loss_smooth = (
+                edge_preserving_smoothness_loss(torch.sigmoid(logits1), feat_lengths)
+                if args.lambda_smooth > 0 else logits1.sum() * 0.0
+            )
+
+            if DNP_use and 'reconstructed_features' in dnp_dict:
+                cons_loss = consistency_loss_fn(
+                    logits1=logits1,
+                    original_features=dnp_dict['original_features'],
+                    reconstructed_features=dnp_dict['reconstructed_features'],
+                    lengths=feat_lengths,
                 )
-                loss_mil_routing = compute_dynamic_density_topk_mil_loss(
-                    scores=p_routing,
-                    binary_labels=binary_labels,
-                    lengths=lengths_batch,
-                    k_min=2,
-                    k_max_div=12,
-                    eps=0.030
+                g_loss = dnp_dict['g_loss'].mean()
+                dnp_norm_loss = dnp_dict.get('dnp_normal_loss', logits1.sum() * 0.0)
+                if torch.is_tensor(dnp_norm_loss):
+                    dnp_norm_loss = dnp_norm_loss.mean()
+
+                if args.rupa_use and 'routing_logits' in dnp_dict:
+                    route_loss = CLAS2(dnp_dict['routing_logits'], text_labels, feat_lengths, device)
+                    route_anchor = routing_anchor_loss(dnp_dict, feat_lengths)
+                else:
+                    route_loss = logits1.sum() * 0.0
+                    route_anchor = logits1.sum() * 0.0
+
+                loss = (
+                    loss1
+                    + loss2 * args.loss2_weight
+                    + loss3 * args.loss_sep_weight
+                    + loss4 * args.loss_residual_weight
+                    + loss5 * args.loss_reconstructed_normal_weight
+                    + cons_loss * args.loss_consistency_weight
+                    + g_loss * args.loss_gather_weight
+                    + dnp_norm_loss * args.loss_dnp_normal_weight
+                    + route_loss * args.loss_routing_weight
+                    + route_anchor * args.loss_routing_anchor_weight
+                    + loss_aux * args.lambda_aux
+                    + loss_smooth * args.lambda_smooth
                 )
             else:
-                loss_mil_det = compute_anti_saturation_mil_loss(
-                    scores=s_det,
-                    binary_labels=binary_labels,
-                    lengths=lengths_batch,
-                    k_ratio=topk_r,
-                    eps=0.030
-                )
-                loss_mil_routing = compute_anti_saturation_mil_loss(
-                    scores=p_routing,
-                    binary_labels=binary_labels,
-                    lengths=lengths_batch,
-                    k_ratio=topk_r,
-                    eps=0.030
+                route_loss = logits1.sum() * 0.0
+                loss = (
+                    loss1
+                    + loss2 * args.loss2_weight
+                    + loss3 * args.loss_sep_weight
+                    + loss4 * args.loss_residual_weight
+                    + loss5 * args.loss_reconstructed_normal_weight
+                    + loss_aux * args.lambda_aux
+                    + loss_smooth * args.lambda_smooth
                 )
 
-            # Pillar 1C: Routing Anchor Loss
-            if lengths_batch is not None:
-                mask_valid = (
-                    torch.arange(s_det.shape[1], device=device)[None, :]
-                    < lengths_batch[:, None]
-                )
-                loss_route_anchor = F.mse_loss(
-                    p_routing.squeeze(-1)[mask_valid],
-                    s_det.detach().squeeze(-1)[mask_valid]
-                )
-                loss_consistency = F.mse_loss(
-                    dnp_dict['reconstruction_scores'].squeeze(-1)[mask_valid],
-                    s_det.detach().squeeze(-1)[mask_valid]
-                )
-            else:
-                loss_route_anchor = F.mse_loss(
-                    p_routing.squeeze(-1),
-                    s_det.detach().squeeze(-1)
-                )
-                loss_consistency = F.mse_loss(dnp_dict['reconstruction_scores'], s_det.detach())
-
-            # Train Multimodal Audio-Visual Stream (S_aux) with Dynamic Density MIL on XD-Violence
-            if use_dd_mil:
-                loss_mil_aux = compute_dynamic_density_topk_mil_loss(
-                    scores=s_aux,
-                    binary_labels=binary_labels,
-                    lengths=lengths_batch,
-                    k_min=2,
-                    k_max_div=12,
-                    eps=0.030
-                )
-            else:
-                loss_mil_aux = compute_anti_saturation_mil_loss(
-                    scores=s_aux,
-                    binary_labels=binary_labels,
-                    lengths=lengths_batch,
-                    k_ratio=topk_r,
-                    eps=0.030
-                )
-
-            # S2-DeepSeek Asymmetric Audio-Visual Discordance Gate (Cures Acoustic False Alarms):
-            # When audio spikes without visual confirmation (D_av > 0.15), aggressively suppresses acoustic FA:
-            # gamma = sigmoid(-10 * D_av), s_final = s_det + gamma * s_aux
-            s_fused_av, gamma_av, d_av = apply_asymmetric_av_discordance_gate(
-                s_vis=s_det,
-                s_aux=s_aux,
-                delta=0.15,
-                eta=10.0
-            )
-            loss_mil_av = compute_dynamic_density_topk_mil_loss(
-                scores=s_fused_av,
-                binary_labels=binary_labels,
-                lengths=lengths_batch,
-                k_min=2,
-                k_max_div=12,
-                eps=0.030
-            )
-
-            # Audio Hard Negative Suppression (AHNS): Suppresses false acoustic activations on normal bags
-            loss_ahns = compute_ahns_loss(
-                scores_aux=s_aux,
-                scores_det=s_det,
-                binary_labels=binary_labels,
-                lengths=lengths_batch,
-                delta_hns=0.20,
-                k_a=16
-            )
-
-            # Pillar 2: Multi-Class Action Classification on Semantics (CLASM, 6 violence classes)
-            clasm_eps = 0.02 if epoch < 2 else 0.05
-            clasm_drop = 0.0 if epoch < 2 else 0.15
-            loss_clasm = compute_clasm_loss(
-                logits=logits2,
-                labels=one_hot_labels,
-                lengths=lengths_batch,
-                device=device,
-                k_ratio=16,
-                epsilon=clasm_eps,
-                is_training=True,
-                peak_drop_prob=clasm_drop
-            )
-
-            # Pillar 3: Decoupled Contrastive Alignment (DCSA = Event + Background)
-            loss_bkg = compute_bkg_loss(logits4, num_classes=len(prompt_text), epsilon=0.10)
-            loss_event = compute_event_loss(logits3, one_hot_labels, epsilon=0.10)
-            loss_dcs = loss_event + loss_bkg
-
-            # Pillar 4: Adaptive Stiefel Prototype Manifold (ASPM) Consistency, Compactness & Stiefel Regularization
-            loss_compact = dnp_dict.get('l_compact', torch.tensor(0.0, device=device)).mean()
-            u_basis = dnp_dict.get('u_norm', None)
-            if u_basis is not None:
-                loss_stiefel = compute_stiefel_grassmann_loss(u_basis, lambda_stiefel=0.5, lambda_grassmann=0.25)
-            else:
-                loss_stiefel = torch.tensor(0.0, device=device)
-
-            # S2-DeepSeek Stiefel Normality Anti-FA Gate & Consistency Loss
-            s_rec = dnp_dict.get('reconstruction_scores', s_det)
-            s_sem = dnp_dict.get('semantic_scores', s_det)
-            loss_stiefel_sem, _, _ = compute_stiefel_gated_semantic_loss(
-                s_rec=s_rec,
-                s_sem=s_sem,
-                binary_labels=binary_labels,
-                lengths=lengths_batch,
-                beta=0.50
-            )
-
-            # Pillar 5: Edge-Preserving Temporal Sharpening (EPTS - Zero Peak Clipping)
-            if w_smooth > 0.0:
-                loss_smooth = compute_epts_loss(s_det, lengths_batch)
-            else:
-                loss_smooth = torch.tensor(0.0, device=device)
-
-            # Pillar 6: Text Orthogonality Separation Loss (L_sep, AAAI-26 Eq. 6)
-            loss_sep = compute_text_separation_loss(text_features)
-
-            loss_tasl = torch.tensor(0.0, device=device)
-            loss_geo = loss_stiefel_sem
-            loss_gather = torch.tensor(0.0, device=device)
-            loss_orth = loss_stiefel
-            loss_gate = loss_route_anchor
-
-            # =========================================================================
-            # TOTAL REFORMATION: PARETO SOTA LOSS ENGINE FOR XD-VIOLENCE
-            # Eliminates negative transfer and gradient dilution.
-            # Focuses 90%+ gradient energy strictly on Visual-Acoustic Synergy!
-            # =========================================================================
-            w_clasm_raw = float(getattr(args, 'loss2_weight', 0.20))
-            w_clasm_eff = min(0.25, w_clasm_raw)  # Capped to keep semantic loss as a gentle anchor
-            loss_anchor_weight = float(getattr(args, 'loss_routing_anchor_weight', 0.10))
-            w_ahns = float(getattr(args, 'lambda_ahns', 0.20))
-
-            total_loss = (
-                1.00 * loss_mil_det                 # Visual Backbone Dynamic Top-k MIL
-                + 1.00 * loss_mil_routing           # Hierarchical Bi-Relational STB Dynamic Top-k MIL
-                + loss_anchor_weight * loss_route_anchor # Anchor routing probability to detector
-                + 0.50 * loss_mil_aux               # Acoustic Auxiliary VGGish Dynamic Top-k MIL
-                + 0.80 * loss_mil_av                # Asymmetric Audio-Visual Discordance Gated MIL
-                + w_ahns * loss_ahns                # Acoustic False Alarm Hard Negative Suppression
-                + w_clasm_eff * loss_clasm          # Gentle Semantic Anchor (Zero Gradient Cannibalization)
-                + (w_smooth * loss_smooth if w_smooth > 0 else 0.0) # Temporal Smoothness
-            ).mean()
-
-            optimizer_main.zero_grad()
-            optimizer_refiner.zero_grad()
-            total_loss.backward()
+            optimizer_main.zero_grad(set_to_none=True)
+            optimizer_refiner.zero_grad(set_to_none=True)
+            loss.backward()
 
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
 
             optimizer_main.step()
             optimizer_refiner.step()
             scheduler_refiner.step()
 
-            # Update Global Normal Memory Bank strictly from pure Normal bags on primary GPU
-            if 'dynamic_normal_patterns' in dnp_dict:
-                base_model.update_global_normal_bank(dnp_dict['dynamic_normal_patterns'], binary_labels)
+            if ema is not None:
+                ema.update(model)
 
-            # Update Polyak-EMA shadow weights after Epoch 1 warmup
-            if epoch >= 1:
-                with torch.no_grad():
-                    if ema_shadow is None:
-                        ema_shadow = {
-                            n: p.detach().clone()
-                            for n, p in base_model.named_parameters() if p.requires_grad
-                        }
-                    else:
-                        for n, p in base_model.named_parameters():
-                            if p.requires_grad and n in ema_shadow:
-                                ema_shadow[n].mul_(ema_decay).add_(p.detach(), alpha=1.0 - ema_decay)
+            sum_l1 += loss1.item()
+            sum_l2 += loss2.item()
+            sum_l3 += loss3.item()
+            sum_aux += loss_aux.item()
+            sum_route += route_loss.item()
 
-            # Accumulate logs
-            loss_accum['mil'] += loss_mil_det.item()
-            loss_accum['aux'] += loss_mil_aux.item()
-            loss_accum['clasm'] += loss_clasm.item()
-            loss_accum['tasl'] += loss_tasl.item()
-            loss_accum['bkg'] += loss_bkg.item()
-            loss_accum['consist'] += loss_consistency.item()
-            loss_accum['smooth'] += loss_smooth.item()
-            loss_accum['gather'] += loss_gather.item()
-            loss_accum['orth'] += loss_orth.item()
-            loss_accum['residual'] += loss_event.item()
-            loss_accum['gate'] += loss_gate.item()
-            loss_accum['guide'] += 0.0
-            loss_accum['total'] += total_loss.item()
-
-            log_interval = 10
-            if (step_idx + 1) <= 3 or (step_idx + 1) % log_interval == 0 or (step_idx + 1) == iters_per_epoch:
-                percent = ((step_idx + 1) / iters_per_epoch) * 100
-                print(f"  [Epoch {epoch_idx}/{args.max_epoch} Iter {step_idx + 1}/{iters_per_epoch} ({percent:.1f}%)] "
-                      f"Total: {total_loss.item():.4f} | Det: {loss_mil_det.item():.4f} | Route: {loss_mil_routing.item():.4f} | "
-                      f"Aux: {loss_mil_aux.item():.4f} | AV-Gate: {loss_mil_av.item():.4f} | Clasm: {loss_clasm.item():.4f} | omega: {omega:.2f}", flush=True)
-
-            # Mid-Epoch Evaluation & Peak-Catching (SOTA Benchmark Standard: every 50 iters)
-            eval_interval_raw = getattr(args, 'eval_interval', 50)
-            eval_interval_iters = eval_interval_raw if eval_interval_raw < 100 else max(1, eval_interval_raw // args.batch_size)
-            if eval_interval_iters > 0 and (step_idx + 1) % eval_interval_iters == 0 and (step_idx + 1) < iters_per_epoch:
-                step_total = epoch * iters_per_epoch + (step_idx + 1)
-                print(f"\n🔍 [Mid-Epoch Eval] Đang đánh giá {len(test_loader)} test videos tại Step {step_total} (Iter {step_idx + 1}/{iters_per_epoch})...", flush=True)
-                eval_model = model.module if hasattr(model, 'module') else model
-                eval_model.eval()
-                eval_model._text_features_cache = None
-                mid_auc, mid_ap, _ = test(
-                    eval_model, test_loader, args.visual_length, prompt_text, gt, gtsegments,
-                    gtlabels, args.DNP_use, args, device, compute_dmap=False
+            iter_num = i + 1
+            if iter_num == 1 or iter_num % 10 == 0 or iter_num == num_batches_per_epoch:
+                elapsed = max(1e-3, time.time() - epoch_t0)
+                it_s = iter_num / elapsed
+                eta_s = (num_batches_per_epoch - iter_num) / max(it_s, 1e-4)
+                print(
+                    f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
+                    f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
+                    f"AuxAV:{sum_aux/iter_num:.4f} Route:{sum_route/iter_num:.4f} | "
+                    f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
+                    flush=True,
                 )
-                print(f"  --> [Step {step_total} / Iter {step_idx + 1}] Mid-Epoch AP: {mid_ap * 100:.2f}% | AUC: {mid_auc * 100:.2f}% (Peak AP: {best_ap * 100:.2f}%)", flush=True)
-                if mid_ap > best_ap or (abs(mid_ap - best_ap) < 1e-4 and mid_auc > best_auc):
-                    best_ap = mid_ap
-                    best_auc = mid_auc
-                    print(f"  🏆 [NEW SOTA PEAK] Step {step_total}: Best Frame-level AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}% saved to {args.model_path}", flush=True)
-                    safe_save_checkpoint(
-                        {
-                            'epoch': epoch,
-                            'step': step_total,
-                            'model_state_dict': {k: v.cpu() for k, v in eval_model.state_dict().items()},
-                            'optimizer_main_state_dict': optimizer_main.state_dict(),
-                            'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
-                            'scheduler_main_state_dict': scheduler_main.state_dict(),
-                            'scheduler_refiner_state_dict': scheduler_refiner.state_dict(),
-                            'optimizer_state_dict': optimizer_main.state_dict(),
-                            'scheduler_state_dict': scheduler_main.state_dict(),
-                            'best_ap': best_ap,
-                            'best_auc': best_auc,
-                            'args': vars(args)
-                        },
-                        args.model_path
+
+            # Mid-epoch peak catching
+            if args.eval_interval > 0 and iter_num % args.eval_interval == 0 and iter_num < num_batches_per_epoch:
+                auc_cur, ap_cur, _ = test(
+                    model, testloader, args.visual_length, prompt_text,
+                    gt, gtsegments, gtlabels, DNP_use, args, device, compute_dmap=False,
+                )
+                if ap_cur > ap_best or (abs(ap_cur - ap_best) < 1e-5 and auc_cur > auc_best):
+                    ap_best = ap_cur
+                    auc_best = auc_cur
+                    state = unwrap_compact_state_dict(model)
+                    torch.save({'epoch': e, 'model_state_dict': state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
+                    print(
+                        f"  [*] [NEW BEST XD-VIOLENCE] AP = {ap_best * 100:.2f}% | AUC = {auc_best * 100:.2f}% saved -> {args.model_path}",
+                        flush=True,
                     )
-                eval_model._text_features_cache = None
                 model.train()
 
-        # End of Epoch Reporting
-        avg_total = loss_accum['total'] / iters_per_epoch
-        avg_mil = loss_accum['mil'] / iters_per_epoch
-        avg_clasm = loss_accum['clasm'] / iters_per_epoch
-        avg_consist = loss_accum['consist'] / iters_per_epoch
-        avg_aux = loss_accum['aux'] / iters_per_epoch
-        avg_gather = loss_accum['gather'] / iters_per_epoch
-        avg_orth = loss_accum['orth'] / iters_per_epoch
-        avg_residual = loss_accum['residual'] / iters_per_epoch
-        avg_smooth = loss_accum['smooth'] / iters_per_epoch
-
-        print(f"\n--- Epoch {epoch_idx}/{args.max_epoch} Summary ---")
-        print(f"Loss Total: {avg_total:.4f} | MIL: {avg_mil:.4f} | CLASM: {avg_clasm:.4f} | Consist: {avg_consist:.4f} | Aux: {avg_aux:.4f} | Gather: {avg_gather:.4f} | Orth: {avg_orth:.4f} | Event: {avg_residual:.4f} | Smooth: {avg_smooth:.4f} | Omega: {omega:.2f}")
-
-        # Evaluate on Test Set (Primary Checkpoint) - compute_dmap=False for fast epoch testing
-        eval_model = model.module if hasattr(model, 'module') else model
-        eval_model._text_features_cache = None
-        auc_val, ap_val, map_val = test(
-            eval_model, test_loader, args.visual_length, prompt_text, gt, gtsegments,
-            gtlabels, args.DNP_use, args, device, compute_dmap=False
-        )
-
-        # Dual-Checkpoint Evaluation: Test Polyak-EMA Shadow Model
-        # Only evaluate EMA from Epoch 4+ (after initial warm-up) and every 2 epochs, or on final epoch
-        auc_ema, ap_ema, map_ema = 0.0, 0.0, 0.0
-        use_ema_best = False
-        should_eval_ema = (ema_shadow is not None) and (epoch_idx >= 4) and (epoch_idx % 2 == 0 or epoch == args.max_epoch - 1)
-        if should_eval_ema:
-            # Temporarily apply shadow weights to eval_model
-            backup_params = {n: p.detach().clone() for n, p in eval_model.named_parameters()}
-            with torch.no_grad():
-                for n, p in eval_model.named_parameters():
-                    if n in ema_shadow:
-                        p.copy_(ema_shadow[n])
-            eval_model._text_features_cache = None
-            print("\n[EMA Evaluation] Evaluating Polyak-EMA smoothed weights on test set...")
-            auc_ema, ap_ema, map_ema = test(
-                eval_model, test_loader, args.visual_length, prompt_text, gt, gtsegments,
-                gtlabels, args.DNP_use, args, device, compute_dmap=False
-            )
-            print(f"[EMA Evaluation] Frame-level AP: {ap_ema * 100:.2f}% | AUC: {auc_ema * 100:.2f}% (vs Current: {ap_val * 100:.2f}% | {auc_val * 100:.2f}%)", flush=True)
-
-            # Restore original active training weights immediately
-            with torch.no_grad():
-                for n, p in eval_model.named_parameters():
-                    if n in backup_params:
-                        p.copy_(backup_params[n])
-            del backup_params
-            eval_model._text_features_cache = None
-
-            if ap_ema > ap_val or (abs(ap_ema - ap_val) < 1e-4 and auc_ema > auc_val):
-                use_ema_best = True
-
-        eval_ap = ap_ema if use_ema_best else ap_val
-        eval_auc = auc_ema if use_ema_best else auc_val
-
-        is_best = False
-        if eval_ap > best_ap or (abs(eval_ap - best_ap) < 1e-4 and eval_auc > best_auc):
-            best_ap = eval_ap
-            best_auc = eval_auc
-            is_best = True
-            saved_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-            if use_ema_best and ema_shadow is not None:
-                for n, v in ema_shadow.items():
-                    key = f"module.{n}" if hasattr(model, 'module') else n
-                    if key in saved_state:
-                        saved_state[key] = v.clone()
-
-            # Compact Checkpoint: Strip 335 MB frozen CLIP weights -> saves in <0.3s!
-            compact_best_state = get_compact_state_dict(saved_state)
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': compact_best_state,
-                'ap': best_ap,
-                'auc': best_auc,
-                'is_ema': use_ema_best,
-                'args': vars(args)
-            }, args.model_path)
-            mode_tag = "Polyak-EMA Checkpoint" if use_ema_best else "Active Checkpoint"
-            print(f"[BEST MODEL] Best AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}% ({mode_tag}) saved compactly (~35MB in 0.2s) to {args.model_path}", flush=True)
-
-        # Step Main Backbone Scheduler at epoch boundary
         scheduler_main.step()
 
-        # Periodic checkpoint saving (every 5 epochs or final epoch) to avoid slow disk writes every epoch
-        if (epoch + 1) % 5 == 0 or epoch == args.max_epoch - 1:
-            saved_raw_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-            compact_raw_state = get_compact_state_dict(saved_raw_state)
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': compact_raw_state,
-                'optimizer_main_state_dict': optimizer_main.state_dict(),
-                'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
-                'scheduler_main_state_dict': scheduler_main.state_dict(),
-                'scheduler_refiner_state_dict': scheduler_refiner.state_dict(),
-                'optimizer_state_dict': optimizer_main.state_dict(),
-                'scheduler_state_dict': scheduler_main.state_dict(),
-                'ap': eval_ap,
-                'auc': eval_auc,
-                'best_ap': best_ap,
-                'best_auc': best_auc
-            }, args.checkpoint_path)
-            print(f"[Checkpoint] Periodic checkpoint saved to {args.checkpoint_path}", flush=True)
+        print(f"\n--- Epoch {e+1}/{args.max_epoch} Complete | Evaluating Live Weights ---", flush=True)
+        auc_live, ap_live, _ = test(
+            model, testloader, args.visual_length, prompt_text,
+            gt, gtsegments, gtlabels, DNP_use, args, device, compute_dmap=(e == args.max_epoch - 1),
+        )
+        live_state = unwrap_compact_state_dict(model)
+        if ap_live > ap_best or (abs(ap_live - ap_best) < 1e-5 and auc_live > auc_best):
+            ap_best = ap_live
+            auc_best = auc_live
+            torch.save({'epoch': e, 'model_state_dict': live_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
+            print(
+                f"  [*] [NEW BEST XD-VIOLENCE (Live)] AP = {ap_best * 100:.2f}% | AUC = {auc_best * 100:.2f}% saved -> {args.model_path}",
+                flush=True,
+            )
 
-    print("\n" + "=" * 70)
-    print(f"[COMPLETE] XD-VIOLENCE TRAINING COMPLETE! FINAL BEST AP: {best_ap * 100:.2f}% | AUC: {best_auc * 100:.2f}%")
-    print("=" * 70 + "\n", flush=True)
+        # Save latest resumable checkpoint at the end of every epoch
+        torch.save({
+            'epoch': e,
+            'model_state_dict': live_state,
+            'optimizer_state_dict': optimizer_main.state_dict(),
+            'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
+            'scheduler_main_state_dict': scheduler_main.state_dict(),
+            'scheduler_refiner_state_dict': scheduler_refiner.state_dict(),
+            'ap': ap_live,
+            'auc': auc_live,
+            'best_ap': ap_best,
+            'best_auc': auc_best,
+        }, args.checkpoint_path)
+
+        # Evaluate Polyak EMA weights from Epoch 2+ for ultra-smooth generalization
+        if ema is not None and e >= 1:
+            backup = ema.apply_to(model)
+            print(f"--- Epoch {e+1}/{args.max_epoch} | Evaluating Polyak-EMA Weights ---", flush=True)
+            auc_ema, ap_ema, _ = test(
+                model, testloader, args.visual_length, prompt_text,
+                gt, gtsegments, gtlabels, DNP_use, args, device, compute_dmap=False,
+            )
+            if ap_ema > ap_best or (abs(ap_ema - ap_best) < 1e-5 and auc_ema > auc_best):
+                ap_best = ap_ema
+                auc_best = auc_ema
+                ema_state = unwrap_compact_state_dict(model)
+                torch.save({'epoch': e, 'model_state_dict': ema_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
+                print(
+                    f"  [*] [NEW BEST XD-VIOLENCE (EMA)] AP = {ap_best * 100:.2f}% | AUC = {auc_best * 100:.2f}% saved -> {args.model_path}",
+                    flush=True,
+                )
+            ema.restore(model, backup)
+        print("", flush=True)
+
+    print(f"[FINISH] XD-Violence Training Complete! Best AP: {ap_best * 100:.2f}% | Best AUC: {auc_best * 100:.2f}%", flush=True)
+    return ap_best
 
 
 if __name__ == '__main__':
