@@ -295,6 +295,9 @@ ARTIFACTS = WORK / "rupa_artifacts"
 ucf_test_csv = ARTIFACTS / "ucf_test.csv" if (ARTIFACTS / "ucf_test.csv").exists() else REPO_DIR / "list/ucf_CLIP_rgbtest.csv"
 ucf_model_path = ARTIFACTS / "model_ucf_best.pth"
 
+subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
+subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
+
 subprocess.run([
     sys.executable, "-u", "src/ucf_test.py",
     "--test-list", str(ucf_test_csv),

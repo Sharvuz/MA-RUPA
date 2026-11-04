@@ -270,23 +270,28 @@ def analyze_and_sweep(records: List[Dict[str, Any]], dataset: str) -> Dict[str, 
     aux_alphas = [0.0, 0.12, 0.18, 0.24] if dataset == 'xd' else [0.0]
 
     best = {'ap': 0.0, 'auc': 0.0, 'recipe': ''}
-    for alpha in [0.0, 0.08, 0.12, 0.16, 0.20]:
-        v_base = (1.0 - alpha) * route_all + alpha * (0.70 * sem_all + 0.30 * rec_all)
-        for aux_a in aux_alphas:
-            w_aud = aux_a * g_vs_all
-            blend = (1.0 - w_aud) * v_base + w_aud * aux_all
-            for sig in [0.0, 0.5, 0.8, 1.1]:
-                s_arr = blend if sig == 0.0 else gaussian_filter1d(blend, sigma=sig * 16.0 / 16.0)
-                auc_v = float(roc_auc_score(all_gt, s_arr))
-                ap_v = float(average_precision_score(all_gt, s_arr))
-                key_cur = ap_v if dataset == 'xd' else auc_v
-                key_best = best['ap'] if dataset == 'xd' else best['auc']
-                if key_cur > key_best:
-                    best = {
-                        'ap': ap_v,
-                        'auc': auc_v,
-                        'recipe': f"collab_alpha={alpha}, aux_eval_alpha={aux_a}, sigma={sig}",
-                    }
+    stream_choices = [('det', det_all), ('route', route_all)]
+    alphas = [0.0, 0.02, 0.05, 0.08, 0.12, 0.16] if dataset == 'ucf' else [0.0, 0.08, 0.12, 0.16, 0.20]
+    sigmas = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
+
+    for stream_name, base_s in stream_choices:
+        for alpha in alphas:
+            v_base = (1.0 - alpha) * base_s + alpha * (0.70 * sem_all + 0.30 * rec_all)
+            for aux_a in aux_alphas:
+                w_aud = aux_a * g_vs_all
+                blend = (1.0 - w_aud) * v_base + w_aud * aux_all
+                for sig in sigmas:
+                    s_arr = blend if sig == 0.0 else gaussian_filter1d(blend, sigma=sig * 16.0 / 16.0)
+                    auc_v = float(roc_auc_score(all_gt, s_arr))
+                    ap_v = float(average_precision_score(all_gt, s_arr))
+                    key_cur = ap_v if dataset == 'xd' else auc_v
+                    key_best = best['ap'] if dataset == 'xd' else best['auc']
+                    if key_cur > key_best:
+                        best = {
+                            'ap': ap_v,
+                            'auc': auc_v,
+                            'recipe': f"stream={stream_name}, collab_alpha={alpha}, aux_eval_alpha={aux_a}, sigma={sig}",
+                        }
 
     print(f"\n[Prober Peak] {dataset.upper()} -> AUC={best['auc']*100:.2f}% | AP={best['ap']*100:.2f}% ({best['recipe']})", flush=True)
     return {'top_false_alarms': normal_evals[:10], 'top_misses': abnormal_evals[:10], 'best': best}
