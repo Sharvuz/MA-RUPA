@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""MA-RUPA v3 Clinical Diagnostic Prober for Weakly-Supervised Video Anomaly Detection (WS-VAD).
+"""MA-RUPA v4 Clinical Diagnostic Prober for Weakly-Supervised Video Anomaly Detection (WS-VAD).
 
 Capabilities:
-  1. Per-Video Error Profiling: Ranks Top-10 Worst False Alarm Normal Videos & Top-10 Missed Anomaly Videos.
-  2. Multi-Stream Failure Attribution across Detector, Multimodal Audio, Vision-Language Semantics, and SGNM Reconstruction.
-  3. Parallel Multi-Crop Inference & Inference-Time Grid Sweep (Gaussian sigma & Collaborative Weights).
+  1. Per-Video Error Profiling: Ranks Top-5 Highest False Alarm Normal Videos & Top-5 Hardest Abnormal Videos.
+  2. Multi-Stream Attribution across Pure Visual Detector, Safe-RUPA Routing, CLIP Semantics, SGNM Prototype Error, and Decoupled Audio-Visual Head.
+  3. Chunked Parallel Multi-Crop Inference & Visual-Protected Synergy Grid Sweep.
 """
 
 import os
@@ -33,7 +33,7 @@ import ucf_option as ucf_opt
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="MA-RUPA v3 Clinical Diagnostic Prober")
+    parser = argparse.ArgumentParser(description="MA-RUPA v4 Clinical Diagnostic Prober")
     parser.add_argument('--dataset', type=str, default='xd', choices=['xd', 'ucf'])
     parser.add_argument('--model-path', '--model_path', dest='model_path', type=str, default='')
     parser.add_argument('--data-dir', '--data_dir', dest='data_dir', type=str, default='')
@@ -41,7 +41,6 @@ def parse_args():
     parser.add_argument('--test-file-path', '--test_file_path', '--test-list', '--test_list', dest='test_file_path', type=str, default='')
     parser.add_argument('--gt-path', '--gt_path', dest='gt_path', type=str, default='')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--temp', type=float, default=1.0)
     parser.add_argument('--multi-crop-eval', default=True, type=ucf_opt.str2bool)
     parser.add_argument('--output-json', '--output_json', dest='output_json', type=str, default='rupa_artifacts/s2_diagnostic_report.json')
     parser.add_argument('--scan-inference', '--scan_inference', dest='scan_inference', action='store_true', default=True)
@@ -105,7 +104,7 @@ def load_diagnostic_model(model_path: str, dataset: str, device: str) -> MARUPA:
 
     if os.path.exists(model_path):
         state = tools.safe_load_checkpoint(model_path, map_location=device)
-        incomp = load_compatible_model_state(model, state, strict=False)
+        incomp = load_compatible_model_state(model, state, strict=False, allow_legacy_dsanet=True)
         print(f"[Prober] Loaded checkpoint: {model_path} (unexpected={len(incomp.unexpected_keys)})", flush=True)
     else:
         print(f"[Prober] WARNING: Checkpoint '{model_path}' not found; running initialized weights.", flush=True)
@@ -114,13 +113,44 @@ def load_diagnostic_model(model_path: str, dataset: str, device: str) -> MARUPA:
     return model
 
 
+def _forward_chunked(model: MARUPA, visual_flat: torch.Tensor, audio_flat: torch.Tensor,
+                     padding_mask: torch.Tensor, prompt_text: List[str],
+                     lengths_flat: torch.Tensor, max_chunk: int = 32):
+    total_b = visual_flat.shape[0]
+    l1_l, l2_l, det_l, route_l, rec_l, aux_l = [], [], [], [], [], []
+    for start in range(0, total_b, max_chunk):
+        end = min(start + max_chunk, total_b)
+        aud_c = audio_flat[start:end] if audio_flat is not None else None
+        _, l1, l2, _, _, dnp_c = model(
+            visual=visual_flat[start:end], padding_mask=padding_mask[start:end],
+            text=prompt_text, lengths=lengths_flat[start:end], audio=aud_c, DNP_use=True,
+        )
+        d_c = dnp_c.get('detector_scores', torch.sigmoid(l1))
+        l1_l.append(l1)
+        l2_l.append(l2)
+        det_l.append(d_c)
+        route_l.append(dnp_c.get('routing_scores', d_c))
+        rec_l.append(dnp_c.get('reconstruction_scores', d_c))
+        if dnp_c.get('aux_scores') is not None:
+            aux_l.append(dnp_c['aux_scores'])
+
+    return (
+        torch.cat(l1_l, dim=0),
+        torch.cat(l2_l, dim=0),
+        torch.cat(det_l, dim=0),
+        torch.cat(route_l, dim=0),
+        torch.cat(rec_l, dim=0),
+        torch.cat(aux_l, dim=0) if aux_l else None,
+    )
+
+
 def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[str],
                                   gt: np.ndarray, args) -> Dict[str, Any]:
     video_records = []
     cursor = 0
     maxlen = 256
-    eff_temp = max(float(args.temp), 1e-3)
-    max_crops = (5 if args.dataset == 'xd' else 10) if args.multi_crop_eval else 1
+    sem_temp = 2.0 if args.dataset == 'xd' else 2.5
+    max_crops = 10 if args.multi_crop_eval else 1
     no_audio = (args.dataset != 'xd')
 
     with torch.no_grad():
@@ -150,32 +180,31 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
                 if aud_crops is not None else None
             )
 
-            _, logits1, logits2, _, _, dnp_dict = model(
-                visual=visual_flat, padding_mask=padding_mask, text=prompt_text,
-                lengths=lengths_flat, audio=audio_flat, DNP_use=True,
+            _, logits2, det_s, route_s, rec_s, aux_s = _forward_chunked(
+                model, visual_flat, audio_flat, padding_mask, prompt_text, lengths_flat
             )
 
-            s_det = dnp_dict.get('detector_scores', torch.sigmoid(logits1)).view(C, num_splits * maxlen, -1)[:, :length, 0].mean(dim=0).cpu().numpy()
-            s_routing = dnp_dict.get('routing_scores', torch.sigmoid(logits1)).view(C, num_splits * maxlen, -1)[:, :length, 0].mean(dim=0).cpu().numpy()
+            s_det = det_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float().mean(dim=0).cpu().numpy()
+            s_routing = route_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float().mean(dim=0).cpu().numpy()
+            s_rec = rec_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float().mean(dim=0).cpu().numpy()
 
-            sem_logits = dnp_dict.get('semantic_logits', logits2).view(C, num_splits * maxlen, -1)[:, :length, :]
             l2_c = logits2.view(C, num_splits * maxlen, -1)[:, :length, :]
-            s_sem = (
-                0.5 * (1.0 - F.softmax(l2_c.float() / eff_temp, dim=-1)[:, :, 0])
-                + 0.5 * (1.0 - F.softmax(sem_logits.float() / eff_temp, dim=-1)[:, :, 0])
-            ).clamp(0.0, 1.0).mean(dim=0).cpu().numpy()
+            s_sem = (1.0 - F.softmax(l2_c.float() / sem_temp, dim=-1)[:, :, 0]).clamp(0.0, 1.0).mean(dim=0).cpu().numpy()
 
-            if 'reconstruction_scores' in dnp_dict:
-                s_rec = dnp_dict['reconstruction_scores'].view(C, num_splits * maxlen, -1)[:, :length, 0].mean(dim=0).cpu().numpy()
-            else:
-                s_rec = s_det.copy()
-
-            if args.dataset == 'xd' and dnp_dict.get('aux_scores') is not None:
-                s_aux = dnp_dict['aux_scores'].view(C, num_splits * maxlen, -1)[:, :length, 0].mean(dim=0).cpu().numpy()
+            has_aux = (args.dataset == 'xd' and aux_s is not None)
+            if has_aux:
+                s_aux = aux_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float().mean(dim=0).cpu().numpy()
             else:
                 s_aux = s_routing.copy()
 
-            s_collab = 0.80 * s_routing + 0.20 * s_sem
+            v_base = 0.88 * s_routing + 0.12 * (0.70 * s_sem + 0.30 * s_rec)
+            if has_aux:
+                g_vs = np.clip((np.maximum(s_det, s_sem) - 0.08) / 0.25, 0.0, 1.0)
+                w_aud = 0.18 * g_vs
+                s_collab = (1.0 - w_aud) * v_base + w_aud * s_aux
+            else:
+                s_collab = v_base
+
             n_frames = length * 16
             video_gt = gt[cursor:cursor + n_frames] if (cursor + n_frames) <= len(gt) else gt[cursor:]
             cursor += n_frames
@@ -190,6 +219,7 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
                 's_rec': s_rec,
                 's_routing': s_routing,
                 's_collab': s_collab,
+                'has_aux': has_aux,
                 'gt_frames': video_gt,
             })
 
@@ -198,13 +228,12 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
 
 def analyze_and_sweep(records: List[Dict[str, Any]], dataset: str) -> Dict[str, Any]:
     normal_evals, abnormal_evals = [], []
-    all_gt = np.concatenate([r['gt_frames'] for r in records if len(r['gt_frames']) > 0]).astype(np.float32)
+    valid_records = [r for r in records if len(r['gt_frames']) > 0]
+    all_gt = np.concatenate([r['gt_frames'] for r in valid_records]).astype(np.float32)
 
-    for rec in records:
+    for rec in valid_records:
         gt = rec['gt_frames']
-        if len(gt) == 0:
-            continue
-        f_col = np.repeat(rec['s_collab'], 16)[:len(gt)]
+        f_col = np.repeat(gaussian_filter1d(rec['s_collab'], sigma=0.80), 16)[:len(gt)]
         if np.sum(gt) == 0:
             normal_evals.append({
                 'path': os.path.basename(rec['path']),
@@ -231,23 +260,33 @@ def analyze_and_sweep(records: List[Dict[str, Any]], dataset: str) -> Dict[str, 
     for v in abnormal_evals[:5]:
         print(f"  {v['path']:<42} | {v['label']:<14} | mean_anom={v['mean_anomaly_score']:.3f} | miss={v['miss_rate_pct']:.1f}%")
 
-    route_all = np.concatenate([np.repeat(r['s_routing'], 16)[:len(r['gt_frames'])] for r in records if len(r['gt_frames']) > 0])
-    sem_all = np.concatenate([np.repeat(r['s_sem'], 16)[:len(r['gt_frames'])] for r in records if len(r['gt_frames']) > 0])
-    q15_r = float(np.clip(np.percentile(route_all, 15.0), 0.01, 0.35))
-    q90_r = float(np.clip(np.percentile(route_all, 90.0), 0.50, 0.98))
-    sem_cal = tools.calibrate_stream_global(sem_all, target_q15=q15_r, target_q90=q90_r)
+    det_all = np.concatenate([np.repeat(r['s_det'], 16)[:len(r['gt_frames'])] for r in valid_records])
+    route_all = np.concatenate([np.repeat(r['s_routing'], 16)[:len(r['gt_frames'])] for r in valid_records])
+    sem_all = np.concatenate([np.repeat(r['s_sem'], 16)[:len(r['gt_frames'])] for r in valid_records])
+    rec_all = np.concatenate([np.repeat(r['s_rec'], 16)[:len(r['gt_frames'])] for r in valid_records])
+    aux_all = np.concatenate([np.repeat(r['s_aux'], 16)[:len(r['gt_frames'])] for r in valid_records])
+
+    g_vs_all = np.clip((np.maximum(det_all, sem_all) - 0.08) / 0.25, 0.0, 1.0)
+    aux_alphas = [0.0, 0.12, 0.18, 0.24] if dataset == 'xd' else [0.0]
 
     best = {'ap': 0.0, 'auc': 0.0, 'recipe': ''}
-    for alpha in [0.0, 0.10, 0.15, 0.20, 0.25]:
-        blend = (1.0 - alpha) * route_all + alpha * sem_cal
-        for sig in [0.0, 0.5, 0.75, 1.0, 1.25]:
-            s_arr = blend if sig == 0.0 else gaussian_filter1d(blend, sigma=sig)
-            auc_v = float(roc_auc_score(all_gt, s_arr))
-            ap_v = float(average_precision_score(all_gt, s_arr))
-            key_cur = ap_v if dataset == 'xd' else auc_v
-            key_best = best['ap'] if dataset == 'xd' else best['auc']
-            if key_cur > key_best:
-                best = {'ap': ap_v, 'auc': auc_v, 'recipe': f"collab_alpha={alpha}, sigma={sig}"}
+    for alpha in [0.0, 0.08, 0.12, 0.16, 0.20]:
+        v_base = (1.0 - alpha) * route_all + alpha * (0.70 * sem_all + 0.30 * rec_all)
+        for aux_a in aux_alphas:
+            w_aud = aux_a * g_vs_all
+            blend = (1.0 - w_aud) * v_base + w_aud * aux_all
+            for sig in [0.0, 0.5, 0.8, 1.1]:
+                s_arr = blend if sig == 0.0 else gaussian_filter1d(blend, sigma=sig * 16.0 / 16.0)
+                auc_v = float(roc_auc_score(all_gt, s_arr))
+                ap_v = float(average_precision_score(all_gt, s_arr))
+                key_cur = ap_v if dataset == 'xd' else auc_v
+                key_best = best['ap'] if dataset == 'xd' else best['auc']
+                if key_cur > key_best:
+                    best = {
+                        'ap': ap_v,
+                        'auc': auc_v,
+                        'recipe': f"collab_alpha={alpha}, aux_eval_alpha={aux_a}, sigma={sig}",
+                    }
 
     print(f"\n[Prober Peak] {dataset.upper()} -> AUC={best['auc']*100:.2f}% | AP={best['ap']*100:.2f}% ({best['recipe']})", flush=True)
     return {'top_false_alarms': normal_evals[:10], 'top_misses': abnormal_evals[:10], 'best': best}

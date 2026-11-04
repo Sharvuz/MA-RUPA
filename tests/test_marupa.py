@@ -31,10 +31,8 @@ def test_mst_sensitivity_adapter_zero_init():
     valid_mask[1, 24:] = 0.0
 
     out = adapter(x, valid_mask=valid_mask)
-    # Because gamma is initialized to 0.0, tanh(0.0) == 0.0 -> exact identity at Step 0!
     assert torch.allclose(out, x, atol=1e-6), "MSTSensitivityAdapter must preserve exact identity at Step 0!"
 
-    # Verify gradient flows into gamma and conv branches once loss backpropagates
     adapter.gamma.data.fill_(0.1)
     out2 = adapter(x, valid_mask=valid_mask)
     out2.mean().backward()
@@ -90,14 +88,15 @@ def test_sgnm_prototype_refiner():
     print("  SGNM prototype refiner passed!")
 
 
-def test_marupa_ucf_and_xd_end_to_end():
-    print("Testing MARUPA v3 End-to-End (UCF-14 & XD-7 Multimodal + Legacy 5-Arg Call)...")
+def test_marupa_v4_ucf_and_xd_visual_protection():
+    print("Testing MARUPA v4 End-to-End (UCF-14, XD-7 Visual-Protection & DataParallel 1-D g_loss)...")
     assert DSANet is MARUPA
     device = "cpu"
     B, T, D = 2, 32, 512
 
     class Args:
-        no_mdtp = False
+        use_mdtp = False
+        no_mdtp = True
         no_audio = False
         no_rupa = False
         no_safegate = False
@@ -109,18 +108,18 @@ def test_marupa_ucf_and_xd_end_to_end():
 
     args = Args()
 
-    # 1. UCF-Crime (14 classes, visual-only + legacy 5-arg call)
+    # 1. UCF-Crime (14 classes, pure LGT-SGNM + legacy 5-arg call)
     model_ucf = MARUPA(
         num_class=14, embed_dim=D, visual_length=T, visual_width=D,
         visual_head=1, visual_layers=2, attn_window=8, args=args, device=device,
     )
+    assert model_ucf.mst_adapter is None, "Pure LGT Dual-GCN must keep mst_adapter=None by default!"
     assert not hasattr(model_ucf.clip_adapter.clipmodel, 'visual'), "Unused 86M CLIP visual tower must be deleted!"
 
     visual = torch.randn(B, T, D, requires_grad=True)
-    lengths = torch.tensor([32, 12])  # includes heavily padded windows for NaN guard check
+    lengths = torch.tensor([32, 12])
     text_ucf = list(DESCRIPTIONS_ORI.keys())
 
-    # Legacy 5-arg call: model(visual, padding_mask, text, lengths, DNP_use)
     text_feat, logits1, logits2, logits3, logits4, dnp_dict = model_ucf(
         visual, None, text_ucf, lengths, True
     )
@@ -129,14 +128,22 @@ def test_marupa_ucf_and_xd_end_to_end():
     assert logits2.shape == (B, T, 14)
     assert logits3.shape == (B, 1, 14)
     assert logits4.shape == (B, 1, 14)
+    assert dnp_dict['g_loss'].dim() == 1 and dnp_dict['g_loss'].shape == (1,), "g_loss must be 1-D for DataParallel!"
+    assert torch.allclose(dnp_dict['semantic_logits'], logits2), "semantic_logits must preserve supervised logits2!"
     assert not torch.isnan(logits1).any(), "NaN in logits1 on padded windows!"
     assert not torch.isnan(dnp_dict['routing_scores']).any(), "NaN in routing_scores!"
 
-    loss_ucf = logits1.mean() + logits2.mean() + dnp_dict['routing_scores'].mean() + dnp_dict['g_loss']
+    # Verify detached SafeGate: backpropagating ONLY routing_logits must update rupa_gate WITHOUT touching visual!
+    dnp_dict['routing_logits'].mean().backward(retain_graph=True)
+    assert visual.grad is None, "Detached SafeGate must NOT inject duplicate MIL gradients into visual backbone!"
+    assert any(p.grad is not None for p in model_ucf.rupa_gate.parameters()), "rupa_gate must receive calibration gradients!"
+    model_ucf.zero_grad()
+
+    loss_ucf = logits1.mean() + logits2.mean() + dnp_dict['g_loss'].mean()
     loss_ucf.backward()
     assert visual.grad is not None and torch.isfinite(visual.grad).all()
 
-    # 2. XD-Violence (7 classes, multimodal visual + 128-D VGGish audio)
+    # 2. XD-Violence (7 classes, Visual-Protected Decoupled VGGish Audio Branch)
     model_xd = MARUPA(
         num_class=7, embed_dim=D, visual_length=T, visual_width=D,
         visual_head=1, visual_layers=1, attn_window=16, args=args, device=device,
@@ -153,11 +160,18 @@ def test_marupa_ucf_and_xd_end_to_end():
     assert l2_xd.shape == (B, T, 7)
     assert dnp_xd['aux_logits'] is not None and dnp_xd['aux_logits'].shape == (B, T, 1)
 
+    # Verify 100% Visual Protection: backpropagating ONLY aux_logits updates audio_adapter, NEVER visual_xd!
+    dnp_xd['aux_logits'].mean().backward(retain_graph=True)
+    assert visual_xd.grad is None, "Decoupled audio branch must NEVER contaminate visual backbone!"
+    assert audio_xd.grad is not None and torch.isfinite(audio_xd.grad).all()
+    model_xd.zero_grad()
+    audio_xd.grad = None
+
     loss_xd = l1_xd.mean() + l2_xd.mean() + dnp_xd['aux_logits'].mean() + dnp_xd['routing_scores'].mean()
     loss_xd.backward()
     assert visual_xd.grad is not None and torch.isfinite(visual_xd.grad).all()
     assert audio_xd.grad is not None and torch.isfinite(audio_xd.grad).all()
-    print("  MARUPA v3 UCF-14 & XD-7 forward/backward passed!")
+    print("  MARUPA v4 UCF-14 & XD-7 Visual-Protected forward/backward passed!")
 
 
 def test_multicrop_discovery_and_ram_cache():
@@ -189,20 +203,20 @@ def test_ablations_and_checkpoint_loading():
     B, T, D = 2, 32, 512
 
     class Args:
-        no_mdtp = True
+        use_mdtp = True
+        no_mdtp = False
         no_audio = True
         no_rupa = True
         no_safegate = True
         decoder_depth = 2
 
     model = MARUPA(num_class=7, visual_length=T, attn_window=16, args=Args(), device="cpu")
-    assert model.mst_adapter is None
+    assert model.mst_adapter is not None, "Optional --use-mdtp ablation must instantiate mst_adapter!"
     assert model.audio_adapter is None
 
     out = model(torch.randn(B, T, D), None, list(DESCRIPTIONS_ORI_XD.keys()), torch.tensor([32, 24]), DNP_use=False)
     assert len(out) == 6
 
-    # Compact state dict (stripped frozen CLIP weights) round-trip load
     compact_sd = {
         f"module.{k}": v.clone()
         for k, v in model.state_dict().items()
@@ -222,7 +236,7 @@ if __name__ == '__main__':
     test_mst_sensitivity_adapter_zero_init()
     test_gated_cross_modal_audio_adapter()
     test_sgnm_prototype_refiner()
-    test_marupa_ucf_and_xd_end_to_end()
+    test_marupa_v4_ucf_and_xd_visual_protection()
     test_multicrop_discovery_and_ram_cache()
     test_ablations_and_checkpoint_loading()
-    print("\n[SUCCESS] ALL MA-RUPA v3 ARCHITECTURE TESTS PASSED!")
+    print("\n[SUCCESS] ALL MA-RUPA v4 ARCHITECTURE TESTS PASSED!")

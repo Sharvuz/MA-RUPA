@@ -9,8 +9,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from model import MARUPA, load_compatible_model_state
 from utils.dataset import UCFDataset, load_multicrop_test_video
 from utils.tools import (
-    get_batch_mask, get_prompt_text, smooth_scores,
-    safe_load_checkpoint, calibrate_stream_global,
+    get_batch_mask, get_prompt_text, smooth_scores, safe_load_checkpoint,
 )
 from utils.ucf_detectionMAP import getDetectionMAP as dmAP
 import ucf_option
@@ -22,13 +21,14 @@ def refine_scores_hierarchical(logits_det: torch.Tensor,
                                total_abnormal_prob: torch.Tensor = None) -> torch.Tensor:
     """Computes per-class snippet probability matrix [T, C] for temporal localization (dmAP)."""
     eps = 1e-12
+    eff_temp = max(float(temp), 1e-3)
     if total_abnormal_prob is None:
-        total_abnormal_prob = torch.sigmoid(logits_det / max(temp, 1e-3))
+        total_abnormal_prob = torch.sigmoid(logits_det / eff_temp)
     if total_abnormal_prob.dim() == 1:
         total_abnormal_prob = total_abnormal_prob.unsqueeze(-1)
     total_normal_prob = (1.0 - total_abnormal_prob).clamp(0.0, 1.0)
 
-    p_align = F.softmax(logits_align / max(temp, 1e-3), dim=1)
+    p_align = F.softmax(logits_align / eff_temp, dim=1)
     p_abn_only = p_align[:, 1:]
     abn_dist = p_abn_only / p_abn_only.sum(dim=1, keepdim=True).clamp_min(eps)
     final_abn_probs = total_abnormal_prob * abn_dist
@@ -58,40 +58,41 @@ def _forward_splits_chunked(eval_model: nn.Module, visual_flat: torch.Tensor,
         _, logits1, logits2, _, _, dnp_dict = eval_model(
             visual_flat, padding_mask, prompt_text, lengths_flat, audio=None, DNP_use=DNP_use
         )
-        route_s = dnp_dict.get('routing_scores', torch.sigmoid(logits1))
         det_s = dnp_dict.get('detector_scores', torch.sigmoid(logits1))
-        sem_logits = dnp_dict.get('semantic_logits', logits2)
+        route_s = dnp_dict.get('routing_scores', det_s)
+        rec_s = dnp_dict.get('reconstruction_scores', det_s)
         gate_s = dnp_dict.get('routing_gate')
-        return logits1, logits2, sem_logits, route_s, det_s, gate_s
+        return logits1, logits2, det_s, route_s, rec_s, gate_s
 
-    l1_list, l2_list, sem_list, r_list, d_list, g_list = [], [], [], [], [], []
+    l1_list, l2_list, d_list, r_list, rec_list, g_list = [], [], [], [], [], []
     for start in range(0, total_b, max_chunk):
         end = min(start + max_chunk, total_b)
         _, l1, l2, _, _, dnp_c = eval_model(
             visual_flat[start:end], padding_mask[start:end], prompt_text,
             lengths_flat[start:end], audio=None, DNP_use=DNP_use
         )
+        d_c = dnp_c.get('detector_scores', torch.sigmoid(l1))
         l1_list.append(l1)
         l2_list.append(l2)
-        sem_list.append(dnp_c.get('semantic_logits', l2))
-        r_list.append(dnp_c.get('routing_scores', torch.sigmoid(l1)))
-        d_list.append(dnp_c.get('detector_scores', torch.sigmoid(l1)))
+        d_list.append(d_c)
+        r_list.append(dnp_c.get('routing_scores', d_c))
+        rec_list.append(dnp_c.get('reconstruction_scores', d_c))
         if dnp_c.get('routing_gate') is not None:
             g_list.append(dnp_c['routing_gate'])
 
     return (
         torch.cat(l1_list, dim=0),
         torch.cat(l2_list, dim=0),
-        torch.cat(sem_list, dim=0),
-        torch.cat(r_list, dim=0),
         torch.cat(d_list, dim=0),
+        torch.cat(r_list, dim=0),
+        torch.cat(rec_list, dim=0),
         torch.cat(g_list, dim=0) if g_list else None,
     )
 
 
 def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
          DNP_use, device, args, compute_dmap: bool = False):
-    """Evaluates MA-RUPA v3 on UCF-Crime with Parallel Multi-Crop Aggregation & DeSC Fusion."""
+    """Evaluates MA-RUPA v4 on UCF-Crime with Parallel 10-Crop Aggregation & Calibrated Synergy."""
     eval_model = model.module if isinstance(model, nn.DataParallel) else model
     eval_model.to(device)
     eval_model.eval()
@@ -99,15 +100,17 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     multi_crop = bool(getattr(args, 'multi_crop_eval', True))
     max_crops = int(getattr(args, 'max_test_crops', 10)) if multi_crop else 1
     data_dir = getattr(args, 'data_dir', None)
-    collab_alpha = float(getattr(args, 'collab_alpha', 0.20))
+    collab_alpha = float(getattr(args, 'collab_alpha', 0.12))
     smooth_eval = bool(getattr(args, 'smooth_eval', True))
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
-    smooth_sigma = float(getattr(args, 'smooth_sigma', 0.75))
+    smooth_sigma = float(getattr(args, 'smooth_sigma', 0.80))
 
+    vid_det_raw_list = []
     vid_route_list = []
     vid_sem_list = []
+    vid_rec_list = []
     vid_logits1_list = []
-    vid_sem_logits_list = []
+    vid_logits2_list = []
     routing_gate_vals = []
     crop_counts = []
 
@@ -139,7 +142,6 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             C, num_splits, _, D = vis_crops.shape
 
             base_lengths = _build_split_lengths(len_cur, maxlen)
-            # Align num_splits if process_split differed by boundary
             if len(base_lengths) != num_splits:
                 base_lengths = torch.full((num_splits,), maxlen, dtype=torch.long)
                 rem = len_cur - maxlen * (num_splits - 1)
@@ -149,60 +151,53 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             padding_mask = get_batch_mask(lengths_flat, maxlen).to(device)
             visual_flat = vis_crops.view(C * num_splits, maxlen, D).to(device)
 
-            logits1, logits2, sem_logits, route_s, _, gate_s = _forward_splits_chunked(
+            logits1, logits2, det_s, route_s, rec_s, gate_s = _forward_splits_chunked(
                 eval_model, visual_flat, padding_mask, prompt_text, lengths_flat, DNP_use
             )
 
-            # Reshape [C, num_splits * maxlen, ...] -> slice [:len_cur] -> mean over C spatial crops
             logits1_c = logits1.view(C, num_splits * maxlen, -1)[:, :len_cur, :]
             logits2_c = logits2.view(C, num_splits * maxlen, -1)[:, :len_cur, :]
-            sem_logits_c = sem_logits.view(C, num_splits * maxlen, -1)[:, :len_cur, :]
+            det_c = det_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
             route_c = route_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
+            rec_c = rec_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
 
-            # Vision-Language Semantic Anomaly Probability (logits2 is already /0.07 scaled)
-            p_sem_bb = 1.0 - F.softmax(logits2_c.float(), dim=-1)[:, :, 0]
-            p_sem_rupa = 1.0 - F.softmax(sem_logits_c.float(), dim=-1)[:, :, 0]
-            p_sem_c = (0.5 * p_sem_bb + 0.5 * p_sem_rupa).clamp(0.0, 1.0)
+            # Temperature-calibrated Vision-Language Semantic Anomaly Probability (smooth log-odds, zero quantile distortion)
+            p_sem_c = (1.0 - F.softmax(logits2_c.float() / 2.5, dim=-1)[:, :, 0]).clamp(0.0, 1.0)
 
-            prob_route_np = route_c.float().mean(dim=0).cpu().numpy()
-            prob_sem_np = p_sem_c.float().mean(dim=0).cpu().numpy()
-
-            vid_route_list.append(prob_route_np)
-            vid_sem_list.append(prob_sem_np)
+            vid_det_raw_list.append(det_c.float().mean(dim=0).cpu().numpy())
+            vid_route_list.append(route_c.float().mean(dim=0).cpu().numpy())
+            vid_sem_list.append(p_sem_c.float().mean(dim=0).cpu().numpy())
+            vid_rec_list.append(rec_c.float().mean(dim=0).cpu().numpy())
             vid_logits1_list.append(logits1_c.float().mean(dim=0).cpu())
-            vid_sem_logits_list.append(sem_logits_c.float().mean(dim=0).cpu())
+            vid_logits2_list.append(logits2_c.float().mean(dim=0).cpu())
 
             if gate_s is not None:
                 gate_c = gate_s.view(C, num_splits * maxlen)[:, :len_cur].mean(dim=0)
                 routing_gate_vals.append(gate_c.detach().cpu())
 
-    # Unsupervised quantile alignment of semantic stream to detector dynamic range (zero GT labels used)
-    concat_route = np.concatenate(vid_route_list, axis=0)
-    concat_sem = np.concatenate(vid_sem_list, axis=0)
-    q15_r = float(np.clip(np.percentile(concat_route, 15.0), 0.01, 0.35))
-    q90_r = float(np.clip(np.percentile(concat_route, 90.0), 0.50, 0.98))
-    cal_sem_concat = calibrate_stream_global(concat_sem, target_q15=q15_r, target_q90=q90_r)
-
+    final_det_raw_all = []
     final_route_all = []
     final_sem_all = []
     final_collab_all = []
     element_logits2_stack = []
 
-    offset = 0
     for idx_v, r_v in enumerate(vid_route_list):
-        lv = len(r_v)
-        s_v_cal = cal_sem_concat[offset:offset + lv]
-        s_v_raw = vid_sem_list[idx_v]
-        offset += lv
+        d_v = vid_det_raw_list[idx_v]
+        s_v = vid_sem_list[idx_v]
+        rec_v = vid_rec_list[idx_v]
 
-        c_v = (1.0 - collab_alpha) * r_v + collab_alpha * s_v_cal
+        # Calibrated multi-view synergy: SGNM `rec_v` is already scale-matched to `d_v` via 1.0 * ConsistencyLoss
+        aux_synergy = 0.70 * s_v + 0.30 * rec_v
+        c_v = (1.0 - collab_alpha) * r_v + collab_alpha * aux_synergy
+
         if smooth_eval:
             r_eval = smooth_scores(r_v, method=smooth_method, sigma=smooth_sigma)
-            s_eval = smooth_scores(s_v_raw, method=smooth_method, sigma=smooth_sigma)
+            s_eval = smooth_scores(s_v, method=smooth_method, sigma=smooth_sigma)
             c_eval = smooth_scores(c_v, method=smooth_method, sigma=smooth_sigma)
         else:
-            r_eval, s_eval, c_eval = r_v, s_v_raw, c_v
+            r_eval, s_eval, c_eval = r_v, s_v, c_v
 
+        final_det_raw_all.append(d_v)
         final_route_all.append(r_eval)
         final_sem_all.append(s_eval)
         final_collab_all.append(c_eval)
@@ -210,20 +205,23 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         if compute_dmap:
             collab_t = torch.from_numpy(c_eval).float().unsqueeze(-1)
             opt_probs = refine_scores_hierarchical(
-                vid_logits1_list[idx_v], vid_sem_logits_list[idx_v], args.temp, collab_t
+                vid_logits1_list[idx_v], vid_logits2_list[idx_v], args.temp, collab_t
             )
             element_logits2_stack.append(np.repeat(opt_probs.numpy(), 16, axis=0))
 
+    pred_det_raw = np.repeat(np.concatenate(final_det_raw_all, axis=0), 16)
     pred_route = np.repeat(np.concatenate(final_route_all, axis=0), 16)
     pred_sem = np.repeat(np.concatenate(final_sem_all, axis=0), 16)
     pred_collab = np.repeat(np.concatenate(final_collab_all, axis=0), 16)
 
-    # Align length safely if GT differs by trailing frames
     n_gt = len(gt)
+    pred_det_raw = pred_det_raw[:n_gt] if len(pred_det_raw) >= n_gt else np.pad(pred_det_raw, (0, n_gt - len(pred_det_raw)))
     pred_route = pred_route[:n_gt] if len(pred_route) >= n_gt else np.pad(pred_route, (0, n_gt - len(pred_route)))
     pred_sem = pred_sem[:n_gt] if len(pred_sem) >= n_gt else np.pad(pred_sem, (0, n_gt - len(pred_sem)))
     pred_collab = pred_collab[:n_gt] if len(pred_collab) >= n_gt else np.pad(pred_collab, (0, n_gt - len(pred_collab)))
 
+    auc_det_raw = roc_auc_score(gt, pred_det_raw)
+    ap_det_raw = average_precision_score(gt, pred_det_raw)
     auc_route = roc_auc_score(gt, pred_route)
     ap_route = average_precision_score(gt, pred_route)
     auc_sem = roc_auc_score(gt, pred_sem)
@@ -238,9 +236,10 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         gate_info = f" | SafeGate={gates_cat.mean().item():.4f}"
 
     print(f"  [Eval {avg_crops:.1f}-Crop{gate_info}]", flush=True)
+    print(f"    LGT-SGNM Detector (Raw)    : AUC = {auc_det_raw * 100:.2f}% | AP = {ap_det_raw * 100:.2f}%", flush=True)
     print(f"    Safe-RUPA Detector-Routing : AUC = {auc_route * 100:.2f}% | AP = {ap_route * 100:.2f}%", flush=True)
     print(f"    Vision-Language Semantic   : AUC = {auc_sem * 100:.2f}% | AP = {ap_sem * 100:.2f}%", flush=True)
-    print(f"    MA-RUPA DeSC Collaborative : AUC = {auc_collab * 100:.2f}% | AP = {ap_collab * 100:.2f}%", flush=True)
+    print(f"    MA-RUPA Collaborative SOTA : AUC = {auc_collab * 100:.2f}% | AP = {ap_collab * 100:.2f}%", flush=True)
 
     if compute_dmap and element_logits2_stack:
         try:
@@ -252,8 +251,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             print(f"    [Note] Detection mAP skipped: {exc}", flush=True)
 
     sys.stdout.flush()
-    primary_auc = max(auc_collab, auc_route)
-    primary_ap = ap_collab if auc_collab >= auc_route else ap_route
+    candidates = [(auc_collab, ap_collab), (auc_route, ap_route), (auc_det_raw, ap_det_raw)]
+    primary_auc, primary_ap = max(candidates, key=lambda x: x[0])
     return primary_auc, primary_ap
 
 

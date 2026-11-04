@@ -1,7 +1,6 @@
 import os
 import random
 import subprocess
-import sys
 import time
 import numpy as np
 import torch
@@ -17,7 +16,7 @@ from utils.tools import (
 )
 from utils.StableAdamW import StableAdamW
 from utils.losses import (
-    CLAS2, CLASM, CLASM_EVENT, RUPA_RESIDUAL_EVENT, CLASM_BKG,
+    CLAS2, CLASM, CLASM_EVENT, CLASM_BKG,
     text_orthogonality_loss, ConsistencyLoss, routing_anchor_loss,
     edge_preserving_smoothness_loss, audio_guided_mil_loss,
     WarmCosineScheduler, ModelEMA,
@@ -52,7 +51,7 @@ def unwrap_compact_state_dict(model: nn.Module) -> dict:
 def interleave_multimodal_batch(n_vis, n_lbls, n_lens, n_aud,
                                 a_vis, a_lbls, a_lens, a_aud, device):
     """Interleaves Normal and Abnormal visual+audio samples [N0, A0, N1, A1, ...]
-    so every GPU shard in torch.nn.DataParallel receives an exact 50/50 balance.
+    when optional `--balanced-sampling True` mode is enabled.
     """
     b = min(n_vis.shape[0], a_vis.shape[0])
     _, t, d = n_vis.shape
@@ -86,36 +85,53 @@ def interleave_multimodal_batch(n_vis, n_lbls, n_lens, n_aud,
 
 
 def build_xd_components(args, device):
-    half_bs = max(1, args.batch_size // 2)
     loader_kwargs = {
         'num_workers': args.num_workers,
         'pin_memory': torch.cuda.is_available(),
         'persistent_workers': args.num_workers > 0,
     }
 
-    normal_dataset = XDDataset(
-        args.visual_length, args.train_list, False, XD_LABEL_MAP,
-        audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
-        data_dir=args.data_dir, no_audio=args.no_audio,
-        normal=True, sample_one_crop_per_video=args.sample_one_crop_per_video,
-        crops_per_video=args.crops_per_video,
-    )
-    anomaly_dataset = XDDataset(
-        args.visual_length, args.train_list, False, XD_LABEL_MAP,
-        audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
-        data_dir=args.data_dir, no_audio=args.no_audio,
-        normal=False, sample_one_crop_per_video=args.sample_one_crop_per_video,
-        crops_per_video=args.crops_per_video,
-    )
-
-    normal_loader = DataLoader(
-        normal_dataset, batch_size=half_bs, shuffle=True, drop_last=True,
-        collate_fn=xd_collate_fn, **loader_kwargs,
-    )
-    anomaly_loader = DataLoader(
-        anomaly_dataset, batch_size=half_bs, shuffle=True, drop_last=True,
-        collate_fn=xd_collate_fn, **loader_kwargs,
-    )
+    use_balanced = bool(getattr(args, 'balanced_sampling', False))
+    if use_balanced:
+        half_bs = max(1, args.batch_size // 2)
+        normal_dataset = XDDataset(
+            args.visual_length, args.train_list, False, XD_LABEL_MAP,
+            audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
+            data_dir=args.data_dir, no_audio=args.no_audio,
+            normal=True, sample_one_crop_per_video=args.sample_one_crop_per_video,
+            crops_per_video=args.crops_per_video,
+        )
+        anomaly_dataset = XDDataset(
+            args.visual_length, args.train_list, False, XD_LABEL_MAP,
+            audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
+            data_dir=args.data_dir, no_audio=args.no_audio,
+            normal=False, sample_one_crop_per_video=args.sample_one_crop_per_video,
+            crops_per_video=args.crops_per_video,
+        )
+        primary_train_loader = DataLoader(
+            normal_dataset, batch_size=half_bs, shuffle=True, drop_last=True,
+            collate_fn=xd_collate_fn, **loader_kwargs,
+        )
+        secondary_train_loader = DataLoader(
+            anomaly_dataset, batch_size=half_bs, shuffle=True, drop_last=True,
+            collate_fn=xd_collate_fn, **loader_kwargs,
+        )
+        probe_datasets = (normal_dataset, anomaly_dataset)
+    else:
+        # Single natural shuffled DataLoader utilizing 100% of XD-Violence's 39,540 crops (51.8% Normal / 48.2% Abnormal)
+        train_dataset = XDDataset(
+            args.visual_length, args.train_list, False, XD_LABEL_MAP,
+            audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
+            data_dir=args.data_dir, no_audio=args.no_audio,
+            normal=None, sample_one_crop_per_video=args.sample_one_crop_per_video,
+            crops_per_video=args.crops_per_video,
+        )
+        primary_train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False,
+            collate_fn=xd_collate_fn, **loader_kwargs,
+        )
+        secondary_train_loader = None
+        probe_datasets = (train_dataset,)
 
     test_dataset = XDDataset(
         args.visual_length, args.test_list, True, XD_LABEL_MAP,
@@ -130,7 +146,7 @@ def build_xd_components(args, device):
     # Auto-detect audio feature dimension on disk (128 VGGish vs 512 CLAP/AST)
     if not args.no_audio:
         detected_audio_dim = None
-        for ds in (normal_dataset, anomaly_dataset):
+        for ds in probe_datasets:
             for idx in range(min(20, len(ds))):
                 item_tuple = ds[idx]
                 sample_audio = item_tuple[3] if len(item_tuple) >= 4 else None
@@ -153,21 +169,21 @@ def build_xd_components(args, device):
         load_compatible_model_state(model, init_state, allow_legacy_dsanet=True)
         print(f"[Init] Loaded initial weights from {args.init_model_path}", flush=True)
 
-    return model, normal_loader, anomaly_loader, test_loader, XD_LABEL_MAP
+    return model, primary_train_loader, secondary_train_loader, test_loader, XD_LABEL_MAP
 
 
 def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=None,
           args=None, label_map=None, device=None):
-    """Supports both `train(args)` and `train(model, normal_loader, anomaly_loader, testloader, args, label_map, device)`."""
+    """Supports both `train(args)` and `train(model, train_loader, anomaly_loader, testloader, args, label_map, device)`."""
     if normal_loader is None and not isinstance(model_or_args, nn.Module):
         args = model_or_args
         device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-            print(f"[MA-RUPA v3 Codebase] Git Commit: {commit_hash}", flush=True)
+            print(f"[MA-RUPA v4 Codebase] Git Commit: {commit_hash}", flush=True)
         except Exception:
             pass
-        print(f"[MA-RUPA v3] Training XD-Violence on device: {device}", flush=True)
+        print(f"[MA-RUPA v4] Training XD-Violence on device: {device}", flush=True)
         setup_seed(args.seed)
         model, normal_loader, anomaly_loader, testloader, label_map = build_xd_components(args, device)
     else:
@@ -189,9 +205,9 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
     # Parameter Grouping:
-    # 1. Main visual/text backbone @ main_lr (1.5e-5)
-    # 2. Newly-initialized VGGish Cross-Modal Audio Adapter @ audio_lr (5e-5)
-    # 3. Counterfactual Prototype Refiner & SafeGate @ refiner_lr (StableAdamW)
+    # 1. Pure Visual/Text LGT+CLIP_Adapter backbone @ main_lr (1e-5, zero audio gradient contamination)
+    # 2. Decoupled VGGish Cross-Modal Audio Adapter @ audio_lr (3e-5, weight_decay=1e-4)
+    # 3. SGNM Dynamic Normal Prototype Refiner & Detached SafeGate @ refiner_lr (StableAdamW)
     refiner_params = []
     audio_adapter_params = []
     main_model_params = []
@@ -206,19 +222,28 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             main_model_params.append(param)
 
     main_lr = args.lr if args.main_lr is None else args.main_lr
-    audio_lr = getattr(args, 'audio_lr', None) or max(main_lr, 5e-5)
+    audio_lr = getattr(args, 'audio_lr', None) or max(main_lr, 3e-5)
     refiner_lr = args.lr if args.refiner_lr is None else args.refiner_lr
 
-    main_param_groups = [{'params': main_model_params, 'lr': main_lr}]
+    main_param_groups = [{'params': main_model_params, 'lr': main_lr, 'weight_decay': args.weight_decay}]
     if audio_adapter_params:
-        main_param_groups.append({'params': audio_adapter_params, 'lr': audio_lr})
+        main_param_groups.append({'params': audio_adapter_params, 'lr': audio_lr, 'weight_decay': 1e-4})
 
-    optimizer_main = torch.optim.AdamW(main_param_groups, weight_decay=args.weight_decay)
+    optimizer_main = torch.optim.AdamW(main_param_groups)
     scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_main, T_max=max(1, args.max_epoch), eta_min=main_lr * 0.05
+        optimizer_main, T_max=max(1, args.max_epoch)
     )
 
-    num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
+    dual_loader_mode = anomaly_loader is not None
+    if dual_loader_mode:
+        num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
+        eff_batch = normal_loader.batch_size * 2
+        sampling_desc = f"{eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)"
+    else:
+        num_batches_per_epoch = len(normal_loader)
+        eff_batch = normal_loader.batch_size
+        sampling_desc = f"{eff_batch} (Single Natural Shuffled Loader -- 100% of {len(normal_loader.dataset)} crops)"
+
     total_iters = max(1, args.max_epoch * num_batches_per_epoch)
 
     optimizer_refiner = StableAdamW(
@@ -267,11 +292,11 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
         print(f"[Resume] Resumed from epoch {start_epoch}, best AP={ap_best * 100:.2f}%", flush=True)
 
-    eff_batch = normal_loader.batch_size * 2
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v3 MULTIMODAL SOTA TRAINING ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
-    print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)", flush=True)
+    print(f"[START] MA-RUPA v4 VISUAL-PROTECTED MULTIMODAL SOTA ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"  Batch Size : {sampling_desc}", flush=True)
     print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps | Main LR={main_lr:.1e}, Audio LR={audio_lr:.1e}", flush=True)
+    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight} | AuxAV={args.lambda_aux}", flush=True)
     print(f"  Multi-Crop : {'5-Crop Parallel Multimodal Eval Active' if args.multi_crop_eval else '1-Crop Eval'}", flush=True)
     print("=" * 78 + "\n", flush=True)
 
@@ -279,35 +304,47 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         model.train()
         DNP_use = args.DNP_use and (not args.no_rupa)
 
-        sum_l1 = sum_l2 = sum_l3 = sum_aux = sum_route = 0.0
+        sum_l1 = sum_l2 = sum_l3 = sum_cons = sum_g = sum_aux = 0.0
         epoch_t0 = time.time()
 
-        normal_iter = iter(normal_loader)
-        anomaly_iter = iter(anomaly_loader)
+        if dual_loader_mode:
+            normal_iter = iter(normal_loader)
+            anomaly_iter = iter(anomaly_loader)
+        else:
+            single_iter = iter(normal_loader)
 
         for i in range(num_batches_per_epoch):
-            n_vis, n_lbls, n_lens, n_aud = next(normal_iter)
-            a_vis, a_lbls, a_lens, a_aud = next(anomaly_iter)
+            if dual_loader_mode:
+                n_vis, n_lbls, n_lens, n_aud = next(normal_iter)
+                a_vis, a_lbls, a_lens, a_aud = next(anomaly_iter)
+                visual_features, text_labels_raw, feat_lengths, audio_features = interleave_multimodal_batch(
+                    n_vis, n_lbls, n_lens, n_aud, a_vis, a_lbls, a_lens, a_aud, device
+                )
+            else:
+                vis_b, text_labels_raw, lens_b, aud_b = next(single_iter)
+                visual_features = vis_b.to(device, non_blocking=True)
+                feat_lengths = lens_b.to(device, non_blocking=True)
+                audio_features = aud_b.to(device, non_blocking=True) if aud_b is not None else None
 
-            visual_features, text_labels_raw, feat_lengths, audio_features = interleave_multimodal_batch(
-                n_vis, n_lbls, n_lens, n_aud, a_vis, a_lbls, a_lens, a_aud, device
-            )
             text_labels = get_batch_label(text_labels_raw, prompt_text, label_map).to(device)
 
-            text_features, logits1, logits2, logits3, logits4, dnp_dict = model(
+            # Guard against 1-sample tail shard in DataParallel if custom dataset size == k*BS + 1
+            forward_module = (
+                raw_model
+                if (isinstance(model, nn.DataParallel) and visual_features.shape[0] < torch.cuda.device_count())
+                else model
+            )
+            text_features, logits1, logits2, logits3, logits4, dnp_dict = forward_module(
                 visual_features, None, prompt_text, feat_lengths, audio=audio_features, DNP_use=DNP_use
             )
 
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
             loss2 = CLASM(logits2, text_labels, feat_lengths, device)
             loss3 = text_orthogonality_loss(text_features)
-
-            if DNP_use and args.rupa_use:
-                loss4 = RUPA_RESIDUAL_EVENT(logits3, text_labels, feat_lengths, device)
-            else:
-                loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
+            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
 
+            # Decoupled Audio-Visual MIL (backpropagates ONLY into `audio_adapter` because `visual_features.detach()` was passed)
             aux_logits = dnp_dict.get('aux_logits')
             if aux_logits is not None and args.lambda_aux > 0:
                 loss_aux = audio_guided_mil_loss(aux_logits, text_labels, feat_lengths)
@@ -327,11 +364,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     lengths=feat_lengths,
                 )
                 g_loss = dnp_dict['g_loss'].mean()
-                dnp_norm_loss = dnp_dict.get('dnp_normal_loss', logits1.sum() * 0.0)
-                if torch.is_tensor(dnp_norm_loss):
-                    dnp_norm_loss = dnp_norm_loss.mean()
 
-                if args.rupa_use and 'routing_logits' in dnp_dict:
+                if args.rupa_use and 'routing_logits' in dnp_dict and args.loss_routing_weight > 0:
                     route_loss = CLAS2(dnp_dict['routing_logits'], text_labels, feat_lengths, device)
                     route_anchor = routing_anchor_loss(dnp_dict, feat_lengths)
                 else:
@@ -346,14 +380,14 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     + loss5 * args.loss_reconstructed_normal_weight
                     + cons_loss * args.loss_consistency_weight
                     + g_loss * args.loss_gather_weight
-                    + dnp_norm_loss * args.loss_dnp_normal_weight
                     + route_loss * args.loss_routing_weight
                     + route_anchor * args.loss_routing_anchor_weight
                     + loss_aux * args.lambda_aux
                     + loss_smooth * args.lambda_smooth
                 )
             else:
-                route_loss = logits1.sum() * 0.0
+                cons_loss = logits1.sum() * 0.0
+                g_loss = logits1.sum() * 0.0
                 loss = (
                     loss1
                     + loss2 * args.loss2_weight
@@ -381,18 +415,19 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             sum_l1 += loss1.item()
             sum_l2 += loss2.item()
             sum_l3 += loss3.item()
+            sum_cons += cons_loss.item()
+            sum_g += g_loss.item()
             sum_aux += loss_aux.item()
-            sum_route += route_loss.item()
 
             iter_num = i + 1
-            if iter_num == 1 or iter_num % 10 == 0 or iter_num == num_batches_per_epoch:
+            if iter_num == 1 or iter_num % 25 == 0 or iter_num == num_batches_per_epoch:
                 elapsed = max(1e-3, time.time() - epoch_t0)
                 it_s = iter_num / elapsed
                 eta_s = (num_batches_per_epoch - iter_num) / max(it_s, 1e-4)
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
-                    f"AuxAV:{sum_aux/iter_num:.4f} Route:{sum_route/iter_num:.4f} | "
+                    f"Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} AuxAV:{sum_aux/iter_num:.4f} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )

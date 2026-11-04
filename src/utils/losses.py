@@ -234,13 +234,18 @@ def edge_preserving_smoothness_loss(scores: torch.Tensor, lengths: torch.Tensor,
 
 
 def audio_guided_mil_loss(aux_logits: torch.Tensor, labels: torch.Tensor,
-                          lengths: torch.Tensor, topk_ratio: int = 16) -> torch.Tensor:
-    """Trains the Cross-Modal Audio-Visual Auxiliary Head with MIL + Normal Acoustic Suppression."""
+                          lengths: torch.Tensor, topk_ratio: int = 16,
+                          normal_fa_weight: float = 0.50) -> torch.Tensor:
+    """Trains the Decoupled Cross-Modal Audio-Visual Branch with MIL + Normal Acoustic Suppression.
+
+    On XD-Violence, Normal movie/sports clips (`label_A`, e.g., The Bourne Ultimatum) often contain
+    loud soundtrack drums, cheering, or dramatic SFX. Explicitly penalizing the top-8 acoustic peaks
+    on Normal bags prevents false-alarm precision collapse while keeping visual features 100% pure.
+    """
     if aux_logits is None:
         return torch.tensor(0.0)
     mil_loss = CLAS2(aux_logits, labels, lengths, device=aux_logits.device, topk_ratio=topk_ratio)
 
-    # Extra suppression of loud harmless audio spikes on Normal bags (labels[:, 0] == 1)
     normal_bag_mask = labels[:, 0] > 0.5
     if torch.any(normal_bag_mask):
         probs_norm = torch.sigmoid(aux_logits[normal_bag_mask].float().squeeze(-1))
@@ -249,9 +254,9 @@ def audio_guided_mil_loss(aux_logits: torch.Tensor, labels: torch.Tensor,
         peaks = []
         for i in range(probs_norm.shape[0]):
             l_i = max(1, min(int(lens_norm[i]), T))
-            k_i = max(1, min(4, l_i))
+            k_i = max(1, min(8, l_i))
             peaks.append(torch.topk(probs_norm[i, :l_i], k=k_i).values.mean())
         fa_loss = torch.stack(peaks).mean()
-        return mil_loss + 0.25 * fa_loss
+        return mil_loss + normal_fa_weight * fa_loss
 
     return mil_loss

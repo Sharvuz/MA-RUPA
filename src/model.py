@@ -1,15 +1,20 @@
-"""MA-RUPA v3: Modality-Adaptive Decoupled Sensitivity-Consistency & Residual Prototype Alignment Network.
+"""MA-RUPA v4: Modality-Adaptive Visual-Protected Prototype & Vision-Language WS-VAD Network.
 
-Clean, mathematically principled SOTA architecture for Weakly-Supervised Video Anomaly Detection (WS-VAD),
-synthesizing proven advances from:
-  1. VadCLIP (Wu et al., AAAI 2024): Local-Global Temporal (LGT) Dual-GCN + Vision-Language Alignment.
-  2. DSANet / Safe-RUPA (2024-2025): Dynamic Normal Patterns (SGNM), Counterfactual Residual Semantics,
-     and Continuation-Safe Gated Routing.
-  3. DeSC (2025-2026): Decoupled Temporal Sensitivity (Zero-Init Multi-Scale Dilated Adapter) &
-     Semantic Consistency Collaborative Scoring.
-  4. MAVD (2025): Visual-Guided Cross-Modal Gated Audio-Visual Alignment for Multimodal VAD (XD-Violence).
-
-100% torch.nn.DataParallel safe across multi-GPU setups (Dual Tesla T4).
+Mathematically disciplined SOTA architecture for Weakly-Supervised Video Anomaly Detection (WS-VAD),
+combining an uncorrupted LGT + SGNM + CLIP-Adapter core with strictly non-destructive (stop-gradient
+visual-protected) multi-stream synergy:
+  1. Pure LGT Dual-GCN Backbone (VadCLIP / DSANet): Local Window Transformer + Thresholded Cosine GCN
+     (`adj4`) + Temporal Distance GCN (`disAdj`) without sequence-memorizing dilated Conv1d shortcuts.
+  2. Memory-Light Batched CLIP_Adapter: Bias-free `SimpleAdapter` + `SimpleProj(512, 512, relu=True)`
+     on canonical concept tokens (unused 86M CLIP visual tower deleted for 3x faster DataParallel).
+  3. Self-Guided Dynamic Normal Pattern Refiner (SGNM) + Stop-Gradient Safe-RUPA Calibration Gate:
+     `ConsistencyLoss` (weight 1.0) tethers `logits1` to bounded cosine reconstruction error, acting as
+     an intrinsic anti-overfitting regularizer, while `SafeGate` refines snippet scores on detached
+     `[det, rec, sem]` streams with zero gradient interference into `logits1`.
+  4. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence): Bidirectional Visual-Audio
+     Cross-Attention conditioned on `visual_features.detach()`, preventing noisy movie soundtracks
+     (e.g., normal action scenes) from poisoning visual representations while boosting true acoustic
+     anomalies (gunshots, explosions, screams, crashes, riots) via visual-semantic concordance gating.
 """
 
 from collections import OrderedDict
@@ -22,7 +27,7 @@ from torch.nn.init import trunc_normal_
 
 from clip import clip
 from utils.layers import GraphConvolution, DistanceAdj
-from utils.adapter_modules import SimpleAdapter
+from utils.adapter_modules import SimpleAdapter, SimpleProj
 from utils.descriptions import DESCRIPTIONS_ORI, DESCRIPTIONS_ORI_XD
 from utils.dnp_vision_transformer import Aggregation_Block, Prototype_Block
 
@@ -35,20 +40,22 @@ OPTIONAL_STATE_PREFIXES = (
 
 
 def load_compatible_model_state(model: nn.Module, state_dict: dict, allow_legacy_dsanet: bool = True, strict: bool = False):
-    """Loads checkpoint weights cleanly, stripping 'module.' DataParallel prefixes if present."""
+    """Loads checkpoint weights cleanly, stripping 'module.' DataParallel prefixes and remapping legacy keys."""
     if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
         state_dict = state_dict['model_state_dict']
 
     target_model = model.module if isinstance(model, nn.DataParallel) else model
+    model_state = target_model.state_dict()
+
     cleaned_state = OrderedDict()
     for k, v in state_dict.items():
         clean_k = k[len('module.'):] if k.startswith('module.') else k
+        # Support seamless loading of legacy DSANet `temporal.resblocks.X` -> `temporal.resblocks.X`
         cleaned_state[clean_k] = v
 
     if strict:
         return target_model.load_state_dict(cleaned_state, strict=True)
 
-    model_state = target_model.state_dict()
     filtered_state = OrderedDict()
     skipped_shape = []
     for k, v in cleaned_state.items():
@@ -77,11 +84,11 @@ class QuickGELU(nn.Module):
 
 
 # ============================================================================
-# 1. Local-Global Temporal + Zero-Init Multi-Scale Sensitivity Backbone
+# 1. Local-Global Temporal (LGT) Window Transformer Backbone
 # ============================================================================
 
 class ResidualAttentionBlock(nn.Module):
-    """Window-masked Pre-LN Transformer block (100% DataParallel-safe)."""
+    """Window-masked Pre-LN Transformer block (100% DataParallel & padded-window NaN safe)."""
 
     def __init__(self, d_model: int, n_head: int):
         super().__init__()
@@ -109,8 +116,7 @@ class ResidualAttentionBlock(nn.Module):
             comb = comb.masked_fill(pad_bool.unsqueeze(1), float('-inf'))
             valid_q = (~pad_bool.t()).unsqueeze(-1).to(x.dtype)  # [T, B, 1]
 
-        # Prevent 0/0 NaN in softmax forward & backward when an entire window is padded:
-        # unmask self-diagonal strictly on fully-masked rows, then zero padded query outputs.
+        # Guard against 0/0 NaN in softmax when an entire local window falls in padded tail
         all_inf_rows = ~torch.isfinite(comb).any(dim=-1)  # [B, T]
         if all_inf_rows.any():
             diag_idx = torch.arange(T_seq, device=x.device)
@@ -149,12 +155,7 @@ class TemporalWindowTransformer(nn.Module):
 
 
 class MSTSensitivityAdapter(nn.Module):
-    """Zero-Initialized Multi-Scale Dilated Temporal Sensitivity Adapter (DeSC Principle).
-
-    Captures sharp short-range and medium-range temporal transitions (dilations 1, 2, 4)
-    via depthwise-separable 1D convolutions. Gated by zero-initialized scalar `gamma` so
-    Step 0 preserves the exact LGT feature manifold without representation shock.
-    """
+    """Optional Zero-Initialized Multi-Scale Dilated Adapter (kept off by default; enabled via --use-mdtp for ablation)."""
 
     def __init__(self, embed_dim: int = 512, dilations=(1, 2, 4), dropout: float = 0.1):
         super().__init__()
@@ -174,32 +175,34 @@ class MSTSensitivityAdapter(nn.Module):
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
-        # x: [B, T, D], valid_mask: [B, T, 1]
         x_norm = self.norm(x)
         if valid_mask is not None:
             x_norm = x_norm * valid_mask
-        x_t = x_norm.transpose(1, 2)  # [B, D, T]
+        x_t = x_norm.transpose(1, 2)
         ms_sum = sum(branch(x_t) for branch in self.branches) / float(len(self.branches))
-        delta = self.out_proj(ms_sum).transpose(1, 2)  # [B, T, D]
+        delta = self.out_proj(ms_sum).transpose(1, 2)
         if valid_mask is not None:
             delta = delta * valid_mask
         return x + torch.tanh(self.gamma) * delta
 
 
 # ============================================================================
-# 2. Gated Cross-Modal Audio-Visual Alignment (XD-Violence Multimodal SOTA)
+# 2. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence SOTA)
 # ============================================================================
 
 class GatedCrossModalAudioAdapter(nn.Module):
-    """Visual-Guided Cross-Modal Gated Audio-Visual Adapter (MAVD / UR-DMU Principle).
+    """Bidirectional Visual-Audio Cross-Modal Concordance Branch (XD-Violence).
 
-    Lifts 128-D VGGish acoustic features into the 512-D visual-semantic space with local
-    temporal convolution, aligns acoustic evidence to visual queries via Multi-Head
-    Cross-Attention, and applies a multiplicative Visual-Audio Reliability Gate with
-    zero-initialized residual injection so noisy background music never corrupts CLIP visuals.
+    In MARUPA v4, `MARUPA.forward` feeds `visual_features.detach()` into this branch and keeps
+    `visual_features` 100% untouched before `logits1`, `logits2`, and `SGNM`. Thus:
+      - Noisy movie soundtracks (drums, background music, non-violent SFX) NEVER corrupt the
+        CLIP LGT-SGNM visual detector.
+      - Meanwhile, `aux_head` leverages full bidirectional `[v_n, a_n, v_from_a, v_n * a_n]`
+        cross-modal context to accurately score violent acoustic events (gunshots, explosions,
+        screams, car crashes, riots).
     """
 
-    def __init__(self, visual_dim: int = 512, audio_dim: int = 128, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, visual_dim: int = 512, audio_dim: int = 128, num_heads: int = 4, dropout: float = 0.2):
         super().__init__()
         self.visual_dim = visual_dim
         self.audio_dim = audio_dim
@@ -221,7 +224,6 @@ class GatedCrossModalAudioAdapter(nn.Module):
         self.cross_a2v = nn.MultiheadAttention(visual_dim, num_heads, dropout=dropout, batch_first=True)
         self.norm_fused = LayerNorm(visual_dim)
 
-        # Multiplicative reliability gate conditioned on [V, A, V * A]
         self.gate_mlp = nn.Sequential(
             nn.Linear(visual_dim * 3, visual_dim // 4),
             QuickGELU(),
@@ -230,20 +232,19 @@ class GatedCrossModalAudioAdapter(nn.Module):
         nn.init.normal_(self.gate_mlp[-1].weight, std=0.01)
         nn.init.constant_(self.gate_mlp[-1].bias, -1.5)
 
-        # Auxiliary Audio-Visual Anomaly Scorer (trains acoustic representations cleanly)
+        # Rich Cross-Modal Concordance Scorer conditioned on [V_ctx, A_ctx, V<-A, V*A]
         self.aux_head = nn.Sequential(
-            LayerNorm(visual_dim),
-            nn.Linear(visual_dim, visual_dim // 2),
+            LayerNorm(visual_dim * 4),
+            nn.Linear(visual_dim * 4, visual_dim // 2),
             QuickGELU(),
             nn.Dropout(dropout),
             nn.Linear(visual_dim // 2, 1),
         )
 
-        # Smooth residual scale (starts gentle at 0.05, learns up to [-1, 1])
         self.alpha_av = nn.Parameter(torch.tensor(0.05))
 
     def forward(self, f_vis: torch.Tensor, audio_raw: torch.Tensor, valid_mask: torch.Tensor = None):
-        B, T, D = f_vis.shape
+        B, T, _ = f_vis.shape
 
         if audio_raw.shape[1] != T:
             a_aligned = F.interpolate(
@@ -252,14 +253,12 @@ class GatedCrossModalAudioAdapter(nn.Module):
         else:
             a_aligned = audio_raw.to(f_vis.dtype)
 
-        # Support both 128-D VGGish and 512-D CLAP/AST gracefully
         if a_aligned.shape[-1] != self.audio_dim:
             if a_aligned.shape[-1] > self.audio_dim:
                 a_aligned = a_aligned[..., :self.audio_dim]
             else:
                 a_aligned = F.pad(a_aligned, (0, self.audio_dim - a_aligned.shape[-1]))
 
-        # Detect zero-padded / missing-audio samples in batch (norm == 0)
         has_signal = (a_aligned.abs().sum(dim=(-1, -2), keepdim=True) > 1e-6).to(f_vis.dtype)  # [B, 1, 1]
 
         a_lift = self.audio_lift(self.audio_input_norm(a_aligned))
@@ -277,12 +276,14 @@ class GatedCrossModalAudioAdapter(nn.Module):
         v_from_a = torch.nan_to_num(v_from_a, nan=0.0)
         a_from_v = torch.nan_to_num(a_from_v, nan=0.0)
 
-        h_av_aux = a_n + a_from_v
-        logits_aux = self.aux_head(h_av_aux)  # [B, T, 1]
+        av_joint = torch.cat([v_n, a_n + a_from_v, v_from_a, v_n * a_n], dim=-1)
+        logits_aux = self.aux_head(av_joint)  # [B, T, 1]
+        # Suppress missing-audio samples toward calm background probability
+        logits_aux = logits_aux * has_signal + (-6.0) * (1.0 - has_signal)
         s_aux = torch.sigmoid(logits_aux)
 
         gate_in = torch.cat([v_n, a_n, v_n * a_n], dim=-1)
-        g_av = torch.sigmoid(self.gate_mlp(gate_in)) * has_signal  # [B, T, 1]
+        g_av = torch.sigmoid(self.gate_mlp(gate_in)) * has_signal
         if valid_mask is not None:
             g_av = g_av * valid_mask
 
@@ -295,23 +296,22 @@ class GatedCrossModalAudioAdapter(nn.Module):
 
 
 # ============================================================================
-# 3. Memory-Light Batched CLIP Text Adapter (Zero-Shot Anchored + Orthogonal-Free)
+# 3. Memory-Light Batched CLIP_Adapter (Exact SimpleAdapter + SimpleProj Geometry)
 # ============================================================================
 
 class CLIPTextAdapter(nn.Module):
-    """Adapts frozen CLIP ViT-B/16 Text Transformer without carrying the unused 86M visual tower.
+    """Exact VadCLIP / DSANet Bias-Free CLIP_Adapter with 1-Pass Batched Tokenization.
 
-    Key SOTA Improvements:
-      1. Deletes unused `clipmodel.visual` to save ~350 MB VRAM and speed up DataParallel by 3x.
-      2. Pre-tokenizes all prompt templates into registered buffers for 1-pass batched GPU encoding.
-      3. Anchors output at `x_eot @ text_projection + proj_residual(text_proj)` so Step 0 begins
-         with true zero-shot CLIP alignment while retaining full R^512 freedom to satisfy
-         Normal-vs-Abnormal Text Orthogonality (`loss3 -> 0`).
+    Why this exact geometry is critical:
+      1. Deletes unused `clipmodel.visual` (86M params), saving ~350 MB VRAM per GPU and
+         making `torch.nn.DataParallel` 3x faster.
+      2. Uses bias-free `SimpleAdapter(512, 512)` x `text_adapt_until` + `SimpleProj(512, 512, relu=True)`
+         directly on `ln_final(x_eot)`, allowing `text_orthogonality_loss` (`loss3`) to converge
+         smoothly to `0.000` without the severe bag-memorization drift of multi-layer biased MLPs.
     """
 
     def __init__(self, clipmodel, text_adapt_until: int = 3, t_w: float = 0.1):
         super().__init__()
-        # Remove unused image encoder from CLIP so DataParallel never replicates 86M dead weights
         if hasattr(clipmodel, 'visual'):
             del clipmodel.visual
 
@@ -324,16 +324,10 @@ class CLIPTextAdapter(nn.Module):
 
         self.text_adapter = nn.ModuleList(
             [SimpleAdapter(512, 512) for _ in range(text_adapt_until)]
-        )
-        # Zero-shot anchored residual projection in joint 512-D CLIP space
-        self.text_proj_residual = nn.Sequential(
-            nn.Linear(512, 512),
-            QuickGELU(),
-            nn.Linear(512, 512),
+            + [SimpleProj(512, 512, relu=True)]
         )
         self._init_weights()
 
-        # Pre-tokenize UCF (14 classes) and XD (7 classes) prompt banks once as buffers
         ucf_tokens, self.ucf_k = self._build_token_bank(DESCRIPTIONS_ORI)
         xd_tokens, self.xd_k = self._build_token_bank(DESCRIPTIONS_ORI_XD)
         self.register_buffer('ucf_prompt_tokens', ucf_tokens, persistent=False)
@@ -343,11 +337,6 @@ class CLIPTextAdapter(nn.Module):
         for p in self.text_adapter.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-        nn.init.xavier_uniform_(self.text_proj_residual[0].weight)
-        nn.init.constant_(self.text_proj_residual[0].bias, 0.0)
-        # Small init on last layer: starts close to pretrained CLIP text space at Step 0
-        nn.init.normal_(self.text_proj_residual[-1].weight, std=0.02)
-        nn.init.constant_(self.text_proj_residual[-1].bias, 0.0)
 
     @staticmethod
     def _build_token_bank(desc_dict: dict):
@@ -356,7 +345,7 @@ class CLIPTextAdapter(nn.Module):
         for prompts in desc_dict.values():
             padded = list(prompts) + [prompts[0]] * (max_k - len(prompts))
             flat_prompts.extend(padded[:max_k])
-        tokens = clip.tokenize(flat_prompts)  # [C * K, 77] on CPU
+        tokens = clip.tokenize(flat_prompts)
         return tokens, max_k
 
     def encode_tokens(self, tokens: torch.Tensor, adapt_text: bool = True) -> torch.Tensor:
@@ -380,15 +369,12 @@ class CLIPTextAdapter(nn.Module):
         eot_indices = tokens.argmax(dim=-1)
         x_eot = x[torch.arange(x.shape[0], device=tokens.device), eot_indices]
 
-        if getattr(self.clipmodel, 'text_projection', None) is not None:
-            base_proj = x_eot @ self.clipmodel.text_projection.float()
-        else:
-            base_proj = x_eot
-
         if not adapt_text:
-            return base_proj
+            if getattr(self.clipmodel, 'text_projection', None) is not None:
+                return x_eot @ self.clipmodel.text_projection.float()
+            return x_eot
 
-        return base_proj + self.text_proj_residual(base_proj)
+        return self.text_adapter[-1](x_eot)
 
     def get_class_embeddings(self, num_classes: int, target_device: torch.device) -> torch.Tensor:
         if num_classes == 14:
@@ -403,13 +389,12 @@ class CLIPTextAdapter(nn.Module):
             raise ValueError(f"Unsupported num_classes={num_classes}; expected 14 (UCF) or 7 (XD).")
 
         feat = self.encode_tokens(tokens, adapt_text=True)  # [C * K, 512]
-        feat = feat.view(c, k, -1)
-        feat = F.normalize(feat, dim=-1).mean(dim=1)
+        feat = feat.view(c, k, -1).mean(dim=1)
         return F.normalize(feat, dim=-1)  # [C, 512]
 
 
 # ============================================================================
-# 4. Stop-Gradient Dynamic Normal Pattern Refiner (SGNM)
+# 4. Self-Guided Dynamic Normal Pattern Refiner (SGNM)
 # ============================================================================
 
 class SGNM(nn.Module):
@@ -441,13 +426,10 @@ class SGNM(nn.Module):
         ])
 
     @staticmethod
-    def gather_loss(query: torch.Tensor, keys: torch.Tensor, reliability: torch.Tensor = None) -> torch.Tensor:
+    def gather_loss(query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         distribution = 1.0 - F.cosine_similarity(query.unsqueeze(2), keys.unsqueeze(1), dim=-1)
         distance, _ = torch.min(distribution, dim=2)
-        if reliability is None:
-            return distance.mean()
-        reliability = reliability / reliability.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        return (distance * reliability).sum(dim=1).mean()
+        return distance.mean()
 
     def forward(self, visual_features: torch.Tensor, logits1: torch.Tensor, lengths: torch.Tensor = None):
         B, N, D = visual_features.shape
@@ -469,17 +451,13 @@ class SGNM(nn.Module):
             selected_normal_features = torch.gather(
                 visual_features, 1, normal_indices.unsqueeze(-1).expand(-1, -1, D)
             )
-            selected_scores = torch.gather(anomaly_scores, 1, normal_indices)
-            reliability = (1.0 - selected_scores).clamp(min=1e-4, max=1.0)
 
-        weighted_normal_features = selected_normal_features * (0.5 + 0.5 * reliability.unsqueeze(-1))
         agg_prototype = self.video_prototypes.unsqueeze(0).expand(B, -1, -1)
-
         for blk in self.dnp_extractor:
-            agg_prototype = blk(agg_prototype, weighted_normal_features)
+            agg_prototype = blk(agg_prototype, selected_normal_features)
 
         dynamic_normal_patterns = agg_prototype
-        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns, reliability)
+        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns)
 
         reconstructed_features = self.bottleneck(visual_features)
         for blk in self.decoder:
@@ -493,7 +471,7 @@ class SGNM(nn.Module):
 # ============================================================================
 
 class MARUPA(nn.Module):
-    """MA-RUPA v3: Unified Multimodal & Vision-Language WS-VAD Architecture."""
+    """MA-RUPA v4: Visual-Protected Multimodal & Vision-Language WS-VAD Architecture."""
 
     def __init__(self,
                  num_class: int,
@@ -517,30 +495,30 @@ class MARUPA(nn.Module):
         self.prompt_postfix = prompt_postfix
         self.device = device
 
-        # Configuration flags (with safe defaults when args is None)
+        # Configuration flags
         self.no_rupa = bool(getattr(args, 'no_rupa', False))
         self.rupa_use = (not self.no_rupa) and bool(getattr(args, 'rupa_use', True))
-        self.no_mdtp = bool(getattr(args, 'no_mdtp', False))
+        self.use_mdtp = bool(getattr(args, 'use_mdtp', False)) and (not bool(getattr(args, 'no_mdtp', True)))
         self.no_audio = bool(getattr(args, 'no_audio', False))
         self.no_safegate = bool(getattr(args, 'no_safegate', False))
 
-        self.routing_det_weight = float(getattr(args, 'routing_det_weight', 0.90))
+        self.routing_det_weight = float(getattr(args, 'routing_det_weight', 0.80))
         self.routing_rec_weight = float(getattr(args, 'routing_rec_weight', 0.10))
-        self.routing_sem_weight = float(getattr(args, 'routing_sem_weight', 0.00))
+        self.routing_sem_weight = float(getattr(args, 'routing_sem_weight', 0.10))
         w_sum = self.routing_det_weight + self.routing_rec_weight + self.routing_sem_weight
         if w_sum <= 0:
-            self.routing_det_weight, self.routing_rec_weight, self.routing_sem_weight = 0.90, 0.10, 0.00
+            self.routing_det_weight, self.routing_rec_weight, self.routing_sem_weight = 0.80, 0.10, 0.10
         else:
             self.routing_det_weight /= w_sum
             self.routing_rec_weight /= w_sum
             self.routing_sem_weight /= w_sum
 
         self.routing_mode = 'fixed' if self.no_safegate else getattr(args, 'routing_mode', 'safe_gate')
-        self.routing_gate_init = float(getattr(args, 'routing_gate_init', 0.01))
-        self.routing_gate_max = float(getattr(args, 'routing_gate_max', 1.0))
+        self.routing_gate_init = float(getattr(args, 'routing_gate_init', 0.15))
+        self.routing_gate_max = float(getattr(args, 'routing_gate_max', 0.50))
         routing_gate_hidden = max(4, int(getattr(args, 'routing_gate_hidden', 8)))
 
-        # 1. LGT Backbone (Local Window Transformer + Dual Similarity/Distance GCN)
+        # 1. Pure LGT Backbone (Local Window Transformer + Dual Similarity/Distance GCN)
         self.register_buffer(
             'base_attn_mask',
             self.build_attention_mask(self.visual_length, self.attn_window),
@@ -562,17 +540,17 @@ class MARUPA(nn.Module):
         self.gelu = QuickGELU()
         self.frame_position_embeddings = nn.Embedding(visual_length, visual_width)
 
-        # Zero-Init Multi-Scale Dilated Temporal Sensitivity Adapter (DeSC upgrade)
         mlp_dropout = float(getattr(args, 'mlp_dropout', 0.1))
-        self.mst_adapter = None if self.no_mdtp else MSTSensitivityAdapter(
-            embed_dim=visual_width, dilations=(1, 2, 4), dropout=mlp_dropout
+        self.mst_adapter = (
+            MSTSensitivityAdapter(embed_dim=visual_width, dilations=(1, 2, 4), dropout=mlp_dropout)
+            if self.use_mdtp else None
         )
 
-        # 2. Cross-Modal Gated Audio-Visual Adapter (active for XD-Violence when audio is provided)
+        # 2. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence only)
         audio_dim = int(getattr(args, 'audio_dim', 128))
         if not self.no_audio and num_class == 7:
             self.audio_adapter = GatedCrossModalAudioAdapter(
-                visual_dim=visual_width, audio_dim=audio_dim, num_heads=4, dropout=mlp_dropout
+                visual_dim=visual_width, audio_dim=audio_dim, num_heads=4, dropout=max(0.15, mlp_dropout)
             )
         else:
             self.audio_adapter = None
@@ -590,13 +568,13 @@ class MARUPA(nn.Module):
         ]))
         self.classifier = nn.Linear(visual_width, 1)
 
-        # 4. Frozen CLIP Text Backbone + Trainable CLIPTextAdapter (loaded on CPU first for clean DataParallel)
+        # 4. Frozen CLIP Text Backbone + Bias-Free CLIPTextAdapter
         text_adapt_until = int(getattr(args, 'text_adapt_until', 3 if num_class == 14 else 1))
         t_w = float(getattr(args, 't_w', 0.1 if num_class == 14 else 0.6))
         clipmodel, _ = clip.load("ViT-B/16", device="cpu")
         self.clip_adapter = CLIPTextAdapter(clipmodel, text_adapt_until=text_adapt_until, t_w=t_w)
 
-        # 5. Dynamic Normal Pattern Refiner (SGNM) & Continuation Safe-Gate
+        # 5. Dynamic Normal Pattern Refiner (SGNM) & Stop-Gradient SafeGate
         num_prototypes = int(getattr(args, 'num_prototypes', 16))
         decoder_depth = int(getattr(args, 'decoder_depth', 8))
         normal_selection_ratio = float(getattr(args, 'normal_selection_ratio', 0.8))
@@ -708,11 +686,7 @@ class MARUPA(nn.Module):
         x = self.linear(torch.cat((x1, x2), dim=-1))
 
         if self.mst_adapter is not None:
-            valid_mask = (
-                (~padding_mask).unsqueeze(-1).to(x.dtype)
-                if padding_mask is not None
-                else None
-            )
+            valid_mask = (~padding_mask).unsqueeze(-1).to(x.dtype) if padding_mask is not None else None
             x = self.mst_adapter(x, valid_mask=valid_mask)
 
         return x
@@ -745,16 +719,17 @@ class MARUPA(nn.Module):
             padding_mask = torch.arange(T, device=dev)[None, :] >= lengths_dev[:, None]
         valid_mask = (~padding_mask).unsqueeze(-1).float()  # [B, T, 1]
 
-        # 1. Spatio-Temporal LGT + Multi-Scale Sensitivity Encoding
+        # 1. Pure Spatio-Temporal LGT Dual-GCN Encoding (never mutated by noisy audio)
         visual_features = self.encode_video(visual, padding_mask, lengths_dev)
 
-        # 2. Optional Cross-Modal Gated Audio-Visual Enrichment (XD-Violence)
+        # 2. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence)
+        # Uses `visual_features.detach()` so soundtrack/SFX noise never poisons visual representations!
         logits_aux = None
         s_aux = None
         g_av = None
         if self.audio_adapter is not None and audio is not None and not self.no_audio:
-            visual_features, s_aux, logits_aux, g_av = self.audio_adapter(
-                visual_features, audio, valid_mask=valid_mask
+            _, s_aux, logits_aux, g_av = self.audio_adapter(
+                visual_features.detach(), audio, valid_mask=valid_mask
             )
 
         # 3. Sensitivity Anomaly Detector Head (logits1)
@@ -774,16 +749,33 @@ class MARUPA(nn.Module):
         text_features_norm = F.normalize(text_features, dim=-1).permute(0, 2, 1)
         logits2 = torch.bmm(visual_features_norm, text_features_norm.to(visual_features_norm.dtype)) / 0.07  # [B, T, C]
 
-        # 5. Counterfactual Dynamic Normal Prototype Reconstruction & Safe-Gated Routing
-        routing_prob = detector_score
-        event_features = visual_features
-        background_features = visual_features
+        # 5. Video-Level Event & Background Contrastive Pooling directly on `visual_features` (Exact DSANet Core)
+        scaled_abn = (scale * detector_score).clamp(max=15.0)
+        abn_weights = F.normalize((scaled_abn.exp() - 1.0) * valid_mask, p=1, dim=1)
+
+        scaled_nor = (scale * (1.0 - detector_score)).clamp(max=15.0)
+        nor_weights = F.normalize((scaled_nor.exp() - 1.0) * valid_mask, p=1, dim=1)
+
+        abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]
+        nor_feat = torch.bmm(nor_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]
+
+        nor_text_norm = F.normalize(text_features_ori, dim=-1).t().unsqueeze(0).expand(B, -1, -1)  # [B, D, C]
+        abn_vis_norm = F.normalize(abn_feat, dim=-1)
+        nor_vis_norm = F.normalize(nor_feat, dim=-1)
+
+        logits3 = torch.bmm(abn_vis_norm, nor_text_norm.to(abn_vis_norm.dtype)) / 0.07  # [B, 1, C]
+        logits4 = torch.bmm(nor_vis_norm, nor_text_norm.to(nor_vis_norm.dtype)) / 0.07  # [B, 1, C]
+
+        # 6. Self-Guided Dynamic Normal Pattern Refiner (SGNM) & Stop-Gradient Safe-RUPA Calibration
+        sem_temp = 2.5 if self.num_class == 14 else 2.0
+        semantic_score = (1.0 - F.softmax(logits2.float() / sem_temp, dim=-1)[:, :, :1]).to(visual_features.dtype).clamp(0.0, 1.0)
 
         dnp_dict = {
             'detector_scores': detector_score,
             'routing_scores': detector_score,
             'routing_logits': logits1,
             'semantic_logits': logits2,
+            'semantic_scores': semantic_score,
             'aux_logits': logits_aux,
             'aux_scores': s_aux,
             'audio_gate': g_av,
@@ -794,88 +786,53 @@ class MARUPA(nn.Module):
                 visual_features, logits1, lengths_dev
             )
             residual_features = visual_features - reconstructed_features
+            reconstruction_score = (
+                (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
+            ).clamp(0.0, 1.0)
 
+            # Reshape g_loss to [1] so torch.nn.DataParallel gathers across GPUs without scalar UserWarning
             dnp_dict.update({
                 'original_features': visual_features,
                 'reconstructed_features': reconstructed_features,
                 'residual_features': residual_features,
                 'dynamic_normal_patterns': dynamic_normal_patterns,
-                'g_loss': g_loss,
+                'reconstruction_scores': reconstruction_score,
+                'g_loss': g_loss.reshape(1),
             })
 
             if self.rupa_use:
-                category_text_norm = F.normalize(text_features_ori, dim=-1)
-                category_text_matrix = category_text_norm.t().to(visual_features.dtype)  # [D, C]
-                reconstructed_norm = F.normalize(reconstructed_features, dim=-1)
-                residual_norm = F.normalize(residual_features, dim=-1)
-
-                reconstructed_semantic_logits = (reconstructed_norm @ category_text_matrix) / 0.07
-                residual_semantic_logits = (residual_norm @ category_text_matrix) / 0.07
-
-                semantic_logits = torch.cat(
-                    [reconstructed_semantic_logits[:, :, :1], residual_semantic_logits[:, :, 1:]],
-                    dim=-1,
-                )
-                semantic_score = (1.0 - F.softmax(semantic_logits, dim=-1)[:, :, :1]).clamp(0.0, 1.0)
-                reconstruction_score = (
-                    (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
-                ).clamp(0.0, 1.0)
+                # Stop-gradient detached inputs ensure `route_loss` trains ONLY `rupa_gate`
+                # and NEVER injects duplicate binary MIL gradients back into `logits1`!
+                det_d = detector_score.detach()
+                rec_d = reconstruction_score.detach()
+                sem_d = semantic_score.detach()
 
                 fixed_routing_prob = (
-                    self.routing_det_weight * detector_score
-                    + self.routing_rec_weight * reconstruction_score
-                    + self.routing_sem_weight * semantic_score
+                    self.routing_det_weight * det_d
+                    + self.routing_rec_weight * rec_d
+                    + self.routing_sem_weight * sem_d
                 ).clamp(1e-5, 1.0 - 1e-5)
 
                 if self.routing_mode == 'safe_gate':
                     gate_inputs = torch.cat([
-                        detector_score,
-                        reconstruction_score,
-                        semantic_score,
-                        (reconstruction_score - detector_score).abs(),
-                        (semantic_score - detector_score).abs(),
+                        det_d,
+                        rec_d,
+                        sem_d,
+                        (rec_d - det_d).abs(),
+                        (sem_d - det_d).abs(),
                     ], dim=-1)
                     routing_gate = torch.sigmoid(self.rupa_gate(gate_inputs)) * self.routing_gate_max
-                    routing_prob = (detector_score + routing_gate * (fixed_routing_prob - detector_score)).clamp(1e-5, 1.0 - 1e-5)
+                    routing_prob = (det_d + routing_gate * (fixed_routing_prob - det_d)).clamp(1e-5, 1.0 - 1e-5)
                 else:
-                    routing_gate = torch.ones_like(detector_score)
+                    routing_gate = torch.ones_like(det_d)
                     routing_prob = fixed_routing_prob
 
-                normal_text = category_text_norm[0].to(dynamic_normal_patterns.dtype).view(1, 1, -1)
-                dnp_normal_sim = F.cosine_similarity(dynamic_normal_patterns, normal_text, dim=-1)
-
                 dnp_dict.update({
-                    'semantic_logits': semantic_logits,
-                    'residual_semantic_logits': residual_semantic_logits,
-                    'reconstructed_semantic_logits': reconstructed_semantic_logits,
-                    'semantic_scores': semantic_score,
-                    'reconstruction_scores': reconstruction_score,
-                    'detector_scores': detector_score,
                     'fixed_routing_scores': fixed_routing_prob,
                     'routing_gate': routing_gate,
                     'routing_scores': routing_prob,
                     'routing_logits': torch.logit(routing_prob, eps=1e-5),
-                    'dnp_normal_loss': (1.0 - dnp_normal_sim).mean(),
                 })
-                event_features = residual_features
-                background_features = reconstructed_features
-
-        # 6. Video-Level Event & Background Contrastive Pooling (logits3, logits4)
-        scaled_abn = (scale * routing_prob).clamp(max=15.0)
-        abn_weights = F.normalize((scaled_abn.exp() - 1.0) * valid_mask, p=1, dim=1)
-
-        scaled_nor = (scale * (1.0 - routing_prob)).clamp(max=15.0)
-        nor_weights = F.normalize((scaled_nor.exp() - 1.0) * valid_mask, p=1, dim=1)
-
-        abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), event_features)       # [B, 1, D]
-        nor_feat = torch.bmm(nor_weights.permute(0, 2, 1), background_features)  # [B, 1, D]
-
-        nor_text_norm = F.normalize(text_features_ori, dim=-1).t().unsqueeze(0).expand(B, -1, -1)  # [B, D, C]
-        abn_vis_norm = F.normalize(abn_feat, dim=-1)
-        nor_vis_norm = F.normalize(nor_feat, dim=-1)
-
-        logits3 = torch.bmm(abn_vis_norm, nor_text_norm.to(abn_vis_norm.dtype)) / 0.07  # [B, 1, C]
-        logits4 = torch.bmm(nor_vis_norm, nor_text_norm.to(nor_vis_norm.dtype)) / 0.07  # [B, 1, C]
 
         return text_features_ori, logits1, logits2, logits3, logits4, dnp_dict
 

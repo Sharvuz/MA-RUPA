@@ -1,7 +1,6 @@
 import os
 import random
 import subprocess
-import sys
 import time
 import numpy as np
 import torch
@@ -14,7 +13,7 @@ from utils.dataset import UCFDataset
 from utils.tools import get_prompt_text, get_batch_label, safe_load_checkpoint
 from utils.StableAdamW import StableAdamW
 from utils.losses import (
-    CLAS2, CLASM, CLASM_EVENT, RUPA_RESIDUAL_EVENT, CLASM_BKG,
+    CLAS2, CLASM, CLASM_EVENT, CLASM_BKG,
     text_orthogonality_loss, ConsistencyLoss, routing_anchor_loss,
     edge_preserving_smoothness_loss, WarmCosineScheduler, ModelEMA,
 )
@@ -134,7 +133,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
-    # Dual Decoupled Optimizers: Main (AdamW) + Prototype Refiner & SafeGate (StableAdamW)
+    # Dual Decoupled Optimizers: Main LGT+CLIP_Adapter (AdamW) + SGNM Refiner & Detached SafeGate (StableAdamW)
     refiner_params = []
     main_model_params = []
     for name, param in raw_model.named_parameters():
@@ -154,7 +153,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         weight_decay=args.weight_decay,
     )
     scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_main, T_max=max(1, args.max_epoch), eta_min=main_lr * 0.05
+        optimizer_main, T_max=max(1, args.max_epoch)
     )
 
     num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
@@ -199,18 +198,19 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         print(f"[Resume] Resumed from epoch {start_epoch}, best AUC={auc_best * 100:.2f}%", flush=True)
 
     eff_batch = normal_loader.batch_size * 2
-    print("\n" + "=" * 76, flush=True)
-    print(f"[START] MA-RUPA v3 SOTA TRAINING ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
+    print("\n" + "=" * 78, flush=True)
+    print(f"[START] MA-RUPA v4 VISUAL-PROTECTED SOTA TRAINING ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)", flush=True)
     print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} gradient steps | LR = {main_lr:.1e}", flush=True)
+    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
     print(f"  Multi-Crop : {'10-Crop Parallel Eval Active' if args.multi_crop_eval else '1-Crop Eval'}", flush=True)
-    print("=" * 76 + "\n", flush=True)
+    print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
         model.train()
         DNP_use = args.DNP_use and (not args.no_rupa)
 
-        sum_l1 = sum_l2 = sum_l3 = sum_l4 = sum_l5 = sum_route = 0.0
+        sum_l1 = sum_l2 = sum_l3 = sum_l4 = sum_l5 = sum_cons = sum_g = 0.0
         epoch_t0 = time.time()
 
         normal_iter = iter(normal_loader)
@@ -232,11 +232,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
             loss2 = CLASM(logits2, text_labels, feat_lengths, device)
             loss3 = text_orthogonality_loss(text_features)
-
-            if DNP_use and args.rupa_use:
-                loss4 = RUPA_RESIDUAL_EVENT(logits3, text_labels, feat_lengths, device)
-            else:
-                loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
+            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
 
             loss_smooth = (
@@ -252,11 +248,9 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     lengths=feat_lengths,
                 )
                 g_loss = dnp_dict['g_loss'].mean()
-                dnp_norm_loss = dnp_dict.get('dnp_normal_loss', logits1.sum() * 0.0)
-                if torch.is_tensor(dnp_norm_loss):
-                    dnp_norm_loss = dnp_norm_loss.mean()
 
-                if args.rupa_use and 'routing_logits' in dnp_dict:
+                # Detached SafeGate calibration loss: updates ONLY `rupa_gate` (zero duplicate MIL into logits1)
+                if args.rupa_use and 'routing_logits' in dnp_dict and args.loss_routing_weight > 0:
                     route_loss = CLAS2(dnp_dict['routing_logits'], text_labels, feat_lengths, device)
                     route_anchor = routing_anchor_loss(dnp_dict, feat_lengths)
                 else:
@@ -271,13 +265,13 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     + loss5 * args.loss_reconstructed_normal_weight
                     + cons_loss * args.loss_consistency_weight
                     + g_loss * args.loss_gather_weight
-                    + dnp_norm_loss * args.loss_dnp_normal_weight
                     + route_loss * args.loss_routing_weight
                     + route_anchor * args.loss_routing_anchor_weight
                     + loss_smooth * args.lambda_smooth
                 )
             else:
-                route_loss = logits1.sum() * 0.0
+                cons_loss = logits1.sum() * 0.0
+                g_loss = logits1.sum() * 0.0
                 loss = (
                     loss1
                     + loss2 * args.loss2_weight
@@ -306,22 +300,22 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             sum_l3 += loss3.item()
             sum_l4 += loss4.item()
             sum_l5 += loss5.item()
-            sum_route += route_loss.item()
+            sum_cons += cons_loss.item()
+            sum_g += g_loss.item()
 
             iter_num = i + 1
-            if iter_num == 1 or iter_num % 10 == 0 or iter_num == num_batches_per_epoch:
+            if iter_num == 1 or iter_num % 25 == 0 or iter_num == num_batches_per_epoch:
                 elapsed = max(1e-3, time.time() - epoch_t0)
                 it_s = iter_num / elapsed
                 eta_s = (num_batches_per_epoch - iter_num) / max(it_s, 1e-4)
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
-                    f"Res:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} Route:{sum_route/iter_num:.4f} | "
+                    f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )
 
-            # Optional mid-epoch peak catching
             if args.eval_interval > 0 and iter_num % args.eval_interval == 0 and iter_num < num_batches_per_epoch:
                 auc_cur, _ = test(
                     model, testloader, args.visual_length, prompt_text,
@@ -347,7 +341,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             torch.save(live_state, args.model_path)
             print(f"  [*] [NEW BEST UCF-CRIME (Live)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
 
-        # Save latest resumable checkpoint at the end of every epoch
         torch.save({
             'epoch': e,
             'model_state_dict': live_state,
@@ -359,7 +352,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             'ap': auc_best,
         }, args.checkpoint_path)
 
-        # Evaluate Polyak EMA weights from Epoch 2+ for ultra-smooth generalization
         if ema is not None and e >= 1:
             backup = ema.apply_to(model)
             print(f"--- Epoch {e+1}/{args.max_epoch} | Evaluating Polyak-EMA Weights ---", flush=True)
@@ -387,11 +379,11 @@ if __name__ == '__main__':
 
     try:
         commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-        print(f"[MA-RUPA v3 Codebase] Git Commit: {commit_hash}", flush=True)
+        print(f"[MA-RUPA v4 Codebase] Git Commit: {commit_hash}", flush=True)
     except Exception:
         pass
 
-    print(f"[MA-RUPA v3] Training UCF-Crime on device: {device}", flush=True)
+    print(f"[MA-RUPA v4] Training UCF-Crime on device: {device}", flush=True)
     setup_seed(args.seed)
     model, normal_loader, anomaly_loader, test_loader, label_map = build_ucf_components(args, device)
     train(model, normal_loader, anomaly_loader, test_loader, args, label_map, device)

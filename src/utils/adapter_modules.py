@@ -3,12 +3,13 @@ from torch import nn
 
 
 class SimpleAdapter(nn.Module):
-    """Bottleneck / Residual-ready Adapter for CLIP Transformer layers."""
+    """Lightweight bias-free CLIP Transformer layer adapter (VadCLIP / DSANet)."""
+
     def __init__(self, c_in: int, c_out: int = 768):
-        super(SimpleAdapter, self).__init__()
+        super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(c_in, c_out, bias=False),
-            nn.LeakyReLU(negative_slope=0.1, inplace=False)
+            nn.LeakyReLU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -16,13 +17,14 @@ class SimpleAdapter(nn.Module):
 
 
 class SimpleProj(nn.Module):
-    """Linear projection adapter without orthant truncation by default."""
-    def __init__(self, c_in: int, c_out: int = 768, relu: bool = False):
-        super(SimpleProj, self).__init__()
+    """Bias-free CLIP projection adapter preserving angular cone geometry."""
+
+    def __init__(self, c_in: int, c_out: int = 768, relu: bool = True):
+        super().__init__()
         if relu:
             self.fc = nn.Sequential(
                 nn.Linear(c_in, c_out, bias=False),
-                nn.LeakyReLU(negative_slope=0.1, inplace=False)
+                nn.LeakyReLU(),
             )
         else:
             self.fc = nn.Linear(c_in, c_out, bias=False)
