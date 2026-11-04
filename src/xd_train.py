@@ -340,7 +340,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
             loss2 = CLASM(logits2, text_labels, feat_lengths, device)
-            loss3 = text_orthogonality_loss(text_features)
+            loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num)
             loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
 

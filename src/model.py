@@ -436,17 +436,9 @@ class SGNM(nn.Module):
 
         with torch.no_grad():
             anomaly_scores = torch.sigmoid(logits1.squeeze(-1))
-            if lengths is not None:
-                lengths_dev = lengths.to(device=visual_features.device, dtype=torch.long).clamp(min=1, max=N)
-                valid_mask = torch.arange(N, device=visual_features.device)[None, :] < lengths_dev[:, None]
-                masked_scores = anomaly_scores.masked_fill(~valid_mask, float('inf'))
-                min_valid_length = int(lengths_dev.min().item())
-            else:
-                masked_scores = anomaly_scores
-                min_valid_length = N
-
-            num_normal_frames = max(1, min(int(N * self.normal_selection_ratio), min_valid_length))
-            _, normal_indices = torch.topk(masked_scores, k=num_normal_frames, largest=False, dim=1)
+            num_normal_frames = max(1, int(N * self.normal_selection_ratio))
+            _, indices = torch.topk(anomaly_scores, k=N, largest=False, dim=1)
+            normal_indices = indices[:, :num_normal_frames]
 
             selected_normal_features = torch.gather(
                 visual_features, 1, normal_indices.unsqueeze(-1).expand(-1, -1, D)
@@ -514,7 +506,7 @@ class MARUPA(nn.Module):
             self.routing_sem_weight /= w_sum
 
         self.routing_mode = 'fixed' if self.no_safegate else getattr(args, 'routing_mode', 'safe_gate')
-        self.routing_gate_init = float(getattr(args, 'routing_gate_init', 0.15))
+        self.routing_gate_init = float(getattr(args, 'routing_gate_init', 0.01))
         self.routing_gate_max = float(getattr(args, 'routing_gate_max', 0.50))
         routing_gate_hidden = max(4, int(getattr(args, 'routing_gate_hidden', 8)))
 
@@ -673,7 +665,7 @@ class MARUPA(nn.Module):
         )
 
         x = (images + pos_emb).permute(1, 0, 2)  # [T, B, D]
-        x = self.temporal(x, attn_mask=attn_mask, padding_mask=padding_mask)
+        x = self.temporal(x, attn_mask=attn_mask, padding_mask=None)
         x = x.permute(1, 0, 2)  # [B, T, D]
 
         adj = self.adj4(x, lengths)
@@ -750,11 +742,11 @@ class MARUPA(nn.Module):
         logits2 = torch.bmm(visual_features_norm, text_features_norm.to(visual_features_norm.dtype)) / 0.07  # [B, T, C]
 
         # 5. Video-Level Event & Background Contrastive Pooling directly on `visual_features` (Exact DSANet Core)
-        scaled_abn = (scale * detector_score).clamp(max=15.0)
-        abn_weights = F.normalize((scaled_abn.exp() - 1.0) * valid_mask, p=1, dim=1)
+        abn_logits = (scale * detector_score).exp() - 1.0
+        abn_weights = F.normalize(abn_logits, p=1, dim=1)
 
-        scaled_nor = (scale * (1.0 - detector_score)).clamp(max=15.0)
-        nor_weights = F.normalize((scaled_nor.exp() - 1.0) * valid_mask, p=1, dim=1)
+        nor_logits = (scale * (1.0 - detector_score)).exp() - 1.0
+        nor_weights = F.normalize(nor_logits, p=1, dim=1)
 
         abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]
         nor_feat = torch.bmm(nor_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]

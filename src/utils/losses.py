@@ -169,9 +169,25 @@ def CLASM_BKG(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
     return -torch.mean(torch.sum(bkg_target * F.log_softmax(instance_logits, dim=1), dim=1))
 
 
-def text_orthogonality_loss(text_features: torch.Tensor) -> torch.Tensor:
-    """Enforces strict orthogonality between normalized 'Normal' prompt and all Anomaly prompts."""
+def text_orthogonality_loss(text_features: torch.Tensor, num_classes: int = None) -> torch.Tensor:
+    """Enforces strict orthogonality between normalized 'Normal' prompt and all Anomaly prompts.
+
+    Handles `torch.nn.DataParallel` multi-GPU gathering automatically: when `DataParallel`
+    concatenates `[C, 512]` from `G` GPUs into `[G * C, 512]`, slices the first `[C, 512]`
+    replica so GPU 1's 'Normal' vector is never mistaken for an Anomaly class.
+    """
     t_norm = F.normalize(text_features.float(), dim=-1)
+    if num_classes is not None and t_norm.shape[0] > num_classes:
+        t_norm = t_norm[:num_classes]
+    elif t_norm.shape[0] > 1:
+        # Auto-detect DataParallel replica boundary where GPU 1's Normal prompt repeats GPU 0's Normal prompt
+        cos_with_normal = t_norm[1:] @ t_norm[0]
+        dup_idx = torch.where(cos_with_normal > 0.9995)[0]
+        if dup_idx.numel() > 0:
+            c_inferred = int(dup_idx[0].item()) + 1
+            if c_inferred > 1 and t_norm.shape[0] % c_inferred == 0:
+                t_norm = t_norm[:c_inferred]
+
     t_normal = t_norm[0]     # [D]
     t_abn = t_norm[1:]       # [C-1, D]
     return torch.abs(t_abn @ t_normal).mean()

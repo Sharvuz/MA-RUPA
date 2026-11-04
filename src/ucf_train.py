@@ -158,6 +158,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
     total_iters = max(1, args.max_epoch * num_batches_per_epoch)
+    total_iters_refiner = max(1, args.max_epoch * (len(normal_loader) + len(anomaly_loader)))
 
     optimizer_refiner = StableAdamW(
         [{'params': refiner_params}],
@@ -171,8 +172,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         optimizer_refiner,
         base_value=refiner_lr,
         final_value=refiner_lr * 0.1,
-        total_iters=total_iters,
-        warmup_iters=min(100, max(0, total_iters - 1)),
+        total_iters=total_iters_refiner,
+        warmup_iters=min(100, max(0, total_iters_refiner - 1)),
     )
 
     ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
@@ -180,11 +181,13 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     prompt_text = get_prompt_text(label_map)
 
     auc_best = -1.0
+    best_live_state = None
     start_epoch = 0
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
+        best_live_state = unwrap_compact_state_dict(model)
         if 'optimizer_state_dict' in checkpoint:
             optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'optimizer_refiner_state_dict' in checkpoint:
@@ -231,7 +234,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
             loss2 = CLASM(logits2, text_labels, feat_lengths, device)
-            loss3 = text_orthogonality_loss(text_features)
+            loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num)
             loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
 
@@ -323,8 +326,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 )
                 if auc_cur > auc_best:
                     auc_best = auc_cur
-                    state = unwrap_compact_state_dict(model)
-                    torch.save(state, args.model_path)
+                    best_live_state = unwrap_compact_state_dict(model)
+                    torch.save(best_live_state, args.model_path)
                     print(f"  [*] [NEW BEST UCF-CRIME] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
                 model.train()
 
@@ -338,12 +341,13 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         live_state = unwrap_compact_state_dict(model)
         if auc_live > auc_best:
             auc_best = auc_live
-            torch.save(live_state, args.model_path)
+            best_live_state = live_state
+            torch.save(best_live_state, args.model_path)
             print(f"  [*] [NEW BEST UCF-CRIME (Live)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
 
         torch.save({
             'epoch': e,
-            'model_state_dict': live_state,
+            'model_state_dict': best_live_state if best_live_state is not None else live_state,
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
             'scheduler_main_state_dict': scheduler_main.state_dict(),
@@ -365,6 +369,10 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 torch.save(ema_state, args.model_path)
                 print(f"  [*] [NEW BEST UCF-CRIME (EMA)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
             ema.restore(model, backup)
+
+        # Anchor next epoch to the best-generalizing live checkpoint (Exact DSANet eb335b2 Continuation Principle)
+        if best_live_state is not None:
+            load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
         print("", flush=True)
 
     print(f"[FINISH] UCF-Crime Training Complete! Best ROC-AUC: {auc_best * 100:.2f}%", flush=True)

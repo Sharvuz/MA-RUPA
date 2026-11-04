@@ -212,16 +212,17 @@ print(f"🎯 Multi-Crop Check: UCF test video có {ucf_crops_found}/10 crops | "
       f"XD test video có {xd_crops_found} crops (tối đa 10).")""")
 
     # Cell 4: UCF-Crime Markdown
-    add_md(r"""## 3. Huấn luyện SOTA trên UCF-Crime (Dual GPU Tesla T4 | Batch Size 32 = 500 Steps/Epoch)
+    add_md(r"""## 3. Huấn luyện SOTA trên UCF-Crime (Dual GPU Tesla T4 | Batch Size 64 = 250 Steps/Epoch)
 
 * **Mục tiêu:** **$\ge 89.0\%$ Frame-level ROC-AUC** (kỳ vọng **$89.6\% - 90.3\%$** với 10-Crop Parallel Evaluation).
 * **Cấu hình cân bằng toán học:**
-  * `Batch Size = 32` (`16 Normal + 16 Abnormal` đan xen đều trên 2 GPU, cung cấp đúng `500` bước cập nhật gradient/epoch tại `LR = 7e-5`).
-  * Cân bằng chính xác `1.0 * ConsistencyLoss` + `1.0 * GatherLoss` + `1.0 * CLASM_EVENT` + `1.0 * CLASM_BKG` + `1.1 * CLASM` + `1.0 * Orthogonality`, giữ `MIL` hội tụ lành mạnh quanh `0.03` thay vì suy biến về `0.0000`.
+  * `Batch Size = 64` (`32 Normal + 32 Abnormal` đan xen đều trên 2 GPU, cung cấp đúng `250` bước cập nhật gradient/epoch tại `LR = 7e-5`).
+  * **SGNM 204-Snippet Full-Bag Prototype Selection & Multi-GPU Orthogonality Deduplication:** Đảm bảo chọn đủ `204/256` đoạn chuẩn mỗi video (không bị cắt cụt theo video ngắn nhất trong batch) và loại bỏ bản sao vector `"normal"` của GPU thứ 2 khi tính `text_orthogonality_loss` (`Orth -> 0.0000` thay vì kẹt ở `1/27 = 0.0370`).
+  * **Epoch-End Best-Checkpoint Rollback Anchor:** Cuối mỗi epoch, mô hình tự động neo lại trọng số có AUC tổng quát hóa cao nhất trước khi bước sang epoch tiếp theo với learning rate giảm dần theo Cosine.
   * **10-Crop Parallel Evaluation (`__0..__9`):** Đánh giá đồng thời cả 10 góc cắt không gian trên toàn bộ 290 video test.""")
 
     # Cell 5: Train UCF-Crime Code
-    add_code("""# ========================= 3. TRAIN UCF-CRIME (MA-RUPA v4 | BATCH 32 | LR 7e-5 | 500 ITERS/EP) =========================
+    add_code("""# ========================= 3. TRAIN UCF-CRIME (MA-RUPA v4 | BATCH 64 | LR 7e-5 | 250 ITERS/EP) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -244,7 +245,7 @@ cmd_train_ucf = [
     "--gt-path", "list/gt_ucf.npy",
     "--gt-segment-path", "list/gt_segment_ucf.npy",
     "--gt-label-path", "list/gt_label_ucf.npy",
-    "--batch-size", "32",
+    "--batch-size", "64",
     "--lr", "7e-5",
     "--max-epoch", "10",
     "--visual-layers", "2",
@@ -254,20 +255,21 @@ cmd_train_ucf = [
     "--num-prototypes", "16",
     "--text-adapt-until", "3",
     "--t-w", "0.1",
+    "--routing-gate-init", "0.01",
     "--loss2-weight", "1.1",
     "--loss-sep-weight", "1.0",
     "--loss-residual-weight", "1.0",
     "--loss-reconstructed-normal-weight", "1.0",
     "--loss-consistency-weight", "1.0",
     "--loss-gather-weight", "1.0",
-    "--loss-routing-weight", "0.20",
+    "--loss-routing-weight", "0.05",
     "--loss-routing-anchor-weight", "0.05",
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
-    "--collab-alpha", "0.12",
+    "--collab-alpha", "0.05",
     "--smooth-eval", "True",
-    "--smooth-sigma", "0.80",
-    "--eval-interval", "100",
+    "--smooth-sigma", "0.50",
+    "--eval-interval", "50",
     "--use-ema", "True",
     "--seed", "234",
     "--model-path", str(ucf_model_path),
@@ -302,9 +304,9 @@ subprocess.run([
     "--model-path", str(ucf_model_path),
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
-    "--collab-alpha", "0.12",
+    "--collab-alpha", "0.05",
     "--smooth-eval", "True",
-    "--smooth-sigma", "0.80",
+    "--smooth-sigma", "0.50",
 ], cwd=REPO_DIR, check=True)
 
 subprocess.run([

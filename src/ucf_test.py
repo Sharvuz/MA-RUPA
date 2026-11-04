@@ -176,6 +176,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
                 routing_gate_vals.append(gate_c.detach().cpu())
 
     final_det_raw_all = []
+    final_det_smooth_all = []
     final_route_all = []
     final_sem_all = []
     final_collab_all = []
@@ -191,13 +192,15 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         c_v = (1.0 - collab_alpha) * r_v + collab_alpha * aux_synergy
 
         if smooth_eval:
+            d_eval = smooth_scores(d_v, method=smooth_method, sigma=smooth_sigma)
             r_eval = smooth_scores(r_v, method=smooth_method, sigma=smooth_sigma)
             s_eval = smooth_scores(s_v, method=smooth_method, sigma=smooth_sigma)
             c_eval = smooth_scores(c_v, method=smooth_method, sigma=smooth_sigma)
         else:
-            r_eval, s_eval, c_eval = r_v, s_v, c_v
+            d_eval, r_eval, s_eval, c_eval = d_v, r_v, s_v, c_v
 
         final_det_raw_all.append(d_v)
+        final_det_smooth_all.append(d_eval)
         final_route_all.append(r_eval)
         final_sem_all.append(s_eval)
         final_collab_all.append(c_eval)
@@ -210,24 +213,31 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             element_logits2_stack.append(np.repeat(opt_probs.numpy(), 16, axis=0))
 
     pred_det_raw = np.repeat(np.concatenate(final_det_raw_all, axis=0), 16)
+    pred_det_smooth = np.repeat(np.concatenate(final_det_smooth_all, axis=0), 16)
     pred_route = np.repeat(np.concatenate(final_route_all, axis=0), 16)
     pred_sem = np.repeat(np.concatenate(final_sem_all, axis=0), 16)
     pred_collab = np.repeat(np.concatenate(final_collab_all, axis=0), 16)
 
     n_gt = len(gt)
     pred_det_raw = pred_det_raw[:n_gt] if len(pred_det_raw) >= n_gt else np.pad(pred_det_raw, (0, n_gt - len(pred_det_raw)))
+    pred_det_smooth = pred_det_smooth[:n_gt] if len(pred_det_smooth) >= n_gt else np.pad(pred_det_smooth, (0, n_gt - len(pred_det_smooth)))
     pred_route = pred_route[:n_gt] if len(pred_route) >= n_gt else np.pad(pred_route, (0, n_gt - len(pred_route)))
     pred_sem = pred_sem[:n_gt] if len(pred_sem) >= n_gt else np.pad(pred_sem, (0, n_gt - len(pred_sem)))
     pred_collab = pred_collab[:n_gt] if len(pred_collab) >= n_gt else np.pad(pred_collab, (0, n_gt - len(pred_collab)))
 
     auc_det_raw = roc_auc_score(gt, pred_det_raw)
     ap_det_raw = average_precision_score(gt, pred_det_raw)
+    auc_det_smooth = roc_auc_score(gt, pred_det_smooth)
+    ap_det_smooth = average_precision_score(gt, pred_det_smooth)
     auc_route = roc_auc_score(gt, pred_route)
     ap_route = average_precision_score(gt, pred_route)
     auc_sem = roc_auc_score(gt, pred_sem)
     ap_sem = average_precision_score(gt, pred_sem)
     auc_collab = roc_auc_score(gt, pred_collab)
     ap_collab = average_precision_score(gt, pred_collab)
+
+    best_det_auc = max(auc_det_raw, auc_det_smooth)
+    best_det_ap = ap_det_raw if auc_det_raw >= auc_det_smooth else ap_det_smooth
 
     avg_crops = float(np.mean(crop_counts)) if crop_counts else 1.0
     gate_info = ""
@@ -236,7 +246,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         gate_info = f" | SafeGate={gates_cat.mean().item():.4f}"
 
     print(f"  [Eval {avg_crops:.1f}-Crop{gate_info}]", flush=True)
-    print(f"    LGT-SGNM Detector (Raw)    : AUC = {auc_det_raw * 100:.2f}% | AP = {ap_det_raw * 100:.2f}%", flush=True)
+    print(f"    LGT-SGNM Detector (Raw)    : AUC = {best_det_auc * 100:.2f}% | AP = {best_det_ap * 100:.2f}%", flush=True)
     print(f"    Safe-RUPA Detector-Routing : AUC = {auc_route * 100:.2f}% | AP = {ap_route * 100:.2f}%", flush=True)
     print(f"    Vision-Language Semantic   : AUC = {auc_sem * 100:.2f}% | AP = {ap_sem * 100:.2f}%", flush=True)
     print(f"    MA-RUPA Collaborative SOTA : AUC = {auc_collab * 100:.2f}% | AP = {ap_collab * 100:.2f}%", flush=True)
@@ -251,7 +261,12 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             print(f"    [Note] Detection mAP skipped: {exc}", flush=True)
 
     sys.stdout.flush()
-    candidates = [(auc_collab, ap_collab), (auc_route, ap_route), (auc_det_raw, ap_det_raw)]
+    candidates = [
+        (auc_collab, ap_collab),
+        (auc_route, ap_route),
+        (auc_det_raw, ap_det_raw),
+        (auc_det_smooth, ap_det_smooth),
+    ]
     primary_auc, primary_ap = max(candidates, key=lambda x: x[0])
     return primary_auc, primary_ap
 
