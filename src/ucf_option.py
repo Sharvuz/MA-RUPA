@@ -82,8 +82,8 @@ parser.add_argument('--loss-gather-weight', '--lambda-gather', dest='loss_gather
 parser.add_argument('--loss-dnp-normal-weight', default=0.0, type=float)
 parser.add_argument('--loss-routing-weight', default=0.05, type=float, help='Detached SafeGate calibration MIL weight')
 parser.add_argument('--loss-routing-anchor-weight', '--loss_routing_anchor_weight', dest='loss_routing_anchor_weight', default=0.05, type=float)
-parser.add_argument('--lambda-iam', '--loss-iam-weight', dest='lambda_iam', default=0.40, type=float, help='LAS-VAD Intention Awareness Mechanism (IAM) loss weight')
-parser.add_argument('--lambda-acc', '--loss-acc-weight', dest='lambda_acc', default=0.30, type=float, help='LAS-VAD Anomaly-Connected Components (ACC) pseudo-label loss weight')
+parser.add_argument('--lambda-iam', '--loss-iam-weight', dest='lambda_iam', default=0.10, type=float, help='LAS-VAD Intention Awareness Mechanism (IAM) loss weight')
+parser.add_argument('--lambda-acc', '--loss-acc-weight', dest='lambda_acc', default=0.10, type=float, help='LAS-VAD Anomaly-Connected Components (ACC) pseudo-label loss weight')
 parser.add_argument('--lambda-smooth', default=0.0, type=float)
 
 # Dataset & Checkpoints

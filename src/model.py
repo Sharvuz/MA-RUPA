@@ -1081,8 +1081,8 @@ class MARUPA(nn.Module):
 
         iam_dict = None
         if self.iam_module is not None:
-            # Visual-protected input (0.15 gentle gradient + 0.85 detached) prevents gradient conflict with LGT
-            f_iam_in = 0.15 * visual_features + 0.85 * visual_features.detach()
+            # 100% stop-gradient: IAM acts as a pure read-only intention probe with zero gradient leakage into visual backbone
+            f_iam_in = visual_features.detach()
             iam_dict = self.iam_module(f_iam_in, valid_mask=valid_mask, sem_temp=sem_temp)
 
         acc_dict = None
@@ -1151,23 +1151,7 @@ class MARUPA(nn.Module):
                 det_d = detector_score.detach()
                 rec_d = reconstruction_score.detach()
                 sem_d = semantic_score.detach()
-
-                # Incorporate ACC segment consolidation & IAM kinematic continuity into detached target
-                if acc_dict is not None:
-                    acc_d = acc_dict['acc_scores'].detach()
-                    det_anchor = 0.85 * det_d + 0.15 * acc_d
-                else:
-                    det_anchor = det_d
-
-                if iam_dict is not None:
-                    kin_c = iam_dict['kin_continuity'].detach()
-                    # Suppress isolated 1-frame high-jerk glitches when semantic score is low
-                    glitch_damp = torch.where(
-                        (det_d > 0.70) & (sem_d < 0.35),
-                        0.75 + 0.25 * kin_c,
-                        torch.ones_like(kin_c),
-                    )
-                    det_anchor = (det_anchor * glitch_damp).clamp(1e-5, 1.0 - 1e-5)
+                det_anchor = det_d
 
                 fixed_routing_prob = (
                     self.routing_det_weight * det_anchor

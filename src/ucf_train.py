@@ -398,9 +398,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         if best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
-                for pg in optimizer_main.param_groups:
-                    pg['lr'] = max(pg['lr'] * 0.75, main_lr * 0.05)
-                print(f"  [Rollback-Damp] Restored best checkpoint (AUC={auc_best*100:.2f}%) & damped LR -> {optimizer_main.param_groups[0]['lr']:.2e}", flush=True)
+                print(f"  [Rollback] Restored best checkpoint (AUC={auc_best*100:.2f}%) without LR penalty", flush=True)
         print("", flush=True)
 
     print(f"[FINISH] UCF-Crime Training Complete! Best ROC-AUC: {auc_best * 100:.2f}%", flush=True)
