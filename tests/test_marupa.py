@@ -12,6 +12,8 @@ from model import (
     MSTSensitivityAdapter,
     GatedCrossModalAudioAdapter,
     CLIPTextAdapter,
+    IntentionAwarenessModule,
+    AnomalyConnectedComponentModule,
     SGNM,
     MARUPA,
     DSANet,
@@ -232,11 +234,44 @@ def test_ablations_and_checkpoint_loading():
     print("  Ablations & compact checkpoint round-trip passed!")
 
 
+def test_las_vad_iam_and_acc_modules():
+    print("Testing LAS-VAD IntentionAwarenessModule (IAM) & AnomalyConnectedComponentModule (ACC)...")
+    B, T, D, C = 2, 32, 512, 14
+    valid_mask = torch.ones(B, T, 1)
+    valid_mask[1, 20:] = 0.0
+    lengths = torch.tensor([32, 20])
+
+    # 1. IntentionAwarenessModule (Position X_p, Velocity X_v, Acceleration X_a + Prototypes Z)
+    iam = IntentionAwarenessModule(embed_dim=D, num_classes=C, momentum=0.10, dropout=0.0)
+    iam.train()
+    f_vis = torch.randn(B, T, D, requires_grad=True)
+    proto_before = iam.intention_prototypes.clone()
+    iam_out = iam(f_vis, valid_mask=valid_mask, sem_temp=2.5)
+    assert iam_out['iam_logits'].shape == (B, T, C)
+    assert iam_out['iam_scores'].shape == (B, T, 1)
+    assert iam_out['kin_continuity'].shape == (B, T, 1)
+    assert not torch.allclose(iam.intention_prototypes, proto_before), "IAM prototypes must momentum-update during train!"
+    iam_out['iam_logits'].mean().backward()
+    assert f_vis.grad is not None and torch.isfinite(f_vis.grad).all()
+
+    # 2. AnomalyConnectedComponentModule (Cross-Modal Affinity Rectification & Boolean Graph Closure)
+    acc = AnomalyConnectedComponentModule(eta=0.5, tau=0.85, propagation_steps=4)
+    logits2 = torch.randn(B, T, C)
+    det_scores = torch.sigmoid(torch.randn(B, T, 1))
+    acc_out = acc(f_vis.detach(), logits2, det_scores, lengths=lengths, sem_temp=2.5)
+    assert acc_out['acc_pseudo_labels'].shape == (B, T, C)
+    assert acc_out['acc_scores'].shape == (B, T, 1)
+    assert acc_out['acc_adj'].shape == (B, T, T)
+    assert (acc_out['acc_scores'] >= 0.0).all() and (acc_out['acc_scores'] <= 1.0).all()
+    print("  LAS-VAD IAM & ACC modules passed!")
+
+
 if __name__ == '__main__':
     test_mst_sensitivity_adapter_zero_init()
     test_gated_cross_modal_audio_adapter()
     test_sgnm_prototype_refiner()
+    test_las_vad_iam_and_acc_modules()
     test_marupa_v4_ucf_and_xd_visual_protection()
     test_multicrop_discovery_and_ram_cache()
     test_ablations_and_checkpoint_loading()
-    print("\n[SUCCESS] ALL MA-RUPA v4 ARCHITECTURE TESTS PASSED!")
+    print("\n[SUCCESS] ALL MA-RUPA v5 (LAS-VAD CONVERGENCE) ARCHITECTURE TESTS PASSED!")

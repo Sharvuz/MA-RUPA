@@ -251,16 +251,24 @@ def edge_preserving_smoothness_loss(scores: torch.Tensor, lengths: torch.Tensor,
 
 def audio_guided_mil_loss(aux_logits: torch.Tensor, labels: torch.Tensor,
                           lengths: torch.Tensor, topk_ratio: int = 16,
-                          normal_fa_weight: float = 0.50) -> torch.Tensor:
-    """Trains the Decoupled Cross-Modal Audio-Visual Branch with MIL + Normal Acoustic Suppression.
+                          normal_fa_weight: float = 0.50,
+                          aux_sem_logits: torch.Tensor = None) -> torch.Tensor:
+    """Trains the Decoupled Cross-Modal Audio-Visual Branch with MIL + Semantic + Normal Suppression.
 
     On XD-Violence, Normal movie/sports clips (`label_A`, e.g., The Bourne Ultimatum) often contain
     loud soundtrack drums, cheering, or dramatic SFX. Explicitly penalizing the top-8 acoustic peaks
     on Normal bags prevents false-alarm precision collapse while keeping visual features 100% pure.
+    When `aux_sem_logits` is provided (MA-RUPA v5 LAS-VAD), also aligns audio-visual features with
+    the 7 CLIP+AAT semantic classes via top-k multi-class MIL (`CLASM`).
     """
     if aux_logits is None:
         return torch.tensor(0.0)
-    mil_loss = CLAS2(aux_logits, labels, lengths, device=aux_logits.device, topk_ratio=topk_ratio)
+    dev = aux_logits.device
+    mil_loss = CLAS2(aux_logits, labels, lengths, device=dev, topk_ratio=topk_ratio)
+
+    if aux_sem_logits is not None:
+        sem_loss = CLASM(aux_sem_logits, labels, lengths, device=dev, topk_ratio=topk_ratio)
+        mil_loss = mil_loss + 0.50 * sem_loss
 
     normal_bag_mask = labels[:, 0] > 0.5
     if torch.any(normal_bag_mask):
@@ -276,3 +284,89 @@ def audio_guided_mil_loss(aux_logits: torch.Tensor, labels: torch.Tensor,
         return mil_loss + normal_fa_weight * fa_loss
 
     return mil_loss
+
+
+def iam_intention_loss(dnp_dict: dict, labels: torch.Tensor, lengths: torch.Tensor,
+                       device: torch.device = None,
+                       iam_prototypes: torch.Tensor = None) -> torch.Tensor:
+    """LAS-VAD Intention Awareness Mechanism Loss (Sec. 3.2, Eq. 10-11).
+
+    Combines:
+      1. Top-k Multi-Class Intention MIL (`CLASM` on `iam_logits`) so intention prototypes
+         discriminate behavioral trajectories (Velocity X_v & Acceleration X_a).
+      2. Cross-Intention Contrastive Regularization (`L_cst`, Eq. 11) enforcing inter-prototype
+         diversity across all C intention classes.
+      3. Normal-Bag Kinematic False-Alarm Suppression penalizing isolated high-jerk spikes on
+         Normal videos (`labels[:, 0] > 0.5`).
+    """
+    if 'iam_logits' not in dnp_dict or dnp_dict['iam_logits'] is None:
+        return torch.tensor(0.0, device=device)
+
+    iam_logits = dnp_dict['iam_logits']
+    dev = iam_logits.device if device is None else device
+    loss_iam = CLASM(iam_logits, labels, lengths, device=dev)
+
+    # Cross-Intention Prototype Diversity (LAS-VAD Eq. 11)
+    if iam_prototypes is not None:
+        num_c = iam_logits.shape[-1]
+        z = F.normalize(iam_prototypes.float(), dim=-1)
+        if z.shape[0] > num_c:
+            z = z[:num_c]
+        sim = z @ z.t()
+        eye_mask = torch.eye(z.shape[0], dtype=torch.bool, device=z.device)
+        loss_cst = F.relu(sim[~eye_mask]).mean() + torch.abs(z[1:] @ z[0]).mean()
+        loss_iam = loss_iam + 0.25 * loss_cst
+
+    # Normal-Bag Kinematic Jerk Spike Suppression
+    normal_bag_mask = labels[:, 0] > 0.5
+    if torch.any(normal_bag_mask) and 'iam_scores' in dnp_dict and dnp_dict['iam_scores'] is not None:
+        iam_s_norm = dnp_dict['iam_scores'][normal_bag_mask].float().squeeze(-1)
+        lens_norm = lengths[normal_bag_mask]
+        T = iam_s_norm.shape[1]
+        peaks = []
+        for i in range(iam_s_norm.shape[0]):
+            l_i = max(1, min(int(lens_norm[i]), T))
+            k_i = max(1, min(4, l_i))
+            peaks.append(torch.topk(iam_s_norm[i, :l_i], k=k_i).values.mean())
+        loss_iam = loss_iam + 0.35 * torch.stack(peaks).mean()
+
+    return loss_iam
+
+
+def acc_pseudo_label_loss(dnp_dict: dict, lengths: torch.Tensor,
+                          logits1: torch.Tensor = None) -> torch.Tensor:
+    """LAS-VAD Anomaly-Connected Component Pseudo-Label & Agnostic Consistency Loss (Eq. 6 & Eq. 8).
+
+    Combines:
+      1. `L_aux` (Eq. 6): Valid-masked L1 distance between ACC graph-propagated pseudo-labels `g`
+         (`acc_pseudo_labels.detach()`) and fine-grained consensus probabilities `p^f`
+         (`fine_grained_probs`), enforcing intra-component temporal completeness.
+      2. `L_reg` (Eq. 8): Agnostic-aware consistency `|1 - p^f_{i,0} - p^b_{i,1}|` aligning the
+         fine-grained non-normal probability with the binary detector probability `p^b`.
+    """
+    if 'acc_pseudo_labels' not in dnp_dict or 'fine_grained_probs' not in dnp_dict:
+        dev = logits1.device if logits1 is not None else None
+        return torch.tensor(0.0, device=dev)
+
+    g = dnp_dict['acc_pseudo_labels'].detach().float()   # [B, T, C]
+    p_f = dnp_dict['fine_grained_probs'].float()         # [B, T, C]
+    B, T, _ = p_f.shape
+    dev = p_f.device
+    valid_mask = torch.arange(T, device=dev)[None, :] < lengths.to(dev)[:, None]
+    if not torch.any(valid_mask):
+        return p_f.sum() * 0.0
+
+    # Eq. (6): L_aux = (1 / T_valid) * sum |g_i - p^f_i|_1
+    l_aux = F.l1_loss(p_f[valid_mask], g[valid_mask], reduction='mean')
+
+    # Eq. (8): L_reg = (1 / T_valid) * sum |1 - p^f_{i,0} - p^b_{i,1}|
+    if logits1 is not None:
+        p_b_abn = torch.sigmoid(logits1.float().squeeze(-1))
+    elif 'detector_scores' in dnp_dict and dnp_dict['detector_scores'] is not None:
+        p_b_abn = dnp_dict['detector_scores'].float().squeeze(-1)
+    else:
+        return l_aux
+
+    p_f_abn = (1.0 - p_f[:, :, 0]).clamp(0.0, 1.0)
+    l_reg = F.l1_loss(p_f_abn[valid_mask], p_b_abn[valid_mask], reduction='mean')
+    return l_aux + 0.50 * l_reg

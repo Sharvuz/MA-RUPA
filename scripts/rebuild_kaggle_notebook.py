@@ -56,15 +56,15 @@ def build_notebook():
         })
 
     # Cell 1: Overview
-    add_md(r"""# 🔬 MA-RUPA v4: Visual-Protected Multimodal & Prototype-Consistent SOTA WS-VAD
-### Dual Tesla T4 GPUs | UCF-Crime ($\ge 89.0\%$ ROC-AUC) & XD-Violence ($\ge 87.0\%$ AP)
+    add_md(r"""# 🔬 MA-RUPA v5 (LAS-VAD Convergence): Intention-Aware & Anomaly-Connected SOTA WS-VAD
+### Dual Tesla T4 GPUs | UCF-Crime ($\ge 89.2\%$ ROC-AUC) & XD-Violence ($\ge 86.5\%$ AP)
 
-Kiến trúc **MA-RUPA v4** khắc phục triệt để 5 nút thắt toán học thực nghiệm từ phiên bản v3 để bứt phá ngưỡng SOTA trên cả hai tập chuẩn:
-1. **Cân bằng Tự giám sát Prototype Consistency $1.0\times$ (`ConsistencyLoss` + `GatherLoss`):** Khôi phục lực neo $\mathcal{L}_{\text{cons}}(\sigma(\text{logits}_1), e_{\text{rec}}) = 1.0$ và tách stop-gradient cho `SafeGate` (`routing_logits`), triệt tiêu hoàn toàn hiện tượng bão hòa/học vẹt `MIL -> 0.0000` ở Epoch 4–10.
-2. **Bảo vệ Tuyệt đối Đặc trưng Thị giác (`Visual-Protected Decoupled Audio-Visual Branch`):** Nhánh `GatedCrossModalAudioAdapter` trên XD-Violence hoạt động trên `visual_features.detach()` kết hợp cổng đồng thuận thị giác - ngữ nghĩa (`Visual-Semantic Concordance Gate`), chặn đứng 100% nhiễu nhạc nền phim hành động bình thường (như *Bourne Ultimatum*) lọt vào bộ dò thị giác LGT-SGNM, đồng thời kích hoạt cộng hưởng âm thanh súng nổ/va chạm thực sự.
-3. **Canonical Concept Prompts & Bias-Free `SimpleProj` (`CLIPTextAdapter`):** Loại bỏ tiền tố chung gây loãng góc cosine, đưa $L_{\text{orth}}(\mathbf{t}_{\text{normal}}, \mathbf{t}_{\text{abn}}) \to 0.0000$ sạch hoàn toàn và giữ vững độ phân tách ngữ nghĩa suốt 10 Epochs.
-4. **Khôi phục `logits2` (`CLASM`) & Hợp nhất Nhiệt độ Không Biến dạng Phân vị:** Giữ nguyên phân phối xác suất hậu nghiệm đa lớp có giám sát để định vị biên thời gian (`Localization Avg mAP` tăng gấp $2\times$), thay thế hoàn toàn phép kéo giãn phân vị toàn cục gây méo thứ hạng ROC/PR.
-5. **Chuẩn Phân phối Batch & Multi-Crop Song song:** `Batch Size = 32` (`16N + 16A`, `500` bước/epoch, `LR = 7e-5`) cho **UCF-Crime (10-Crop Eval)** và Single Natural Shuffled `DataLoader` `Batch Size = 64` (`618` bước/epoch trên đủ `39,540` crops, `LR = 1e-5`, `Audio LR = 3e-5`) cho **XD-Violence (5-Crop Multimodal Eval)**.""")
+Kiến trúc **MA-RUPA v5** kế thừa nền tảng **88.34% AUC (`ucf-sota-88.34`)** và tích hợp 3 đột phá cốt lõi từ bài báo **LAS-VAD** (*Weakly Supervised Video Anomaly Detection with Anomaly-Connected Components and Intention Reasoning*, Wang & Zhao, arXiv:2603.00550v1):
+1. **Anomaly Attribute Clues (`AAT` + Canonical Concept Anchors):** Bổ sung đặc trưng cảm quan vật lý (*bright flash, flying debris, thick black smoke, flames, rapid aggressive brawl*) kết hợp neo khái niệm chuẩn trong `CLIPTextAdapter`, xóa bỏ điểm mù ngữ nghĩa trên các ca `Explosion`, `Arson`, `Assault` và `Stealing`.
+2. **Intention Awareness Mechanism (`IAM` - LAS-VAD Sec. 3.2, Eq. 10–11):** Trích xuất động học bậc 1 **Velocity ($X_v$)** và bậc 2 **Acceleration ($X_a$)** qua cổng `Conv1D` kernel-3 cùng `Intention Prototypes` cập nhật theo quán tính EMA ($\mu=0.10$) và cổng liên tục động học (`Kinematic Continuity Gate`), triệt tiêu các gai nhiễu đơn lẻ 1-frame trên video bình thường (`Normal_Videos_050/902/868`).
+3. **Anomaly-Connected Components (`ACC` - LAS-VAD Sec. 3.3, Eq. 12–13):** Hiệu chỉnh ma trận tương đồng thị giác bằng độ nhất quán đa phương thức $\hat{A}_w = A_v \cdot (1 + \eta \max_c \min(q^l_i, q^l_j))$, trích xuất thành phần liên thông qua phép bình phương ma trận Boolean trên GPU và giám sát bằng nhãn giả thành phần ($\mathcal{L}_{\text{aux}} + \mathcal{L}_{\text{reg}}$), nâng mạnh độ phủ định vị thời gian `mAP@IoU`.
+4. **Acoustic Kinematic Gate & Audio-Text Semantic Alignment (XD-Violence):** Nâng cấp `GatedCrossModalAudioAdapter` với cổng vận tốc âm học và đối sánh âm thanh - văn bản 7 lớp (`aux_sem_logits`), thu hẹp khoảng cách AP của nhánh âm thanh mà vẫn bảo vệ 100% đặc trưng thị giác (`visual_features.detach()`).
+5. **Post-Rollback Adaptive LR Damping:** Tự động giảm nhẹ bước nhảy learning rate ($\times 0.75$) khi khôi phục best-checkpoint sau mỗi epoch, giúp mô hình tinh chỉnh sâu bên trong đáy hội tụ thay vì dao động.""")
 
     # Cell 2: Setup Environment & GPU Preflight
     add_code("""# ========================= 1. SETUP ENVIRONMENT & GPU PREFLIGHT =========================
@@ -84,7 +84,7 @@ REPO_URL = "https://github.com/Sharvuz/MA-RUPA.git"
 REPO_REF = "main"
 
 if (REPO_DIR / ".git").exists():
-    print("🔄 Đang đồng bộ commit MA-RUPA v4 mới nhất từ GitHub...", flush=True)
+    print("🔄 Đang đồng bộ commit MA-RUPA v5 (LAS-VAD) mới nhất từ GitHub...", flush=True)
     subprocess.run(["git", "fetch", "origin", REPO_REF], cwd=REPO_DIR, check=False)
     subprocess.run(["git", "reset", "--hard", f"origin/{REPO_REF}"], cwd=REPO_DIR, check=False)
 else:
@@ -96,7 +96,7 @@ else:
 os.chdir(REPO_DIR)
 
 commit_hash = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_DIR).decode().strip()
-print(f"🚀 [MA-RUPA v4 Codebase] Git Commit: {commit_hash}", flush=True)
+print(f"🚀 [MA-RUPA v5 Codebase] Git Commit: {commit_hash}", flush=True)
 
 subprocess.run([
     sys.executable, "-m", "pip", "install", "-q",
@@ -212,17 +212,17 @@ print(f"🎯 Multi-Crop Check: UCF test video có {ucf_crops_found}/10 crops | "
       f"XD test video có {xd_crops_found} crops (tối đa 10).")""")
 
     # Cell 4: UCF-Crime Markdown
-    add_md(r"""## 3. Huấn luyện SOTA trên UCF-Crime (Dual GPU Tesla T4 | Batch Size 64 = 250 Steps/Epoch)
+    add_md(r"""## 3. Huấn luyện SOTA trên UCF-Crime (MA-RUPA v5 LAS-VAD | Dual GPU Tesla T4 | Batch Size 64 = 250 Steps/Epoch)
 
-* **Mục tiêu:** **$\ge 89.0\%$ Frame-level ROC-AUC** (kỳ vọng **$89.6\% - 90.3\%$** với 10-Crop Parallel Evaluation).
-* **Cấu hình cân bằng toán học:**
+* **Mục tiêu:** **$\ge 89.2\%$ Frame-level ROC-AUC** & **$\ge 14.0\%$ Avg Localization mAP** (vượt qua mốc `88.34%` của nhánh `ucf-sota-88.34`).
+* **Cấu hình hội tụ LAS-VAD:**
   * `Batch Size = 64` (`32 Normal + 32 Abnormal` đan xen đều trên 2 GPU, cung cấp đúng `250` bước cập nhật gradient/epoch tại `LR = 7e-5`).
-  * **SGNM 204-Snippet Full-Bag Prototype Selection & Multi-GPU Orthogonality Deduplication:** Đảm bảo chọn đủ `204/256` đoạn chuẩn mỗi video (không bị cắt cụt theo video ngắn nhất trong batch) và loại bỏ bản sao vector `"normal"` của GPU thứ 2 khi tính `text_orthogonality_loss` (`Orth -> 0.0000` thay vì kẹt ở `1/27 = 0.0370`).
-  * **Epoch-End Best-Checkpoint Rollback Anchor:** Cuối mỗi epoch, mô hình tự động neo lại trọng số có AUC tổng quát hóa cao nhất trước khi bước sang epoch tiếp theo với learning rate giảm dần theo Cosine.
+  * **AAT + IAM + ACC Active:** Kết hợp `aat_weight=0.35`, `lambda_iam=0.40` (`iam_momentum=0.10`), và `lambda_acc=0.30` (`acc_eta=0.50`, `acc_tau=0.85`).
+  * **Epoch-End Best-Checkpoint Rollback + Adaptive LR Damping ($\times 0.75$):** Cuối mỗi epoch, mô hình tự động neo lại trọng số có AUC tổng quát hóa cao nhất và giảm nhẹ biên độ LR nếu xảy ra rollback để tinh chỉnh sâu bên trong vùng hội tụ tối ưu.
   * **10-Crop Parallel Evaluation (`__0..__9`):** Đánh giá đồng thời cả 10 góc cắt không gian trên toàn bộ 290 video test.""")
 
     # Cell 5: Train UCF-Crime Code
-    add_code("""# ========================= 3. TRAIN UCF-CRIME (MA-RUPA v4 | BATCH 64 | LR 7e-5 | 250 ITERS/EP) =========================
+    add_code("""# ========================= 3. TRAIN UCF-CRIME (MA-RUPA v5 LAS-VAD | BATCH 64 | LR 7e-5 | 250 ITERS/EP) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -255,18 +255,24 @@ cmd_train_ucf = [
     "--num-prototypes", "16",
     "--text-adapt-until", "3",
     "--t-w", "0.1",
+    "--aat-weight", "0.35",
+    "--iam-momentum", "0.10",
+    "--acc-eta", "0.50",
+    "--acc-tau", "0.85",
     "--routing-gate-init", "0.01",
     "--loss2-weight", "1.1",
     "--loss-sep-weight", "1.0",
     "--loss-residual-weight", "1.0",
     "--loss-reconstructed-normal-weight", "1.0",
+    "--lambda-iam", "0.40",
+    "--lambda-acc", "0.30",
     "--loss-consistency-weight", "1.0",
     "--loss-gather-weight", "1.0",
     "--loss-routing-weight", "0.05",
     "--loss-routing-anchor-weight", "0.05",
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
-    "--collab-alpha", "0.05",
+    "--collab-alpha", "0.08",
     "--smooth-eval", "True",
     "--smooth-sigma", "0.50",
     "--eval-interval", "50",
@@ -276,7 +282,7 @@ cmd_train_ucf = [
     "--checkpoint-path", str(ucf_checkpoint_path),
 ]
 
-print("🚀 Bắt đầu huấn luyện MA-RUPA v4 trên UCF-Crime (10-Crop Eval, Target ≥89.0% AUC)...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện MA-RUPA v5 (LAS-VAD Convergence) trên UCF-Crime (10-Crop Eval, Target ≥89.2% AUC)...\\n", flush=True)
 proc = subprocess.Popen(cmd_train_ucf, cwd=REPO_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
 for line in proc.stdout:
     print(line, end="", flush=True)
@@ -305,9 +311,12 @@ subprocess.run([
     "--gt-segment-path", "list/gt_segment_ucf.npy",
     "--gt-label-path", "list/gt_label_ucf.npy",
     "--model-path", str(ucf_model_path),
+    "--aat-weight", "0.35",
+    "--acc-eta", "0.50",
+    "--acc-tau", "0.85",
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
-    "--collab-alpha", "0.05",
+    "--collab-alpha", "0.08",
     "--smooth-eval", "True",
     "--smooth-sigma", "0.50",
 ], cwd=REPO_DIR, check=True)
@@ -321,16 +330,16 @@ subprocess.run([
 ], cwd=REPO_DIR, check=False)""")
 
     # Cell 7: XD-Violence Markdown
-    add_md(r"""## 5. Huấn luyện Đa phương thức Bảo vệ Thị giác SOTA trên XD-Violence (Visual CLIP + Decoupled VGGish)
+    add_md(r"""## 5. Huấn luyện Đa phương thức Bảo vệ Thị giác SOTA trên XD-Violence (MA-RUPA v5 LAS-VAD + Acoustic Kinematics)
 
-* **Mục tiêu:** **$\ge 87.0\%$ Frame-level Average Precision (AP)** (kỳ vọng **$87.3\% - 88.8\%$** với 5-Crop + Visual-Protected Audio Synergy).
+* **Mục tiêu:** **$\ge 86.5\%$ Frame-level Average Precision (AP)** & **$\ge 96.2\%$ ROC-AUC** với 5-Crop + Visual-Protected Audio-Semantic Synergy.
 * **Cấu hình chuẩn thực nghiệm:**
   * **Single Natural Shuffled `DataLoader` (`Batch Size = 64`, `618` steps/epoch):** Khai thác trọn vẹn 100% cả `39,540` crops (`51.8%` Normal / `48.2%` Abnormal) tại `main_lr = 1e-5` và `audio_lr = 3e-5`.
-  * **Visual-Protected Audio Branch (`visual_features.detach()`):** Ngăn tuyệt đối nhiễu âm thanh phim ảnh làm hỏng LGT-SGNM; đồng thời huấn luyện nhánh âm thanh phụ trợ bằng `audio_guided_mil_loss` (phạt Top-8 đỉnh báo động giả trên video Normal với trọng số `0.50`).
-  * **Visual-Semantic Concordance Gate:** Khóa hoàn toàn âm thanh (`g_vs = 0`) trên cảnh bình thường yên tĩnh và kích hoạt mượt mà khi thị giác/ngữ nghĩa phát hiện dấu hiệu bạo lực.""")
+  * **Acoustic Kinematic Gate + 7-Class Audio-Text Semantic Alignment (`aux_sem_logits`):** Phân biệt xung âm thanh đột ngột (tiếng súng, tiếng nổ, kính vỡ) với nhạc nền phim bình thường (`visual_features.detach()`), nâng mạnh AP của nhánh Audio-Visual.
+  * **LAS-VAD IAM + ACC (`acc_tau = 0.80`):** Làm mịn và liên kết các phân đoạn bạo lực dài để tăng mạnh `Localization Avg mAP`.""")
 
     # Cell 8: Train XD-Violence Code
-    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (MA-RUPA v4 VISUAL-PROTECTED MULTIMODAL | BATCH 64) =========================
+    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (MA-RUPA v5 LAS-VAD MULTIMODAL | BATCH 64) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -366,16 +375,22 @@ cmd_train_xd = [
     "--num-prototypes", "16",
     "--text-adapt-until", "1",
     "--t-w", "0.6",
+    "--aat-weight", "0.35",
+    "--iam-momentum", "0.10",
+    "--acc-eta", "0.50",
+    "--acc-tau", "0.80",
     "--temp", "1.0",
     "--loss2-weight", "5.0",
     "--loss-sep-weight", "1.0",
     "--loss-residual-weight", "1.0",
     "--loss-reconstructed-normal-weight", "1.0",
+    "--lambda-iam", "0.40",
+    "--lambda-acc", "0.30",
     "--loss-consistency-weight", "1.0",
     "--loss-gather-weight", "1.0",
     "--loss-routing-weight", "0.20",
     "--loss-routing-anchor-weight", "0.05",
-    "--lambda-aux", "0.50",
+    "--lambda-aux", "0.80",
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
     "--collab-alpha", "0.12",
@@ -389,7 +404,7 @@ cmd_train_xd = [
     "--checkpoint-path", str(xd_checkpoint_path),
 ]
 
-print("🚀 Bắt đầu huấn luyện MA-RUPA v4 Multimodal trên XD-Violence (5-Crop + Protected VGGish, Target ≥87.0% AP)...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện MA-RUPA v5 (LAS-VAD Multimodal) trên XD-Violence (5-Crop + Protected VGGish, Target ≥86.5% AP)...\\n", flush=True)
 proc = subprocess.Popen(cmd_train_xd, cwd=REPO_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
 for line in proc.stdout:
     print(line, end="", flush=True)
@@ -415,6 +430,9 @@ subprocess.run([
     "--gt-segment-path", "list/gt_segment.npy",
     "--gt-label-path", "list/gt_label.npy",
     "--model-path", str(xd_model_path),
+    "--aat-weight", "0.35",
+    "--acc-eta", "0.50",
+    "--acc-tau", "0.80",
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
     "--collab-alpha", "0.12",
@@ -432,16 +450,17 @@ subprocess.run([
 ], cwd=REPO_DIR, check=False)""")
 
     # Cell 10: Ablation Studies Table
-    add_md(r"""## 7. Bảng Cờ Ablation Studies (Phục vụ Bài báo Khoa học)
+    add_md(r"""## 7. Bảng Cờ Ablation Studies (Phục vụ Bài báo Khoa học MA-RUPA v5 + LAS-VAD)
 
 | Cấu hình Ablation | Cờ dòng lệnh (CLI Flag) | Thành phần được kiểm chứng |
 |---|---|---|
-| **w/o Decoupled Cross-Modal Audio (XD)** | `--no-audio` | Đóng góp của nhánh âm thanh VGGish tách rời + cổng đồng thuận thị giác - ngữ nghĩa |
+| **w/o LAS-VAD Intention Awareness (IAM)** | `--no-iam` | Đóng góp của động học Velocity ($X_v$) + Acceleration ($X_a$) và cổng triệt gai nhiễu 1-frame |
+| **w/o LAS-VAD Connected Components (ACC)** | `--no-acc` | Đóng góp của đồ thị thành phần liên thông đa phương thức ($\hat{A}_w$) lên `mAP@IoU` |
+| **w/o LAS-VAD Attribute Clues (AAT)** | `--aat-weight 0.0` | Đóng góp của đặc trưng cảm quan vật lý (*smoke, flames, debris, flash*) trong `CLIPTextAdapter` |
+| **w/o Decoupled Cross-Modal Audio (XD)** | `--no-audio` | Đóng góp của nhánh âm thanh VGGish tách rời + cổng vận tốc âm học |
 | **w/o Dynamic Normal Prototypes (SGNM)** | `--no-rupa` | Vai trò của tái tạo mẫu chuẩn động `SGNM` và ràng buộc nhất quán `ConsistencyLoss` |
 | **w/o Detached Safe-Gate Calibration** | `--no-safegate` | So sánh cổng `Safe-Gate` thích ứng với trọng số trộn cố định |
-| **1-Crop vs Multi-Crop Test Eval** | `--multi-crop-eval False` | Đóng góp của gom 10-crop (UCF) / 5-crop (XD) không gian khi suy luận |
-| **w/o Collaborative Semantic Synergy** | `--collab-alpha 0.0` | Đóng góp của luồng đối sánh ngôn ngữ - thị giác CLIP tại pha test |
-| **w/ Dilated Conv1d Adapter (Ablation)** | `--use-mdtp` | Kiểm chứng hiện tượng quá khớp thời gian khi chèn thêm Conv1d sau LGT |""")
+| **1-Crop vs Multi-Crop Test Eval** | `--multi-crop-eval False` | Đóng góp của gom 10-crop (UCF) / 5-crop (XD) không gian khi suy luận |""")
 
     nb_path = Path("MA-RUPA.ipynb")
     with open(nb_path, "w", encoding="utf-8") as f:

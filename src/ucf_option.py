@@ -41,10 +41,16 @@ parser.add_argument('--routing-gate-hidden', default=8, type=int)
 parser.add_argument('--routing-gate-init', default=0.01, type=float)
 parser.add_argument('--routing-gate-max', default=0.50, type=float)
 
-# CLIP Text Adapter
+# CLIP Text Adapter & LAS-VAD Anomaly Attribute Clues (AAT)
 parser.add_argument('--text_adapt_until', '--text-adapt-until', dest='text_adapt_until', default=3, type=int)
 parser.add_argument('--t_w', '--t-w', dest='t_w', default=0.1, type=float)
+parser.add_argument('--aat-weight', default=0.35, type=float, help='LAS-VAD Anomaly Attribute Clue (AAT) fusion weight with canonical concepts')
 parser.add_argument('--temp', default=5.0, type=float, help='Hierarchical class localization temperature')
+
+# LAS-VAD Intention Awareness Mechanism (IAM) & Anomaly-Connected Components (ACC)
+parser.add_argument('--iam-momentum', default=0.10, type=float, help='Momentum update factor mu for Intention Prototypes Z')
+parser.add_argument('--acc-eta', default=0.50, type=float, help='Cross-modal consistency boost eta for ACC affinity graph')
+parser.add_argument('--acc-tau', default=0.85, type=float, help='Adjacency binarization threshold tau for ACC connected components')
 
 # Ablation Flags
 parser.add_argument('--use-mdtp', action='store_true', default=False, help='Enable optional Dilated Conv1d Sensitivity Adapter')
@@ -52,6 +58,8 @@ parser.add_argument('--no-mdtp', action='store_true', default=True, help='Keep p
 parser.add_argument('--no-audio', action='store_true', default=False)
 parser.add_argument('--no-rupa', action='store_true', default=False, help='Disable SGNM Dynamic Normal Prototype Refiner')
 parser.add_argument('--no-safegate', action='store_true', default=False, help='Use fixed routing instead of SafeGate')
+parser.add_argument('--no-iam', action='store_true', default=False, help='Disable LAS-VAD Intention Awareness Module (IAM)')
+parser.add_argument('--no-acc', action='store_true', default=False, help='Disable LAS-VAD Anomaly-Connected Components (ACC)')
 
 # Optimization & Schedule (Exact Verified UCF Optimum: Batch 64 = 32N+32A, 250 steps/epoch, LR 7e-5)
 parser.add_argument('--max-epoch', default=10, type=int)
@@ -74,6 +82,8 @@ parser.add_argument('--loss-gather-weight', '--lambda-gather', dest='loss_gather
 parser.add_argument('--loss-dnp-normal-weight', default=0.0, type=float)
 parser.add_argument('--loss-routing-weight', default=0.05, type=float, help='Detached SafeGate calibration MIL weight')
 parser.add_argument('--loss-routing-anchor-weight', '--loss_routing_anchor_weight', dest='loss_routing_anchor_weight', default=0.05, type=float)
+parser.add_argument('--lambda-iam', '--loss-iam-weight', dest='lambda_iam', default=0.40, type=float, help='LAS-VAD Intention Awareness Mechanism (IAM) loss weight')
+parser.add_argument('--lambda-acc', '--loss-acc-weight', dest='lambda_acc', default=0.30, type=float, help='LAS-VAD Anomaly-Connected Components (ACC) pseudo-label loss weight')
 parser.add_argument('--lambda-smooth', default=0.0, type=float)
 
 # Dataset & Checkpoints

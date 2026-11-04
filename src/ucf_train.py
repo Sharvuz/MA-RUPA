@@ -15,7 +15,8 @@ from utils.StableAdamW import StableAdamW
 from utils.losses import (
     CLAS2, CLASM, CLASM_EVENT, CLASM_BKG,
     text_orthogonality_loss, ConsistencyLoss, routing_anchor_loss,
-    edge_preserving_smoothness_loss, WarmCosineScheduler, ModelEMA,
+    edge_preserving_smoothness_loss, iam_intention_loss, acc_pseudo_label_loss,
+    WarmCosineScheduler, ModelEMA,
 )
 import ucf_option
 
@@ -201,19 +202,22 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         print(f"[Resume] Resumed from epoch {start_epoch}, best AUC={auc_best * 100:.2f}%", flush=True)
 
     eff_batch = normal_loader.batch_size * 2
+    lambda_iam = float(getattr(args, 'lambda_iam', 0.40))
+    lambda_acc = float(getattr(args, 'lambda_acc', 0.30))
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v4 VISUAL-PROTECTED SOTA TRAINING ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v5 (LAS-VAD CONVERGENCE) SOTA TRAINING ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)", flush=True)
     print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} gradient steps | LR = {main_lr:.1e}", flush=True)
-    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
+    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | IAM={lambda_iam} | ACC={lambda_acc} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
     print(f"  Multi-Crop : {'10-Crop Parallel Eval Active' if args.multi_crop_eval else '1-Crop Eval'}", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
         model.train()
         DNP_use = args.DNP_use and (not args.no_rupa)
+        epoch_improved = False
 
-        sum_l1 = sum_l2 = sum_l3 = sum_l4 = sum_l5 = sum_cons = sum_g = 0.0
+        sum_l1 = sum_l2 = sum_l3 = sum_l4 = sum_l5 = sum_iam = sum_acc = sum_cons = sum_g = 0.0
         epoch_t0 = time.time()
 
         normal_iter = iter(normal_loader)
@@ -237,6 +241,16 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num)
             loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
+
+            iam_protos = raw_model.iam_module.intention_prototypes if getattr(raw_model, 'iam_module', None) is not None else None
+            loss_iam = (
+                iam_intention_loss(dnp_dict, text_labels, feat_lengths, device, iam_prototypes=iam_protos)
+                if lambda_iam > 0 else logits1.sum() * 0.0
+            )
+            loss_acc = (
+                acc_pseudo_label_loss(dnp_dict, feat_lengths, logits1=logits1)
+                if lambda_acc > 0 else logits1.sum() * 0.0
+            )
 
             loss_smooth = (
                 edge_preserving_smoothness_loss(torch.sigmoid(logits1), feat_lengths)
@@ -266,6 +280,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     + loss3 * args.loss_sep_weight
                     + loss4 * args.loss_residual_weight
                     + loss5 * args.loss_reconstructed_normal_weight
+                    + loss_iam * lambda_iam
+                    + loss_acc * lambda_acc
                     + cons_loss * args.loss_consistency_weight
                     + g_loss * args.loss_gather_weight
                     + route_loss * args.loss_routing_weight
@@ -281,6 +297,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     + loss3 * args.loss_sep_weight
                     + loss4 * args.loss_residual_weight
                     + loss5 * args.loss_reconstructed_normal_weight
+                    + loss_iam * lambda_iam
+                    + loss_acc * lambda_acc
                     + loss_smooth * args.lambda_smooth
                 )
 
@@ -303,6 +321,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             sum_l3 += loss3.item()
             sum_l4 += loss4.item()
             sum_l5 += loss5.item()
+            sum_iam += loss_iam.item()
+            sum_acc += loss_acc.item()
             sum_cons += cons_loss.item()
             sum_g += g_loss.item()
 
@@ -314,6 +334,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
+                    f"IAM:{sum_iam/iter_num:.4f} ACC:{sum_acc/iter_num:.4f} "
                     f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
@@ -326,6 +347,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 )
                 if auc_cur > auc_best:
                     auc_best = auc_cur
+                    epoch_improved = True
                     best_live_state = unwrap_compact_state_dict(model)
                     torch.save(best_live_state, args.model_path)
                     print(f"  [*] [NEW BEST UCF-CRIME] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
@@ -341,6 +363,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         live_state = unwrap_compact_state_dict(model)
         if auc_live > auc_best:
             auc_best = auc_live
+            epoch_improved = True
             best_live_state = live_state
             torch.save(best_live_state, args.model_path)
             print(f"  [*] [NEW BEST UCF-CRIME (Live)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
@@ -365,6 +388,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             )
             if auc_ema > auc_best:
                 auc_best = auc_ema
+                epoch_improved = True
                 ema_state = unwrap_compact_state_dict(model)
                 torch.save(ema_state, args.model_path)
                 print(f"  [*] [NEW BEST UCF-CRIME (EMA)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
@@ -373,6 +397,10 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         # Anchor next epoch to the best-generalizing live checkpoint (Exact DSANet eb335b2 Continuation Principle)
         if best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
+            if not epoch_improved:
+                for pg in optimizer_main.param_groups:
+                    pg['lr'] = max(pg['lr'] * 0.75, main_lr * 0.05)
+                print(f"  [Rollback-Damp] Restored best checkpoint (AUC={auc_best*100:.2f}%) & damped LR -> {optimizer_main.param_groups[0]['lr']:.2e}", flush=True)
         print("", flush=True)
 
     print(f"[FINISH] UCF-Crime Training Complete! Best ROC-AUC: {auc_best * 100:.2f}%", flush=True)
@@ -387,11 +415,11 @@ if __name__ == '__main__':
 
     try:
         commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-        print(f"[MA-RUPA v4 Codebase] Git Commit: {commit_hash}", flush=True)
+        print(f"[MA-RUPA v5 Codebase] Git Commit: {commit_hash}", flush=True)
     except Exception:
         pass
 
-    print(f"[MA-RUPA v4] Training UCF-Crime on device: {device}", flush=True)
+    print(f"[MA-RUPA v5] Training UCF-Crime on device: {device}", flush=True)
     setup_seed(args.seed)
     model, normal_loader, anomaly_loader, test_loader, label_map = build_ucf_components(args, device)
     train(model, normal_loader, anomaly_loader, test_loader, args, label_map, device)

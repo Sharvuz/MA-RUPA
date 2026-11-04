@@ -15,6 +15,8 @@ from utils.losses import (
     routing_anchor_loss,
     edge_preserving_smoothness_loss,
     audio_guided_mil_loss,
+    iam_intention_loss,
+    acc_pseudo_label_loss,
     WarmCosineScheduler,
     ModelEMA,
 )
@@ -65,14 +67,30 @@ def test_sota_losses_and_gradients():
     labels[2, 0] = 1.0  # Normal
     labels[3, 7] = 1.0  # Fighting
 
+    aux_sem_logits = torch.randn(B, T, C, requires_grad=True)
+    iam_logits = torch.randn(B, T, C, requires_grad=True)
+    iam_prototypes = torch.randn(C, D)
+    acc_pseudo = torch.softmax(torch.randn(B, T, C), dim=-1)
+    fine_grained_probs = torch.softmax(logits2, dim=-1)
+
     l1 = CLAS2(logits1, labels, lengths, device)
     l2 = CLASM(logits2, labels, lengths, device)
     l3 = text_orthogonality_loss(text_features)
     l4 = RUPA_RESIDUAL_EVENT(logits3, labels, lengths, device)
     l4_ev = CLASM_EVENT(logits3, labels, lengths, device)
     l5 = CLASM_BKG(logits4, labels, lengths, device)
-    l_aux = audio_guided_mil_loss(aux_logits, labels, lengths)
+    l_aux = audio_guided_mil_loss(aux_logits, labels, lengths, aux_sem_logits=aux_sem_logits)
     l_sm = edge_preserving_smoothness_loss(torch.sigmoid(logits1), lengths)
+
+    dnp_mock = {
+        'iam_logits': iam_logits,
+        'iam_scores': 1.0 - torch.softmax(iam_logits, dim=-1)[:, :, :1],
+        'acc_pseudo_labels': acc_pseudo,
+        'fine_grained_probs': fine_grained_probs,
+        'detector_scores': torch.sigmoid(logits1),
+    }
+    l_iam = iam_intention_loss(dnp_mock, labels, lengths, device, iam_prototypes=iam_prototypes)
+    l_acc = acc_pseudo_label_loss(dnp_mock, lengths, logits1=logits1)
 
     f_orig = torch.randn(B, T, D, requires_grad=True)
     f_rec = torch.randn(B, T, D, requires_grad=True)
@@ -85,13 +103,17 @@ def test_sota_losses_and_gradients():
         lengths,
     )
 
-    total = l1 + 1.1 * l2 + l3 + 0.2 * l4 + 0.05 * l4_ev + 0.2 * l5 + 0.25 * l_aux + 0.02 * l_sm + 0.1 * l_cons + 0.1 * l_anchor
+    total = (
+        l1 + 1.1 * l2 + l3 + 0.2 * l4 + 0.05 * l4_ev + 0.2 * l5
+        + 0.25 * l_aux + 0.4 * l_iam + 0.3 * l_acc + 0.02 * l_sm + 0.1 * l_cons + 0.1 * l_anchor
+    )
     assert total.dim() == 0 and torch.isfinite(total)
     total.backward()
 
     for name, tensor in [
         ('logits1', logits1), ('logits2', logits2), ('logits3', logits3),
-        ('logits4', logits4), ('aux_logits', aux_logits), ('text_features', text_features),
+        ('logits4', logits4), ('aux_logits', aux_logits), ('aux_sem_logits', aux_sem_logits),
+        ('iam_logits', iam_logits), ('text_features', text_features),
     ]:
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all(), f"Bad grad on {name}"
 
