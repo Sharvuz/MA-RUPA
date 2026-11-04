@@ -268,11 +268,13 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     ap_best = -1.0
     auc_best = -1.0
+    best_live_state = None
     start_epoch = 0
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
+        best_live_state = unwrap_compact_state_dict(model)
         if 'optimizer_state_dict' in checkpoint:
             try:
                 optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -441,8 +443,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 if ap_cur > ap_best or (abs(ap_cur - ap_best) < 1e-5 and auc_cur > auc_best):
                     ap_best = ap_cur
                     auc_best = auc_cur
-                    state = unwrap_compact_state_dict(model)
-                    torch.save({'epoch': e, 'model_state_dict': state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
+                    best_live_state = unwrap_compact_state_dict(model)
+                    torch.save({'epoch': e, 'model_state_dict': best_live_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
                     print(
                         f"  [*] [NEW BEST XD-VIOLENCE] AP = {ap_best * 100:.2f}% | AUC = {auc_best * 100:.2f}% saved -> {args.model_path}",
                         flush=True,
@@ -460,7 +462,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         if ap_live > ap_best or (abs(ap_live - ap_best) < 1e-5 and auc_live > auc_best):
             ap_best = ap_live
             auc_best = auc_live
-            torch.save({'epoch': e, 'model_state_dict': live_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
+            best_live_state = live_state
+            torch.save({'epoch': e, 'model_state_dict': best_live_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
             print(
                 f"  [*] [NEW BEST XD-VIOLENCE (Live)] AP = {ap_best * 100:.2f}% | AUC = {auc_best * 100:.2f}% saved -> {args.model_path}",
                 flush=True,
@@ -469,7 +472,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         # Save latest resumable checkpoint at the end of every epoch
         torch.save({
             'epoch': e,
-            'model_state_dict': live_state,
+            'model_state_dict': best_live_state if best_live_state is not None else live_state,
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
             'scheduler_main_state_dict': scheduler_main.state_dict(),
@@ -491,13 +494,17 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             if ap_ema > ap_best or (abs(ap_ema - ap_best) < 1e-5 and auc_ema > auc_best):
                 ap_best = ap_ema
                 auc_best = auc_ema
-                ema_state = unwrap_compact_state_dict(model)
-                torch.save({'epoch': e, 'model_state_dict': ema_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
+                best_live_state = unwrap_compact_state_dict(model)
+                torch.save({'epoch': e, 'model_state_dict': best_live_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
                 print(
                     f"  [*] [NEW BEST XD-VIOLENCE (EMA)] AP = {ap_best * 100:.2f}% | AUC = {auc_best * 100:.2f}% saved -> {args.model_path}",
                     flush=True,
                 )
             ema.restore(model, backup)
+
+        # Anchor next epoch to the best-generalizing checkpoint (Prevents mid/late-epoch overfitting drift)
+        if best_live_state is not None:
+            load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
         print("", flush=True)
 
     print(f"[FINISH] XD-Violence Training Complete! Best AP: {ap_best * 100:.2f}% | Best AUC: {auc_best * 100:.2f}%", flush=True)
