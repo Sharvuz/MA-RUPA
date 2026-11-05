@@ -413,7 +413,9 @@ class UCFDataset(data.Dataset):
             for p, l in zip(self.raw_paths, self.labels):
                 base_id = os.path.basename(p).split('__')[0]
                 grouped[base_id].append((p, l))
-            self.video_groups = list(grouped.values())
+            for grp in grouped.values():
+                existing_grp = [(p, l) for p, l in grp if os.path.exists(resolve_feature_path(p, self.data_dir))]
+                self.video_groups.append(existing_grp if existing_grp else grp)
 
     def __len__(self):
         if self.sample_one_crop_per_video and not self.test_mode and self.video_groups:
@@ -484,7 +486,9 @@ class XDDataset(data.Dataset):
             for p, l in zip(self.raw_paths, self.labels):
                 base_id = strip_crop_suffix(p)
                 grouped[base_id].append((p, l))
-            self.video_groups = list(grouped.values())
+            for grp in grouped.values():
+                existing_grp = [(p, l) for p, l in grp if os.path.exists(resolve_feature_path(p, self.data_dir))]
+                self.video_groups.append(existing_grp if existing_grp else grp)
 
         self.audio_dict = {}
         if audio_file_path and os.path.exists(audio_file_path):

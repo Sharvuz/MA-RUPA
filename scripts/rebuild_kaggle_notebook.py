@@ -332,13 +332,13 @@ subprocess.run([
     add_md(r"""## 5. Huấn luyện Đa phương thức Bảo vệ Thị giác SOTA trên XD-Violence (MA-RUPA v6 Argon-4 Gradient Conservation)
 
 * **Mục tiêu:** **$\ge 86.5\%$ Frame-level Average Precision (AP)** & **$\ge 96.2\%$ ROC-AUC** với 5-Crop + Peak-Preserving Audio Concordance.
-* **Cấu hình chuẩn thực nghiệm:**
-  * **Stratified Distinct-Crop Slot Sampling (`crops_per_video = 3`, `Batch Size = 64`, `185` steps/epoch):** Mỗi epoch lấy mẫu phân tầng đúng 3 góc cắt không gian tách biệt cho mỗi video gốc (`11,862` mẫu/epoch), kết thúc mỗi epoch ngay tại vùng đỉnh hội tụ vàng (`150–185` steps) và triệt tiêu hoàn toàn hiện tượng học vẹt bối cảnh 10-crop từ `Iter 300–618`.
+* **Cấu hình chuẩn thực nghiệm (Chuẩn 5-Crop của các bài báo XD-Violence):**
+  * **Stratified 5-Crop Slot Sampling (`crops_per_video = 5`, `Batch Size = 64`, `309` steps/epoch):** Khớp chính xác với giao thức **5-Crop (`19,770` clips/epoch = `309` steps/epoch)** của các bài báo gốc trên XD-Violence (Wu et al. ECCV 2020, PEL4VAD, VadCLIP, DSANet), thay vì nạp trùng lặp 10-crop (`618` steps) gây học vẹt nền.
   * **Gradient-Conserving Multi-Scale Logit-MIL + CLIP-Cone Baseline Normalization:** Phá vỡ trần điểm số `0.30` trên các phim hành động khó (`Operation.Red.Sea`, `City.of.God`, `Salt`).
   * **Peak-Preserving Multiplicative Audio Concordance:** Kết hợp âm thanh VGGish theo cơ chế đồng thuận nhân tính, tăng áp các đỉnh bạo lực có cả hình ảnh và âm thanh mà không kéo tụt các phân cảnh bạo lực câm.""")
 
     # Cell 8: Train XD-Violence Code
-    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (MA-RUPA v6 ARGON-4 MULTIMODAL | BATCH 64 | 3 CROPS/VIDEO = 185 ITERS/EP) =========================
+    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (MA-RUPA v6 ARGON-4 MULTIMODAL | BATCH 64 | 5 CROPS/VIDEO = 309 ITERS/EP) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -365,7 +365,7 @@ cmd_train_xd = [
     "--batch-size", "64",
     "--balanced-sampling", "False",
     "--sample-one-crop-per-video", "True",
-    "--crops-per-video", "3",
+    "--crops-per-video", "5",
     "--lr", "1e-5",
     "--audio-lr", "3e-5",
     "--max-epoch", "10",
@@ -397,14 +397,14 @@ cmd_train_xd = [
     "--aux-eval-alpha", "0.08",
     "--smooth-eval", "True",
     "--smooth-sigma", "1.00",
-    "--eval-interval", "90",
+    "--eval-interval", "150",
     "--use-ema", "True",
     "--seed", "234",
     "--model-path", str(xd_model_path),
     "--checkpoint-path", str(xd_checkpoint_path),
 ]
 
-print("🚀 Bắt đầu huấn luyện MA-RUPA v6 (Argon-4 Gradient Conservation) trên XD-Violence (5-Crop + Stratified 3-Crop Loader, Target ≥86.5% AP)...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện MA-RUPA v6 (Argon-4 Gradient Conservation) trên XD-Violence (Chuẩn 5-Crop = 309 steps/epoch, Target ≥86.5% AP)...\\n", flush=True)
 proc = subprocess.Popen(cmd_train_xd, cwd=REPO_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
 for line in proc.stdout:
     print(line, end="", flush=True)

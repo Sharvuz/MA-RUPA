@@ -107,7 +107,7 @@ parser.add_argument('--checkpoint-path', default='model/checkpoint_xd.pth')
 parser.add_argument('--use-checkpoint', default=False, type=str2bool)
 parser.add_argument('--init-model-path', default=None)
 parser.add_argument('--sample-one-crop-per-video', default=True, type=str2bool, help='Group by unique video ID to prevent 10x intra-epoch bag memorization')
-parser.add_argument('--crops-per-video', default=3, type=int, help='Sample 3 disjoint spatial crops per video per epoch (~185 steps/epoch at BS=64)')
+parser.add_argument('--crops-per-video', default=5, type=int, help='Sample 5 disjoint spatial crops per video per epoch (19770 clips = 309 steps/epoch at BS=64, standard 5-crop XD-Violence paper protocol)')
 
 # Evaluation & 5-Crop Visual-Protected Multimodal Inference
 parser.add_argument('--multi-crop-eval', default=True, type=str2bool, help='Aggregate available spatial test crops (__0..__4) in parallel')
@@ -117,5 +117,5 @@ parser.add_argument('--aux-eval-alpha', default=0.04, type=float, help='Peak-pre
 parser.add_argument('--smooth-eval', default=True, type=str2bool)
 parser.add_argument('--smooth-method', choices=['gaussian', 'savgol'], default='gaussian')
 parser.add_argument('--smooth-sigma', default=1.00, type=float, help='Optimal Gaussian temporal smoothing sigma verified by Prober')
-parser.add_argument('--eval-interval', default=90, type=int, help='Mid-epoch validation interval in iterations (90 = half of 185-step 3-crop epoch)')
+parser.add_argument('--eval-interval', default=150, type=int, help='Mid-epoch validation interval in iterations (150 = half of 309-step 5-crop epoch)')
 parser.add_argument('--num-workers', default=2, type=int)
