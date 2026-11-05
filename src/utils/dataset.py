@@ -423,8 +423,15 @@ class UCFDataset(data.Dataset):
     def __getitem__(self, index):
         if self.sample_one_crop_per_video and not self.test_mode and self.video_groups:
             vid_idx = index % len(self.video_groups)
+            slot = index // len(self.video_groups)
             crops = self.video_groups[vid_idx]
-            raw_path, label = crops[np.random.randint(len(crops))]
+            n_c = len(crops)
+            if n_c > 1 and self.crops_per_video > 1:
+                stride = max(1, n_c // self.crops_per_video)
+                crop_idx = (slot * stride + np.random.randint(stride)) % n_c
+                raw_path, label = crops[crop_idx]
+            else:
+                raw_path, label = crops[np.random.randint(n_c)]
         else:
             raw_path = self.raw_paths[index]
             label = self.labels[index]
@@ -528,8 +535,15 @@ class XDDataset(data.Dataset):
     def __getitem__(self, index):
         if self.sample_one_crop_per_video and not self.test_mode and self.video_groups:
             vid_idx = index % len(self.video_groups)
+            slot = index // len(self.video_groups)
             crops = self.video_groups[vid_idx]
-            raw_path, label = crops[np.random.randint(len(crops))]
+            n_c = len(crops)
+            if n_c > 1 and self.crops_per_video > 1:
+                stride = max(1, n_c // self.crops_per_video)
+                crop_idx = (slot * stride + np.random.randint(stride)) % n_c
+                raw_path, label = crops[crop_idx]
+            else:
+                raw_path, label = crops[np.random.randint(n_c)]
         else:
             raw_path = self.raw_paths[index]
             label = self.labels[index]

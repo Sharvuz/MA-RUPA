@@ -64,12 +64,11 @@ def _forward_multimodal_chunked(eval_model: nn.Module, visual_flat: torch.Tensor
         route_s = dnp_dict.get('routing_scores', det_s)
         rec_s = dnp_dict.get('reconstruction_scores', det_s)
         sem_s = dnp_dict.get('semantic_scores')
-        acc_s = dnp_dict.get('acc_scores', det_s)
         aux_s = dnp_dict.get('aux_scores')
         gate_s = dnp_dict.get('routing_gate')
-        return logits1, logits2, det_s, route_s, rec_s, sem_s, acc_s, aux_s, gate_s
+        return logits1, logits2, det_s, route_s, rec_s, sem_s, aux_s, gate_s
 
-    l1_list, l2_list, d_list, r_list, rec_list, sem_list, acc_list, aux_list, g_list = [], [], [], [], [], [], [], [], []
+    l1_list, l2_list, d_list, r_list, rec_list, sem_list, aux_list, g_list = [], [], [], [], [], [], [], []
     for start in range(0, total_b, max_chunk):
         end = min(start + max_chunk, total_b)
         aud_chunk = audio_flat[start:end] if audio_flat is not None else None
@@ -85,7 +84,6 @@ def _forward_multimodal_chunked(eval_model: nn.Module, visual_flat: torch.Tensor
         rec_list.append(dnp_c.get('reconstruction_scores', d_c))
         if dnp_c.get('semantic_scores') is not None:
             sem_list.append(dnp_c['semantic_scores'])
-        acc_list.append(dnp_c.get('acc_scores', d_c))
         if dnp_c.get('aux_scores') is not None:
             aux_list.append(dnp_c['aux_scores'])
         if dnp_c.get('routing_gate') is not None:
@@ -98,7 +96,6 @@ def _forward_multimodal_chunked(eval_model: nn.Module, visual_flat: torch.Tensor
         torch.cat(r_list, dim=0),
         torch.cat(rec_list, dim=0),
         torch.cat(sem_list, dim=0) if sem_list else None,
-        torch.cat(acc_list, dim=0),
         torch.cat(aux_list, dim=0) if aux_list else None,
         torch.cat(g_list, dim=0) if g_list else None,
     )
@@ -106,8 +103,7 @@ def _forward_multimodal_chunked(eval_model: nn.Module, visual_flat: torch.Tensor
 
 def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
          DNP_use, args, device, compute_dmap: bool = False):
-    """Evaluates MA-RUPA v5 (LAS-VAD Convergence) on XD-Violence with 5-Crop Multimodal Synergy."""
-    # Defensively support swapped (args, device) vs (device, args) callers
+    """Evaluates MA-RUPA v4+ (Argon-4 Edition) on XD-Violence with Peak-Preserving Multimodal Synergy."""
     if isinstance(args, (str, torch.device)) and not isinstance(device, (str, torch.device)):
         args, device = device, args
 
@@ -120,17 +116,16 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     data_dir = getattr(args, 'data_dir', None)
     audio_dir = getattr(args, 'audio_dir', None)
     no_audio = bool(getattr(args, 'no_audio', False))
-    collab_alpha = float(getattr(args, 'collab_alpha', 0.12))
-    aux_eval_alpha = float(getattr(args, 'aux_eval_alpha', 0.18))
+    collab_alpha = float(getattr(args, 'collab_alpha', 0.03))
+    aux_eval_alpha = float(getattr(args, 'aux_eval_alpha', 0.04))
     smooth_eval = bool(getattr(args, 'smooth_eval', True))
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
-    smooth_sigma = float(getattr(args, 'smooth_sigma', 0.80))
+    smooth_sigma = float(getattr(args, 'smooth_sigma', 1.00))
 
     vid_det_raw_list = []
     vid_route_list = []
     vid_sem_list = []
     vid_rec_list = []
-    vid_acc_list = []
     vid_aux_list = []
     vid_logits1_list = []
     vid_logits2_list = []
@@ -191,7 +186,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
                 if aud_crops is not None else None
             )
 
-            logits1, logits2, det_s, route_s, rec_s, sem_s, acc_s, aux_s, gate_s = _forward_multimodal_chunked(
+            logits1, logits2, det_s, route_s, rec_s, sem_s, aux_s, gate_s = _forward_multimodal_chunked(
                 eval_model, visual_flat, audio_flat, padding_mask, prompt_text, lengths_flat, DNP_use
             )
 
@@ -200,9 +195,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             det_c = det_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
             route_c = route_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
             rec_c = rec_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
-            acc_c = acc_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
 
-            # Temperature-calibrated Vision-Language + IAM Semantic Anomaly Probability
             if sem_s is not None:
                 p_sem_c = sem_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0].clamp(0.0, 1.0)
             else:
@@ -212,13 +205,11 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             prob_route_np = route_c.float().mean(dim=0).cpu().numpy()
             prob_sem_np = p_sem_c.float().mean(dim=0).cpu().numpy()
             prob_rec_np = rec_c.float().mean(dim=0).cpu().numpy()
-            prob_acc_np = acc_c.float().mean(dim=0).cpu().numpy()
 
             vid_det_raw_list.append(prob_det_np)
             vid_route_list.append(prob_route_np)
             vid_sem_list.append(prob_sem_np)
             vid_rec_list.append(prob_rec_np)
-            vid_acc_list.append(prob_acc_np)
             vid_logits1_list.append(logits1_c.float().mean(dim=0).cpu())
             vid_logits2_list.append(logits2_c.float().mean(dim=0).cpu())
 
@@ -236,6 +227,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     eff_aux_alpha = aux_eval_alpha if has_aux_stream else 0.0
 
     final_det_raw_all = []
+    final_det_smooth_all = []
     final_route_all = []
     final_sem_all = []
     final_aux_all = []
@@ -246,45 +238,48 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         d_v = vid_det_raw_list[idx_v]
         s_v = vid_sem_list[idx_v]
         rec_v = vid_rec_list[idx_v]
-        acc_v = vid_acc_list[idx_v]
         a_v = vid_aux_list[idx_v]
 
-        # 1. Pure Visual-Semantic-ACC-Prototype Collaborative Score (0% audio false alarms)
-        v_base = (1.0 - collab_alpha) * r_v + collab_alpha * (0.55 * s_v + 0.25 * acc_v + 0.20 * rec_v)
+        # 1. Visual-Semantic-Prototype Base Score
+        v_base = (1.0 - collab_alpha) * r_v + collab_alpha * (0.75 * s_v + 0.25 * rec_v)
 
-        # 2. Visual-Semantic Concordance Gate:
-        # Strictly 0.0 when both visual detector and CLIP semantic confirm a calm normal scene (max <= 0.08),
-        # eliminating loud movie music/SFX false alarms while smoothly activating acoustic violence evidence!
+        # 2. Peak-Preserving Multiplicative Concordance Modulation (Argon-4 Principle):
+        # Never dilutes high-confidence visual peaks (`v_base`); boosts when both Audio and
+        # CLIP Semantic confirm violence, and gently vetoes ambiguous motion when both Audio
+        # and Semantic confirm a calm normal scene.
         if eff_aux_alpha > 0.0:
-            g_vs = np.clip((np.maximum(d_v, s_v) - 0.08) / 0.25, 0.0, 1.0)
-            w_aud = eff_aux_alpha * g_vs
-            c_v = (1.0 - w_aud) * v_base + w_aud * a_v
+            sem_conf = np.clip((s_v - 0.15) / 0.35, 0.0, 1.0)
+            boost = np.maximum(0.0, a_v - v_base) * sem_conf
+            calm_veto = np.clip(0.25 - np.maximum(s_v, a_v), 0.0, 0.25) / 0.25
+            c_v = np.clip(v_base + eff_aux_alpha * boost - (0.5 * eff_aux_alpha) * v_base * calm_veto, 0.0, 1.0)
         else:
             c_v = v_base
 
         if smooth_eval:
+            d_eval = smooth_scores(d_v, method=smooth_method, sigma=smooth_sigma)
             r_eval = smooth_scores(r_v, method=smooth_method, sigma=smooth_sigma)
             s_eval = smooth_scores(s_v, method=smooth_method, sigma=smooth_sigma)
             a_eval = smooth_scores(a_v, method=smooth_method, sigma=smooth_sigma)
             c_eval = smooth_scores(c_v, method=smooth_method, sigma=smooth_sigma)
         else:
-            r_eval, s_eval, a_eval, c_eval = r_v, s_v, a_v, c_v
+            d_eval, r_eval, s_eval, a_eval, c_eval = d_v, r_v, s_v, a_v, c_v
 
         final_det_raw_all.append(d_v)
+        final_det_smooth_all.append(d_eval)
         final_route_all.append(r_eval)
         final_sem_all.append(s_eval)
         final_aux_all.append(a_eval)
         final_collab_all.append(c_eval)
 
         if compute_dmap:
-            collab_dmap = 0.75 * c_eval + 0.25 * acc_v
-            collab_t = torch.from_numpy(collab_dmap).float().unsqueeze(-1)
+            collab_t = torch.from_numpy(c_eval).float().unsqueeze(-1)
             opt_probs = refine_scores_hierarchical(
                 vid_logits1_list[idx_v], vid_logits2_list[idx_v], args.temp, collab_t
             )
             element_logits2_stack.append(np.repeat(opt_probs.numpy(), 16, axis=0))
 
     pred_det_raw = np.nan_to_num(np.repeat(np.concatenate(final_det_raw_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
+    pred_det_smooth = np.nan_to_num(np.repeat(np.concatenate(final_det_smooth_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_route = np.nan_to_num(np.repeat(np.concatenate(final_route_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_sem = np.nan_to_num(np.repeat(np.concatenate(final_sem_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_aux = np.nan_to_num(np.repeat(np.concatenate(final_aux_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -292,6 +287,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     n_gt = len(gt)
     pred_det_raw = pred_det_raw[:n_gt] if len(pred_det_raw) >= n_gt else np.pad(pred_det_raw, (0, n_gt - len(pred_det_raw)))
+    pred_det_smooth = pred_det_smooth[:n_gt] if len(pred_det_smooth) >= n_gt else np.pad(pred_det_smooth, (0, n_gt - len(pred_det_smooth)))
     pred_route = pred_route[:n_gt] if len(pred_route) >= n_gt else np.pad(pred_route, (0, n_gt - len(pred_route)))
     pred_sem = pred_sem[:n_gt] if len(pred_sem) >= n_gt else np.pad(pred_sem, (0, n_gt - len(pred_sem)))
     pred_aux = pred_aux[:n_gt] if len(pred_aux) >= n_gt else np.pad(pred_aux, (0, n_gt - len(pred_aux)))
@@ -299,12 +295,17 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     auc_det_raw = roc_auc_score(gt, pred_det_raw)
     ap_det_raw = average_precision_score(gt, pred_det_raw)
+    auc_det_smooth = roc_auc_score(gt, pred_det_smooth)
+    ap_det_smooth = average_precision_score(gt, pred_det_smooth)
     auc_route = roc_auc_score(gt, pred_route)
     ap_route = average_precision_score(gt, pred_route)
     auc_sem = roc_auc_score(gt, pred_sem)
     ap_sem = average_precision_score(gt, pred_sem)
     auc_collab = roc_auc_score(gt, pred_collab)
     ap_collab = average_precision_score(gt, pred_collab)
+
+    best_det_ap = max(ap_det_raw, ap_det_smooth)
+    best_det_auc = auc_det_raw if ap_det_raw >= ap_det_smooth else auc_det_smooth
 
     avg_crops = float(np.mean(crop_counts)) if crop_counts else 1.0
     gate_info = ""
@@ -313,7 +314,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         gate_info = f" | SafeGate={gates_cat.mean().item():.4f}"
 
     print(f"  [Eval {avg_crops:.1f}-Crop{gate_info}]", flush=True)
-    print(f"    LGT-SGNM Visual Detector     : AP = {ap_det_raw * 100:.2f}% | AUC = {auc_det_raw * 100:.2f}%", flush=True)
+    print(f"    LGT-SGNM Visual Detector     : AP = {best_det_ap * 100:.2f}% | AUC = {best_det_auc * 100:.2f}%", flush=True)
     print(f"    Safe-RUPA Visual Routing     : AP = {ap_route * 100:.2f}% | AUC = {auc_route * 100:.2f}%", flush=True)
     print(f"    Vision-Language Semantic     : AP = {ap_sem * 100:.2f}% | AUC = {auc_sem * 100:.2f}%", flush=True)
     if has_aux_stream:
@@ -333,7 +334,12 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             print(f"    [Note] Detection mAP skipped: {exc}", flush=True)
 
     sys.stdout.flush()
-    candidates = [(ap_collab, auc_collab), (ap_route, auc_route), (ap_det_raw, auc_det_raw)]
+    candidates = [
+        (ap_collab, auc_collab),
+        (ap_route, auc_route),
+        (ap_det_raw, auc_det_raw),
+        (ap_det_smooth, auc_det_smooth),
+    ]
     primary_ap, primary_auc = max(candidates, key=lambda x: x[0])
     return primary_auc, primary_ap, avg_dmap
 

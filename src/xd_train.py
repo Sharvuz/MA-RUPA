@@ -16,7 +16,7 @@ from utils.tools import (
 )
 from utils.StableAdamW import StableAdamW
 from utils.losses import (
-    CLAS2, CLASM, CLASM_EVENT, CLASM_BKG,
+    CLAS2, CLASM, RUPA_RESIDUAL_EVENT, CLASM_BKG,
     text_orthogonality_loss, ConsistencyLoss, routing_anchor_loss,
     edge_preserving_smoothness_loss, audio_guided_mil_loss,
     iam_intention_loss, acc_pseudo_label_loss,
@@ -119,7 +119,6 @@ def build_xd_components(args, device):
         )
         probe_datasets = (normal_dataset, anomaly_dataset)
     else:
-        # Single natural shuffled DataLoader utilizing 100% of XD-Violence's 39,540 crops (51.8% Normal / 48.2% Abnormal)
         train_dataset = XDDataset(
             args.visual_length, args.train_list, False, XD_LABEL_MAP,
             audio_file_path=args.audio_train_list, audio_dir=args.audio_dir,
@@ -144,7 +143,6 @@ def build_xd_components(args, device):
         collate_fn=xd_test_collate_fn, **loader_kwargs,
     )
 
-    # Auto-detect audio feature dimension on disk (128 VGGish vs 512 CLAP/AST)
     if not args.no_audio:
         detected_audio_dim = None
         for ds in probe_datasets:
@@ -181,10 +179,10 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-            print(f"[MA-RUPA v4 Codebase] Git Commit: {commit_hash}", flush=True)
+            print(f"[MA-RUPA v4+ Argon-4] Git Commit: {commit_hash}", flush=True)
         except Exception:
             pass
-        print(f"[MA-RUPA v4] Training XD-Violence on device: {device}", flush=True)
+        print(f"[MA-RUPA v4+ Argon-4] Training XD-Violence on device: {device}", flush=True)
         setup_seed(args.seed)
         model, normal_loader, anomaly_loader, testloader, label_map = build_xd_components(args, device)
     else:
@@ -205,10 +203,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
-    # Parameter Grouping:
-    # 1. Pure Visual/Text LGT+CLIP_Adapter backbone @ main_lr (1e-5, zero audio gradient contamination)
-    # 2. Decoupled VGGish Cross-Modal Audio Adapter @ audio_lr (3e-5, weight_decay=1e-4)
-    # 3. SGNM Dynamic Normal Prototype Refiner & Detached SafeGate @ refiner_lr (StableAdamW)
     refiner_params = []
     audio_adapter_params = []
     main_model_params = []
@@ -243,7 +237,14 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     else:
         num_batches_per_epoch = len(normal_loader)
         eff_batch = normal_loader.batch_size
-        sampling_desc = f"{eff_batch} (Single Natural Shuffled Loader -- 100% of {len(normal_loader.dataset)} crops)"
+        ds = normal_loader.dataset
+        if getattr(ds, 'sample_one_crop_per_video', False) and getattr(ds, 'video_groups', None):
+            sampling_desc = (
+                f"{eff_batch} (Stratified {ds.crops_per_video}-Crop Unique Video Loader -- "
+                f"{len(ds)} crops/epoch across {len(ds.video_groups)} unique videos)"
+            )
+        else:
+            sampling_desc = f"{eff_batch} (Single Natural Shuffled Loader -- 100% of {len(ds)} crops)"
 
     total_iters = max(1, args.max_epoch * num_batches_per_epoch)
 
@@ -295,14 +296,14 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
         print(f"[Resume] Resumed from epoch {start_epoch}, best AP={ap_best * 100:.2f}%", flush=True)
 
-    lambda_iam = float(getattr(args, 'lambda_iam', 0.40))
-    lambda_acc = float(getattr(args, 'lambda_acc', 0.30))
+    lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
+    lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v5 (LAS-VAD CONVERGENCE) MULTIMODAL SOTA ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v4+ (ARGON-4 GRADIENT CONSERVATION) MULTIMODAL SOTA ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {sampling_desc}", flush=True)
     print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps | Main LR={main_lr:.1e}, Audio LR={audio_lr:.1e}", flush=True)
-    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | IAM={lambda_iam} | ACC={lambda_acc} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight} | AuxAV={args.lambda_aux}", flush=True)
-    print(f"  Multi-Crop : {'5-Crop Parallel Multimodal Eval Active' if args.multi_crop_eval else '1-Crop Eval'}", flush=True)
+    print(f"  Loss Eq.   : GC-MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | ResEv={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight} | AuxAV={args.lambda_aux}", flush=True)
+    print(f"  Multi-Crop : {'5-Crop Parallel Multimodal Eval Active' if args.multi_crop_eval else '1-Crop Eval'} (sigma={args.smooth_sigma})", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
@@ -310,7 +311,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         DNP_use = args.DNP_use and (not args.no_rupa)
         epoch_improved = False
 
-        sum_l1 = sum_l2 = sum_l3 = sum_iam = sum_acc = sum_cons = sum_g = sum_aux = 0.0
+        sum_l1 = sum_l2 = sum_l3 = sum_cons = sum_g = sum_aux = 0.0
         epoch_t0 = time.time()
 
         if dual_loader_mode:
@@ -334,7 +335,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
             text_labels = get_batch_label(text_labels_raw, prompt_text, label_map).to(device)
 
-            # Guard against 1-sample tail shard in DataParallel if custom dataset size == k*BS + 1
             forward_module = (
                 raw_model
                 if (isinstance(model, nn.DataParallel) and visual_features.shape[0] < torch.cuda.device_count())
@@ -347,7 +347,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
             loss2 = CLASM(logits2, text_labels, feat_lengths, device)
             loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num)
-            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
+            loss4 = RUPA_RESIDUAL_EVENT(logits3, text_labels, feat_lengths, device)
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
 
             iam_protos = raw_model.iam_module.intention_prototypes if getattr(raw_model, 'iam_module', None) is not None else None
@@ -360,7 +360,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 if lambda_acc > 0 else logits1.sum() * 0.0
             )
 
-            # Decoupled Audio-Visual MIL + 7-Class Semantic Alignment (backpropagates ONLY into `audio_adapter`)
             aux_logits = dnp_dict.get('aux_logits')
             aux_sem_logits = dnp_dict.get('aux_sem_logits')
             if aux_logits is not None and args.lambda_aux > 0:
@@ -438,8 +437,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             sum_l1 += loss1.item()
             sum_l2 += loss2.item()
             sum_l3 += loss3.item()
-            sum_iam += loss_iam.item()
-            sum_acc += loss_acc.item()
             sum_cons += cons_loss.item()
             sum_g += g_loss.item()
             sum_aux += loss_aux.item()
@@ -452,13 +449,11 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
-                    f"IAM:{sum_iam/iter_num:.4f} ACC:{sum_acc/iter_num:.4f} "
                     f"Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} AuxAV:{sum_aux/iter_num:.4f} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )
 
-            # Mid-epoch peak catching
             if args.eval_interval > 0 and iter_num % args.eval_interval == 0 and iter_num < num_batches_per_epoch:
                 auc_cur, ap_cur, _ = test(
                     model, testloader, args.visual_length, prompt_text,
@@ -495,7 +490,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 flush=True,
             )
 
-        # Save latest resumable checkpoint at the end of every epoch
         torch.save({
             'epoch': e,
             'model_state_dict': best_live_state if best_live_state is not None else live_state,
@@ -509,7 +503,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             'best_auc': auc_best,
         }, args.checkpoint_path)
 
-        # Evaluate Polyak EMA weights from Epoch 2+ for ultra-smooth generalization
         if ema is not None and e >= 1:
             backup = ema.apply_to(model)
             print(f"--- Epoch {e+1}/{args.max_epoch} | Evaluating Polyak-EMA Weights ---", flush=True)
@@ -529,7 +522,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 )
             ema.restore(model, backup)
 
-        # Anchor next epoch to the best-generalizing checkpoint (Prevents mid/late-epoch overfitting drift)
         if best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:

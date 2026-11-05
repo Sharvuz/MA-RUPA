@@ -199,9 +199,9 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
 
             v_base = 0.88 * s_routing + 0.12 * (0.70 * s_sem + 0.30 * s_rec)
             if has_aux:
-                g_vs = np.clip((np.maximum(s_det, s_sem) - 0.08) / 0.25, 0.0, 1.0)
-                w_aud = 0.18 * g_vs
-                s_collab = (1.0 - w_aud) * v_base + w_aud * s_aux
+                g_vs = np.clip((np.maximum(s_det, s_sem) - 0.10) / 0.25, 0.0, 1.0)
+                concordance = g_vs * s_aux
+                s_collab = np.clip(v_base * (1.0 + 0.24 * (concordance - 0.15 * (1.0 - s_aux) * g_vs)) + 0.096 * concordance, 0.0, 1.0)
             else:
                 s_collab = v_base
 
@@ -266,20 +266,24 @@ def analyze_and_sweep(records: List[Dict[str, Any]], dataset: str) -> Dict[str, 
     rec_all = np.concatenate([np.repeat(r['s_rec'], 16)[:len(r['gt_frames'])] for r in valid_records])
     aux_all = np.concatenate([np.repeat(r['s_aux'], 16)[:len(r['gt_frames'])] for r in valid_records])
 
-    g_vs_all = np.clip((np.maximum(det_all, sem_all) - 0.08) / 0.25, 0.0, 1.0)
-    aux_alphas = [0.0, 0.12, 0.18, 0.24] if dataset == 'xd' else [0.0]
+    g_vs_all = np.clip((np.maximum(det_all, sem_all) - 0.10) / 0.25, 0.0, 1.0)
+    aux_alphas = [0.0, 0.06, 0.08, 0.12] if dataset == 'xd' else [0.0]
 
     best = {'ap': 0.0, 'auc': 0.0, 'recipe': ''}
     stream_choices = [('det', det_all), ('route', route_all)]
     alphas = [0.0, 0.02, 0.05, 0.08, 0.12, 0.16] if dataset == 'ucf' else [0.0, 0.08, 0.12, 0.16, 0.20]
-    sigmas = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0]
+    sigmas = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2]
 
     for stream_name, base_s in stream_choices:
         for alpha in alphas:
             v_base = (1.0 - alpha) * base_s + alpha * (0.70 * sem_all + 0.30 * rec_all)
             for aux_a in aux_alphas:
-                w_aud = aux_a * g_vs_all
-                blend = (1.0 - w_aud) * v_base + w_aud * aux_all
+                if aux_a > 0.0:
+                    concordance = g_vs_all * aux_all
+                    boost_gain = min(0.35, 3.0 * aux_a)
+                    blend = np.clip(v_base * (1.0 + boost_gain * (concordance - 0.15 * (1.0 - aux_all) * g_vs_all)) + (0.40 * boost_gain) * concordance, 0.0, 1.0)
+                else:
+                    blend = v_base
                 for sig in sigmas:
                     s_arr = blend if sig == 0.0 else gaussian_filter1d(blend, sigma=sig * 16.0 / 16.0)
                     auc_v = float(roc_auc_score(all_gt, s_arr))

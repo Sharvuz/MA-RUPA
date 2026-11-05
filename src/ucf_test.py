@@ -62,11 +62,10 @@ def _forward_splits_chunked(eval_model: nn.Module, visual_flat: torch.Tensor,
         route_s = dnp_dict.get('routing_scores', det_s)
         rec_s = dnp_dict.get('reconstruction_scores', det_s)
         sem_s = dnp_dict.get('semantic_scores')
-        acc_s = dnp_dict.get('acc_scores', det_s)
         gate_s = dnp_dict.get('routing_gate')
-        return logits1, logits2, det_s, route_s, rec_s, sem_s, acc_s, gate_s
+        return logits1, logits2, det_s, route_s, rec_s, sem_s, gate_s
 
-    l1_list, l2_list, d_list, r_list, rec_list, sem_list, acc_list, g_list = [], [], [], [], [], [], [], []
+    l1_list, l2_list, d_list, r_list, rec_list, sem_list, g_list = [], [], [], [], [], [], []
     for start in range(0, total_b, max_chunk):
         end = min(start + max_chunk, total_b)
         _, l1, l2, _, _, dnp_c = eval_model(
@@ -81,7 +80,6 @@ def _forward_splits_chunked(eval_model: nn.Module, visual_flat: torch.Tensor,
         rec_list.append(dnp_c.get('reconstruction_scores', d_c))
         if dnp_c.get('semantic_scores') is not None:
             sem_list.append(dnp_c['semantic_scores'])
-        acc_list.append(dnp_c.get('acc_scores', d_c))
         if dnp_c.get('routing_gate') is not None:
             g_list.append(dnp_c['routing_gate'])
 
@@ -92,14 +90,13 @@ def _forward_splits_chunked(eval_model: nn.Module, visual_flat: torch.Tensor,
         torch.cat(r_list, dim=0),
         torch.cat(rec_list, dim=0),
         torch.cat(sem_list, dim=0) if sem_list else None,
-        torch.cat(acc_list, dim=0),
         torch.cat(g_list, dim=0) if g_list else None,
     )
 
 
 def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
          DNP_use, device, args, compute_dmap: bool = False):
-    """Evaluates MA-RUPA v5 (LAS-VAD Convergence) on UCF-Crime with Parallel 10-Crop Aggregation."""
+    """Evaluates MA-RUPA v4+ (Argon-4 Edition) on UCF-Crime with Parallel 10-Crop Aggregation."""
     eval_model = model.module if isinstance(model, nn.DataParallel) else model
     eval_model.to(device)
     eval_model.eval()
@@ -107,16 +104,15 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     multi_crop = bool(getattr(args, 'multi_crop_eval', True))
     max_crops = int(getattr(args, 'max_test_crops', 10)) if multi_crop else 1
     data_dir = getattr(args, 'data_dir', None)
-    collab_alpha = float(getattr(args, 'collab_alpha', 0.12))
+    collab_alpha = float(getattr(args, 'collab_alpha', 0.08))
     smooth_eval = bool(getattr(args, 'smooth_eval', True))
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
-    smooth_sigma = float(getattr(args, 'smooth_sigma', 0.80))
+    smooth_sigma = float(getattr(args, 'smooth_sigma', 1.00))
 
     vid_det_raw_list = []
     vid_route_list = []
     vid_sem_list = []
     vid_rec_list = []
-    vid_acc_list = []
     vid_logits1_list = []
     vid_logits2_list = []
     routing_gate_vals = []
@@ -159,7 +155,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             padding_mask = get_batch_mask(lengths_flat, maxlen).to(device)
             visual_flat = vis_crops.view(C * num_splits, maxlen, D).to(device)
 
-            logits1, logits2, det_s, route_s, rec_s, sem_s, acc_s, gate_s = _forward_splits_chunked(
+            logits1, logits2, det_s, route_s, rec_s, sem_s, gate_s = _forward_splits_chunked(
                 eval_model, visual_flat, padding_mask, prompt_text, lengths_flat, DNP_use
             )
 
@@ -168,9 +164,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             det_c = det_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
             route_c = route_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
             rec_c = rec_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
-            acc_c = acc_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0]
 
-            # Temperature-calibrated Vision-Language + IAM Semantic Anomaly Probability
             if sem_s is not None:
                 p_sem_c = sem_s.view(C, num_splits * maxlen, -1)[:, :len_cur, 0].clamp(0.0, 1.0)
             else:
@@ -180,7 +174,6 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             vid_route_list.append(route_c.float().mean(dim=0).cpu().numpy())
             vid_sem_list.append(p_sem_c.float().mean(dim=0).cpu().numpy())
             vid_rec_list.append(rec_c.float().mean(dim=0).cpu().numpy())
-            vid_acc_list.append(acc_c.float().mean(dim=0).cpu().numpy())
             vid_logits1_list.append(logits1_c.float().mean(dim=0).cpu())
             vid_logits2_list.append(logits2_c.float().mean(dim=0).cpu())
 
@@ -199,10 +192,9 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         d_v = vid_det_raw_list[idx_v]
         s_v = vid_sem_list[idx_v]
         rec_v = vid_rec_list[idx_v]
-        acc_v = vid_acc_list[idx_v]
 
-        # Calibrated multi-view synergy: combines AAT+IAM semantic, ACC connected components, and SGNM reconstruction
-        aux_synergy = 0.55 * s_v + 0.25 * acc_v + 0.20 * rec_v
+        # Calibrated semantic + CLIP-cone normalized prototype synergy
+        aux_synergy = 0.75 * s_v + 0.25 * rec_v
         c_v = (1.0 - collab_alpha) * r_v + collab_alpha * aux_synergy
 
         if smooth_eval:
@@ -220,9 +212,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         final_collab_all.append(c_eval)
 
         if compute_dmap:
-            # Consolidate temporal localization segments with ACC connected component scores
-            collab_dmap = 0.75 * c_eval + 0.25 * acc_v
-            collab_t = torch.from_numpy(collab_dmap).float().unsqueeze(-1)
+            collab_t = torch.from_numpy(c_eval).float().unsqueeze(-1)
             opt_probs = refine_scores_hierarchical(
                 vid_logits1_list[idx_v], vid_logits2_list[idx_v], args.temp, collab_t
             )

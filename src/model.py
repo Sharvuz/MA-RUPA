@@ -1,24 +1,19 @@
-"""MA-RUPA v5: LAS-VAD Convergence Architecture (AAT + IAM + ACC + Visual-Protected LGT-SGNM).
+"""MA-RUPA v4+ (Argon-4 Gradient Conservation Edition): Pure LGT-SGNM & Visual-Protected WS-VAD.
 
-Mathematically disciplined SOTA architecture for Weakly-Supervised Video Anomaly Detection (WS-VAD),
-combining the 88.34% AUC LGT + SGNM + CLIP-Adapter core with the three breakthrough mechanisms from
-LAS-VAD (Wang & Zhao, arXiv:2603.00550, Feb 2026):
-  1. Pure LGT Dual-GCN Backbone (VadCLIP / DSANet): Local Window Transformer + Thresholded Cosine GCN
-     (`adj4`) + Temporal Distance GCN (`disAdj`).
-  2. Anomaly Attribute Clues (AAT) in Batched CLIPTextAdapter: Combines canonical concept embeddings
-     (`X_lang`) with LLM-derived observable sensory attributes (`X_aux`: flames, thick smoke, bright
-     flash, flying debris, rapid physical brawl) via bias-free `SimpleAdapter` + `SimpleProj`.
-  3. Intention Awareness Mechanism (IAM - LAS-VAD Sec. 3.2): Decomposes video trajectory into
-     Position (`X_p`), 1st-order gated Velocity (`X_v`), and 2nd-order gated Acceleration (`X_a`)
-     with momentum-updated Intention Prototypes (`Z`) and Kinematic Continuity Gating to suppress
-     isolated 1-frame camera/lighting false alarms on Normal videos.
-  4. Anomaly-Connected Components (ACC - LAS-VAD Sec. 3.3): Rectifies pairwise visual similarity
-     with cross-modal semantic consistency (`A_w = A_v * (1 + eta * max_c min(q_i, q_j))`), extracts
-     connected components via GPU Boolean Matrix Squaring (`tau = 0.85`), and generates segment-coherent
-     pseudo-labels (`g`) and component-consolidated anomaly scores (`s_acc`) to double mAP@IoU.
-  5. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence): Bidirectional Visual-Audio
-     Cross-Attention with Acoustic Kinematic Velocity/Shock Gating and Multi-Class Audio-Text
-     Attribute Alignment (`logits_aux_sem`) conditioned on `visual_features.detach()`.
+Engineered under the Argon-4 Gradient Conservation Law to surpass 89.5% AUC on UCF-Crime
+and 87.0% AP on XD-Violence:
+  1. Pure LGT Dual-GCN Backbone (VadCLIP / DSANet): Local Window Transformer (with NaN-safe
+     valid-length padding mask) + Thresholded Cosine GCN (`adj4`) + Temporal Distance GCN (`disAdj`).
+  2. Pure Canonical CLIP Concept Space (`aat_weight=0.0` by default): Eliminates long-sentence AAT
+     cone dilution and auxiliary IAM/ACC bottlenecks so 100% of representation capacity serves
+     Top-k MIL and Multi-Class Semantic Alignment.
+  3. Valid-Masked & Reliability-Weighted SGNM Prototype Refiner: Masks out padded frames (`t >= L_i`)
+     prior to normal snippet selection, weights normal candidates by `reliability = 1 - p_det`, and
+     normalizes reconstruction distance against each video's intrinsic CLIP-cone baseline.
+  4. Valid-Masked Contrastive Event/Background Pooling (`logits3`, `logits4`): Prevents padded tail
+     frames (`1 - p_det ~ 1.0`) from dominating background feature pooling on short videos.
+  5. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence): Conditioned on `visual_features.detach()`
+     with Peak-Preserving Concordance Gating so soundtrack noise never contaminates visual features.
 """
 
 from collections import OrderedDict
@@ -34,6 +29,7 @@ from utils.layers import GraphConvolution, DistanceAdj
 from utils.adapter_modules import SimpleAdapter, SimpleProj
 from utils.descriptions import DESCRIPTIONS_ORI, DESCRIPTIONS_ORI_XD
 from utils.dnp_vision_transformer import Aggregation_Block, Prototype_Block
+from utils.losses import compute_normalized_recon_error
 
 
 OPTIONAL_STATE_PREFIXES = (
@@ -191,16 +187,11 @@ class MSTSensitivityAdapter(nn.Module):
 
 
 # ============================================================================
-# 2. LAS-VAD Intention Awareness Mechanism (IAM - Sec. 3.2, Eq. 10-11)
+# 2. Legacy Optional Modules (Kept for Unit-Test Compatibility; Off by Default)
 # ============================================================================
 
 class IntentionAwarenessModule(nn.Module):
-    """LAS-VAD Kinematic Intention Awareness Mechanism (IAM).
-
-    Extracts Position (X_p), 1st-order Velocity (X_v), and 2nd-order Acceleration (X_a)
-    with kernel-3 Conv1D sigmoid gating (Eq. 10), maintains EMA Intention Prototypes Z,
-    and computes Kinematic Continuity Gating to suppress isolated 1-frame normal spikes.
-    """
+    """Optional Kinematic Intention Awareness Module (off by default in Argon-4 Edition)."""
 
     def __init__(self, feature_dim: int = 512, num_classes: int = 14,
                  momentum: float = 0.1, conf_thresh: float = 0.35, dropout: float = 0.1,
@@ -210,7 +201,7 @@ class IntentionAwarenessModule(nn.Module):
             feature_dim = embed_dim
         self.feature_dim = feature_dim
         self.num_classes = num_classes
-        self.k_dim = feature_dim // 3  # 170 for D=512
+        self.k_dim = feature_dim // 3
         self.momentum = momentum
         self.conf_thresh = conf_thresh
 
@@ -229,12 +220,9 @@ class IntentionAwarenessModule(nn.Module):
             nn.Linear(feature_dim, num_classes),
         )
 
-        # Intention Prototypes Z in R^{C x D} updated via momentum EMA (LAS-VAD Sec. 3.2)
         init_proto = F.normalize(torch.randn(num_classes, feature_dim), dim=-1)
         self.register_buffer('prototypes', init_proto)
         self.register_buffer('proto_initialized', torch.tensor(False))
-
-        # Residual fusion weight for blending intention logits with CLIP semantic logits
         self.gamma_iam = nn.Parameter(torch.tensor(0.15))
 
     @property
@@ -246,12 +234,10 @@ class IntentionAwarenessModule(nn.Module):
         if valid_mask is not None:
             x_n = x_n * valid_mask
 
-        # Position features X_p in R^{B x T x (D/3)}
         x_p = self.fc_p(x_n)
         if valid_mask is not None:
             x_p = x_p * valid_mask
 
-        # 1st-order Velocity difference: |X_p[t] - X_p[t-1]|
         diff_v = torch.zeros_like(x_p)
         if x_p.shape[1] > 1:
             diff_v[:, 1:, :] = (x_p[:, 1:, :] - x_p[:, :-1, :]).abs()
@@ -263,7 +249,6 @@ class IntentionAwarenessModule(nn.Module):
         if valid_mask is not None:
             x_v = x_v * valid_mask
 
-        # 2nd-order Acceleration difference: |X_v[t] - X_v[t-1]|
         diff_a = torch.zeros_like(x_v)
         if x_v.shape[1] > 1:
             diff_a[:, 1:, :] = (x_v[:, 1:, :] - x_v[:, :-1, :]).abs()
@@ -307,18 +292,17 @@ class IntentionAwarenessModule(nn.Module):
 
     def forward(self, f_vis: torch.Tensor, valid_mask: torch.Tensor = None, sem_temp: float = 2.0):
         x_p, x_v, x_a, x_int = self._extract_kinematics(f_vis, valid_mask=valid_mask)
-        q_int = self.int_mlp(x_int)  # [B, T, C]
+        q_int = self.int_mlp(x_int)
 
         x_int_norm = F.normalize(x_int.float(), dim=-1)
-        proto_norm = F.normalize(self.prototypes.float(), dim=-1)  # [C, D]
+        proto_norm = F.normalize(self.prototypes.float(), dim=-1)
 
-        # Cosine similarity between each frame's intention feature and the prototype of its predicted label
-        pred_labels = q_int.detach().argmax(dim=-1)  # [B, T]
-        selected_protos = proto_norm[pred_labels]     # [B, T, D]
-        cos_conf = (x_int_norm * selected_protos).sum(dim=-1, keepdim=True)  # [B, T, 1] in [-1, 1]
+        pred_labels = q_int.detach().argmax(dim=-1)
+        selected_protos = proto_norm[pred_labels]
+        cos_conf = (x_int_norm * selected_protos).sum(dim=-1, keepdim=True)
         w_int = (0.5 * (1.0 + cos_conf)).clamp(0.1, 1.0).to(q_int.dtype)
 
-        q_a = q_int * w_int  # Weighted frame-wise intention logits [B, T, C]
+        q_a = q_int * w_int
         q_probs = F.softmax(q_a.float() / max(sem_temp, 0.5), dim=-1)
 
         if self.training:
@@ -326,10 +310,9 @@ class IntentionAwarenessModule(nn.Module):
 
         s_iam = (1.0 - q_probs[:, :, :1]).to(f_vis.dtype).clamp(0.0, 1.0)
 
-        # Kinematic Continuity Factor: suppresses isolated 1-frame glitches where jerk >> sustained velocity
         with torch.no_grad():
-            vel_mag = x_v.float().norm( p=2, dim=-1, keepdim=True)  # [B, T, 1]
-            acc_mag = x_a.float().norm(p=2, dim=-1, keepdim=True)   # [B, T, 1]
+            vel_mag = x_v.float().norm(p=2, dim=-1, keepdim=True)
+            acc_mag = x_a.float().norm(p=2, dim=-1, keepdim=True)
             vel_sustained = F.avg_pool1d(
                 vel_mag.transpose(1, 2), kernel_size=5, stride=1, padding=2
             ).transpose(1, 2)
@@ -351,17 +334,8 @@ class IntentionAwarenessModule(nn.Module):
         }
 
 
-# ============================================================================
-# 3. LAS-VAD Anomaly-Connected Components (ACC - Sec. 3.3, Eq. 12-13)
-# ============================================================================
-
 class AnomalyConnectedComponentModule(nn.Module):
-    """LAS-VAD Anomaly-Connected Components (ACC) with Cross-Modal Rectification.
-
-    Computes pairwise visual similarity A_v, rectifies it using cross-modal text alignment q^l
-    (Eq. 13), thresholds at tau to form binary graph A, extracts connected components via fast
-    GPU Boolean Matrix Squaring, and outputs component pseudo-labels g and consolidated scores.
-    """
+    """Optional Anomaly-Connected Components Module (off by default in Argon-4 Edition)."""
 
     def __init__(self, eta: float = 0.5, tau: float = 0.85, propagation_steps: int = 8):
         super().__init__()
@@ -378,57 +352,47 @@ class AnomalyConnectedComponentModule(nn.Module):
         orig_dtype = visual_features.dtype
 
         x_norm = F.normalize(visual_features.float(), p=2, dim=-1)
-        a_v = torch.bmm(x_norm, x_norm.transpose(1, 2))  # [B, T, T]
+        a_v = torch.bmm(x_norm, x_norm.transpose(1, 2))
 
-        # Cross-modal semantic probability distribution q^l in R^{B x T x C}
         q_l = F.softmax(logits_sem.float() / max(sem_temp, 0.5), dim=-1)
         C = q_l.shape[-1]
 
-        # Memory-efficient max_c min(q^l[i, c], q^l[j, c]) in R^{B x T x T}
         max_min = torch.zeros((B, T, T), device=dev, dtype=torch.float32)
         for c in range(C):
-            q_c = q_l[:, :, c]  # [B, T]
+            q_c = q_l[:, :, c]
             min_c = torch.minimum(q_c.unsqueeze(2), q_c.unsqueeze(1))
             max_min = torch.maximum(max_min, min_c)
 
-        # LAS-VAD Eq. 13: Cross-modal rectified similarity matrix
         a_w = a_v * (1.0 + self.eta * max_min)
-
-        # Binarize at threshold tau (with valid length masking & self-loops)
         a_bin = (a_w > self.tau).float()
         if lengths is not None:
-            valid_1d = torch.arange(T, device=dev)[None, :] < lengths.to(dev)[:, None]  # [B, T]
+            valid_1d = torch.arange(T, device=dev)[None, :] < lengths.to(dev)[:, None]
             valid_2d = (valid_1d.unsqueeze(2) & valid_1d.unsqueeze(1)).float()
             a_bin = a_bin * valid_2d
 
         diag_idx = torch.arange(T, device=dev)
         a_bin[:, diag_idx, diag_idx] = 1.0
 
-        # GPU Connected Components Transitive Closure via 3-step Boolean Matrix Squaring (2^3 = 8 hops)
         a_cc = a_bin
         for _ in range(3):
             a_cc = (torch.bmm(a_cc, a_cc) > 0.0).float()
 
-        comp_sizes = a_cc.sum(dim=-1, keepdim=True).clamp_min(1.0)  # [B, T, 1]
-        w_acc = a_cc / comp_sizes                                   # [B, T, T] row-normalized component pooling
+        comp_sizes = a_cc.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        w_acc = a_cc / comp_sizes
 
-        # Component feature prototypes X_ac and semantic prototypes y_proto (LAS-VAD Sec. 3.3)
-        x_ac = F.normalize(torch.bmm(w_acc, x_norm), p=2, dim=-1)   # [B, T, D]
-        y_proto = torch.bmm(w_acc, q_l)                             # [B, T, C]
+        x_ac = F.normalize(torch.bmm(w_acc, x_norm), p=2, dim=-1)
+        y_proto = torch.bmm(w_acc, q_l)
 
-        # Frame-to-component prototype matching -> frame-level pseudo-labels g in R^{B x T x C}
         sim_proto = torch.bmm(x_norm, x_ac.transpose(1, 2)) / 0.10
         if lengths is not None:
             sim_proto = sim_proto.masked_fill(~valid_1d.unsqueeze(1), float('-inf'))
         proto_assign = F.softmax(sim_proto, dim=-1)
         proto_assign = torch.nan_to_num(proto_assign, nan=0.0)
-        pseudo_labels = torch.bmm(proto_assign, y_proto)            # [B, T, C]
+        pseudo_labels = torch.bmm(proto_assign, y_proto)
         pseudo_labels = pseudo_labels / pseudo_labels.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        # Component-consolidated detector score (suppresses singleton 1-frame noise spikes)
         det_f = detector_scores.float()
-        s_acc = torch.bmm(w_acc, det_f)                             # [B, T, 1]
-        # Damp isolated singleton spikes (comp_size == 1) when raw score is high but neighbors disagree
+        s_acc = torch.bmm(w_acc, det_f)
         singleton_factor = torch.where(comp_sizes <= 1.5, torch.full_like(comp_sizes, 0.70), torch.ones_like(comp_sizes))
         s_acc = (0.75 * s_acc + 0.25 * det_f * singleton_factor).clamp(0.0, 1.0)
 
@@ -441,20 +405,11 @@ class AnomalyConnectedComponentModule(nn.Module):
 
 
 # ============================================================================
-# 4. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence SOTA)
+# 3. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence SOTA)
 # ============================================================================
 
 class GatedCrossModalAudioAdapter(nn.Module):
-    """Bidirectional Visual-Audio Cross-Modal Concordance Branch with Acoustic Kinematics (XD-Violence).
-
-    In MARUPA v5, `MARUPA.forward` feeds `visual_features.detach()` into this branch and keeps
-    `visual_features` 100% untouched before `logits1`, `logits2`, and `SGNM`.
-    Upgraded with:
-      1. Acoustic Kinematic Velocity Gate: distinguishes impulsive acoustic anomalies (gunshots,
-         explosions, glass shattering, screams) from steady normal soundtrack music.
-      2. Optional Audio-Text Semantic Alignment (`logits_aux_sem`) against `text_features_ori.detach()`
-         to resolve the 7-9% audio head AP lag diagnosed by System-2.
-    """
+    """Bidirectional Visual-Audio Cross-Modal Concordance Branch with Acoustic Kinematics (XD-Violence)."""
 
     def __init__(self, visual_dim: int = 512, audio_dim: int = 128, num_heads: int = 4, dropout: float = 0.2):
         super().__init__()
@@ -471,7 +426,6 @@ class GatedCrossModalAudioAdapter(nn.Module):
         self.audio_temp_conv = nn.Conv1d(
             visual_dim, visual_dim, kernel_size=3, padding=1, groups=visual_dim, bias=True
         )
-        # Acoustic 1st-order Kinematic Velocity Conv Gate (captures sudden gunshots/screams/booms)
         self.audio_vel_conv = nn.Conv1d(
             visual_dim, visual_dim, kernel_size=3, padding=1, groups=visual_dim, bias=True
         )
@@ -490,7 +444,6 @@ class GatedCrossModalAudioAdapter(nn.Module):
         nn.init.normal_(self.gate_mlp[-1].weight, std=0.01)
         nn.init.constant_(self.gate_mlp[-1].bias, -1.5)
 
-        # Rich Cross-Modal Concordance Scorer conditioned on [V_ctx, A_ctx, V<-A, V*A]
         self.aux_head = nn.Sequential(
             LayerNorm(visual_dim * 4),
             nn.Linear(visual_dim * 4, visual_dim // 2),
@@ -499,7 +452,6 @@ class GatedCrossModalAudioAdapter(nn.Module):
             nn.Linear(visual_dim // 2, 1),
         )
 
-        # Audio-Visual Semantic Projector for aligning with CLIP+AAT class embeddings
         self.av_sem_proj = nn.Sequential(
             LayerNorm(visual_dim * 2),
             nn.Linear(visual_dim * 2, visual_dim),
@@ -527,12 +479,11 @@ class GatedCrossModalAudioAdapter(nn.Module):
             else:
                 a_aligned = F.pad(a_aligned, (0, self.audio_dim - a_aligned.shape[-1]))
 
-        has_signal = (a_aligned.abs().sum(dim=(-1, -2), keepdim=True) > 1e-6).to(f_vis.dtype)  # [B, 1, 1]
+        has_signal = (a_aligned.abs().sum(dim=(-1, -2), keepdim=True) > 1e-6).to(f_vis.dtype)
 
         a_lift = self.audio_lift(self.audio_input_norm(a_aligned))
         a_conv = self.audio_temp_conv(a_lift.transpose(1, 2)).transpose(1, 2)
 
-        # Acoustic Kinematic Velocity (1st-order temporal difference + Conv1d sigmoid gating)
         a_diff = torch.zeros_like(a_lift)
         if T > 1:
             a_diff[:, 1:, :] = (a_lift[:, 1:, :] - a_lift[:, :-1, :]).abs()
@@ -553,16 +504,15 @@ class GatedCrossModalAudioAdapter(nn.Module):
         a_from_v = torch.nan_to_num(a_from_v, nan=0.0)
 
         av_joint = torch.cat([v_n, a_n + a_from_v, v_from_a, v_n * a_n], dim=-1)
-        logits_aux = self.aux_head(av_joint)  # [B, T, 1]
+        logits_aux = self.aux_head(av_joint)
         logits_aux = logits_aux * has_signal + (-6.0) * (1.0 - has_signal)
         s_aux = torch.sigmoid(logits_aux)
 
-        # Optional Audio-Text Semantic Alignment against CLIP+AAT embeddings (detached text anchor)
         self.last_logits_aux_sem = None
         if text_features_ori is not None:
             av_sem_feat = F.normalize(self.av_sem_proj(torch.cat([a_n + a_from_v, v_from_a], dim=-1)), dim=-1)
-            t_norm = F.normalize(text_features_ori.detach().to(av_sem_feat.dtype), dim=-1)  # [C, D]
-            logits_aux_sem = torch.matmul(av_sem_feat, t_norm.t()) / 0.07                   # [B, T, C]
+            t_norm = F.normalize(text_features_ori.detach().to(av_sem_feat.dtype), dim=-1)
+            logits_aux_sem = torch.matmul(av_sem_feat, t_norm.t()) / 0.07
             self.last_logits_aux_sem = logits_aux_sem
 
         gate_in = torch.cat([v_n, a_n, v_n * a_n], dim=-1)
@@ -579,24 +529,13 @@ class GatedCrossModalAudioAdapter(nn.Module):
 
 
 # ============================================================================
-# 5. Memory-Light Batched CLIP_Adapter with LAS-VAD Anomaly Attribute Clues (AAT)
+# 4. Memory-Light Batched CLIP_Adapter (Pure Canonical Concept Anchor)
 # ============================================================================
 
 class CLIPTextAdapter(nn.Module):
-    """Bias-Free CLIP_Adapter with Canonical Concept Anchor + LAS-VAD Anomaly Attribute Clues (AAT).
+    """Bias-Free CLIP_Adapter on Pure Canonical Class Concepts."""
 
-    Why this exact geometry is critical:
-      1. Deletes unused `clipmodel.visual` (86M params), saving ~350 MB VRAM per GPU and
-         making `torch.nn.DataParallel` 3x faster.
-      2. Uses bias-free `SimpleAdapter(512, 512)` x `text_adapt_until` + `SimpleProj(512, 512, relu=True)`
-         directly on `ln_final(x_eot)`, allowing `text_orthogonality_loss` (`loss3`) to converge
-         smoothly to `0.000`.
-      3. Fuses Canonical Concept (`X_lang`, prompt 0) with Observable Sensory Attribute Clues
-         (`X_aux`, prompts 1..K-1) using `aat_weight` (0.35), rescuing 100% missed anomalies
-         (Arson, Explosion, Assault) while preserving strict Normal-vs-Abnormal orthogonality.
-    """
-
-    def __init__(self, clipmodel, text_adapt_until: int = 3, t_w: float = 0.1, aat_weight: float = 0.35):
+    def __init__(self, clipmodel, text_adapt_until: int = 3, t_w: float = 0.1, aat_weight: float = 0.0):
         super().__init__()
         if hasattr(clipmodel, 'visual'):
             del clipmodel.visual
@@ -639,7 +578,7 @@ class CLIPTextAdapter(nn.Module):
         cast_dtype = self.clipmodel.token_embedding.weight.dtype
         x = self.clipmodel.token_embedding(tokens).to(cast_dtype)
         x = x + self.clipmodel.positional_embedding.to(cast_dtype)
-        x = x.permute(1, 0, 2)  # [77, N_prompts, 512]
+        x = x.permute(1, 0, 2)
 
         for i, block in enumerate(self.clipmodel.transformer.resblocks):
             x = block(x)
@@ -651,7 +590,7 @@ class CLIPTextAdapter(nn.Module):
                 )
                 x = self.t_w * adapt_out + (1.0 - self.t_w) * x
 
-        x = x.permute(1, 0, 2)  # [N_prompts, 77, 512]
+        x = x.permute(1, 0, 2)
         x = self.clipmodel.ln_final(x).float()
         eot_indices = tokens.argmax(dim=-1)
         x_eot = x[torch.arange(x.shape[0], device=tokens.device), eot_indices]
@@ -675,21 +614,30 @@ class CLIPTextAdapter(nn.Module):
         else:
             raise ValueError(f"Unsupported num_classes={num_classes}; expected 14 (UCF) or 7 (XD).")
 
-        feat = self.encode_tokens(tokens, adapt_text=True).view(c, k, -1)  # [C, K, 512]
+        feat = self.encode_tokens(tokens, adapt_text=True).view(c, k, -1)
         if k > 1 and self.aat_weight > 0.0:
             x_lang = F.normalize(feat[:, 0, :], dim=-1)
             x_aux = F.normalize(feat[:, 1:, :].mean(dim=1), dim=-1)
             combined = (1.0 - self.aat_weight) * x_lang + self.aat_weight * x_aux
             return F.normalize(combined, dim=-1)
-        return F.normalize(feat.mean(dim=1), dim=-1)
+        return F.normalize(feat[:, 0, :], dim=-1)
 
 
 # ============================================================================
-# 6. Self-Guided Dynamic Normal Pattern Refiner (SGNM)
+# 5. Self-Guided Dynamic Normal Pattern Refiner (SGNM - Valid-Masked & Reliability-Weighted)
 # ============================================================================
 
 class SGNM(nn.Module):
-    """Dynamic Normal Pattern Extractor & Counterfactual Normal Background Reconstructor."""
+    """Dynamic Normal Pattern Extractor & Counterfactual Normal Background Reconstructor.
+
+    Restores two critical mathematical invariants from original DSANet (`62cfd81`):
+      1. Valid-Length Masking: Padded frames (`t >= lengths[i]`) are masked with `+inf`
+         before `torch.topk(..., largest=False)` so zero-padded tail frames are NEVER
+         selected as normal prototypes.
+      2. Reliability Weighting (`r_t = 1 - p_det(t)`): Modulates normal candidate features
+         by `0.5 + 0.5 * r_t` and weights `gather_loss` by `r_t`, preventing abnormal frames
+         in long-anomaly videos from corrupting normal prototypes.
+    """
 
     def __init__(self, feature_dim: int = 512, num_prototypes: int = 16, num_heads: int = 8,
                  extractor_depth: int = 1, decoder_depth: int = 8, normal_selection_ratio: float = 0.8):
@@ -717,30 +665,47 @@ class SGNM(nn.Module):
         ])
 
     @staticmethod
-    def gather_loss(query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    def gather_loss(query: torch.Tensor, keys: torch.Tensor, reliability: torch.Tensor = None) -> torch.Tensor:
         distribution = 1.0 - F.cosine_similarity(query.unsqueeze(2), keys.unsqueeze(1), dim=-1)
         distance, _ = torch.min(distribution, dim=2)
-        return distance.mean()
+        if reliability is None:
+            return distance.mean()
+        rel_norm = reliability / reliability.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return (distance * rel_norm).sum(dim=1).mean()
 
     def forward(self, visual_features: torch.Tensor, logits1: torch.Tensor, lengths: torch.Tensor = None):
         B, N, D = visual_features.shape
+        dev = visual_features.device
 
         with torch.no_grad():
-            anomaly_scores = torch.sigmoid(logits1.squeeze(-1))
-            num_normal_frames = max(1, int(N * self.normal_selection_ratio))
-            _, indices = torch.topk(anomaly_scores, k=N, largest=False, dim=1)
+            anomaly_scores = torch.sigmoid(logits1.float().squeeze(-1))
+            if lengths is not None:
+                lengths_clamped = lengths.to(device=dev, dtype=torch.long).clamp(min=1, max=N)
+                valid_mask = torch.arange(N, device=dev)[None, :] < lengths_clamped[:, None]
+                masked_scores = anomaly_scores.masked_fill(~valid_mask, float('inf'))
+                min_valid_length = int(lengths_clamped.min().item())
+            else:
+                masked_scores = anomaly_scores
+                min_valid_length = N
+
+            num_normal_frames = max(1, min(int(N * self.normal_selection_ratio), min_valid_length))
+            _, indices = torch.topk(masked_scores, k=num_normal_frames, largest=False, dim=1)
             normal_indices = indices[:, :num_normal_frames]
 
             selected_normal_features = torch.gather(
                 visual_features, 1, normal_indices.unsqueeze(-1).expand(-1, -1, D)
             )
+            selected_scores = torch.gather(anomaly_scores, 1, normal_indices)
+            reliability = (1.0 - selected_scores).clamp(min=1e-4, max=1.0).to(visual_features.dtype)
+
+        weighted_normal_features = selected_normal_features * (0.5 + 0.5 * reliability.unsqueeze(-1))
 
         agg_prototype = self.video_prototypes.unsqueeze(0).expand(B, -1, -1)
         for blk in self.dnp_extractor:
-            agg_prototype = blk(agg_prototype, selected_normal_features)
+            agg_prototype = blk(agg_prototype, weighted_normal_features)
 
         dynamic_normal_patterns = agg_prototype
-        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns)
+        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns, reliability=reliability)
 
         reconstructed_features = self.bottleneck(visual_features)
         for blk in self.decoder:
@@ -750,11 +715,11 @@ class SGNM(nn.Module):
 
 
 # ============================================================================
-# 7. Unified SOTA Model: MARUPA v5 (LAS-VAD Convergence)
+# 6. Unified SOTA Model: MARUPA (Argon-4 Gradient Conservation Edition)
 # ============================================================================
 
 class MARUPA(nn.Module):
-    """MA-RUPA v5: LAS-VAD Convergence Architecture (AAT + IAM + ACC + LGT-SGNM)."""
+    """MA-RUPA v4+ (Argon-4 Gradient Conservation Architecture)."""
 
     def __init__(self,
                  num_class: int,
@@ -778,14 +743,14 @@ class MARUPA(nn.Module):
         self.prompt_postfix = prompt_postfix
         self.device = device
 
-        # Configuration flags
+        # Configuration flags (Pure Argon-4 defaults: no_iam=True, no_acc=True, aat_weight=0.0)
         self.no_rupa = bool(getattr(args, 'no_rupa', False))
         self.rupa_use = (not self.no_rupa) and bool(getattr(args, 'rupa_use', True))
         self.use_mdtp = bool(getattr(args, 'use_mdtp', False)) and (not bool(getattr(args, 'no_mdtp', True)))
         self.no_audio = bool(getattr(args, 'no_audio', False))
         self.no_safegate = bool(getattr(args, 'no_safegate', False))
-        self.use_iam = not bool(getattr(args, 'no_iam', False))
-        self.use_acc = not bool(getattr(args, 'no_acc', False))
+        self.use_iam = bool(getattr(args, 'use_iam', False)) and (not bool(getattr(args, 'no_iam', True)))
+        self.use_acc = bool(getattr(args, 'use_acc', False)) and (not bool(getattr(args, 'no_acc', True)))
 
         self.routing_det_weight = float(getattr(args, 'routing_det_weight', 0.80))
         self.routing_rec_weight = float(getattr(args, 'routing_rec_weight', 0.10))
@@ -840,29 +805,31 @@ class MARUPA(nn.Module):
         else:
             self.audio_adapter = None
 
-        # 3. Sensitivity Detector & Video-Conditioned Prompt MLPs
+        # 3. Sensitivity Detector & Video-Conditioned Prompt MLPs (with DSANet Dropout Restored)
         self.mlp1 = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(visual_width, visual_width * 4)),
             ("gelu", QuickGELU()),
+            ("dropout", nn.Dropout(mlp_dropout)),
             ("c_proj", nn.Linear(visual_width * 4, visual_width)),
         ]))
         self.mlp2 = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(visual_width, visual_width * 4)),
             ("gelu", QuickGELU()),
+            ("dropout", nn.Dropout(mlp_dropout)),
             ("c_proj", nn.Linear(visual_width * 4, visual_width)),
         ]))
         self.classifier = nn.Linear(visual_width, 1)
 
-        # 4. Frozen CLIP Text Backbone + Bias-Free CLIPTextAdapter with LAS-VAD AAT
+        # 4. Frozen CLIP Text Backbone + Bias-Free CLIPTextAdapter on Pure Canonical Concepts
         text_adapt_until = int(getattr(args, 'text_adapt_until', 3 if num_class == 14 else 1))
         t_w = float(getattr(args, 't_w', 0.1 if num_class == 14 else 0.6))
-        aat_weight = float(getattr(args, 'aat_weight', 0.35))
+        aat_weight = float(getattr(args, 'aat_weight', 0.0))
         clipmodel, _ = clip.load("ViT-B/16", device="cpu")
         self.clip_adapter = CLIPTextAdapter(
             clipmodel, text_adapt_until=text_adapt_until, t_w=t_w, aat_weight=aat_weight
         )
 
-        # 5. LAS-VAD Intention Awareness Module (IAM) & Anomaly-Connected Components (ACC)
+        # 5. Optional Legacy Modules (Off by default under Argon-4)
         iam_momentum = float(getattr(args, 'iam_momentum', 0.10))
         self.iam_module = (
             IntentionAwarenessModule(
@@ -940,7 +907,7 @@ class MARUPA(nn.Module):
     def adj4(x: torch.Tensor, seq_len: torch.Tensor = None) -> torch.Tensor:
         """Thresholded cosine similarity graph adjacency over valid snippets (DataParallel-safe)."""
         x_norm = F.normalize(x.float(), p=2, dim=-1)
-        sim = torch.bmm(x_norm, x_norm.transpose(1, 2))  # [B, T, T]
+        sim = torch.bmm(x_norm, x_norm.transpose(1, 2))
         output = torch.zeros_like(sim)
 
         if seq_len is None:
@@ -977,7 +944,7 @@ class MARUPA(nn.Module):
         )
 
         x = (images + pos_emb).permute(1, 0, 2)  # [T, B, D]
-        x = self.temporal(x, attn_mask=attn_mask, padding_mask=None)
+        x = self.temporal(x, attn_mask=attn_mask, padding_mask=padding_mask)
         x = x.permute(1, 0, 2)  # [B, T, D]
 
         adj = self.adj4(x, lengths)
@@ -1021,16 +988,15 @@ class MARUPA(nn.Module):
 
         if padding_mask is None:
             padding_mask = torch.arange(T, device=dev)[None, :] >= lengths_dev[:, None]
-        valid_mask = (~padding_mask).unsqueeze(-1).float()  # [B, T, 1]
+        valid_mask = (~padding_mask).unsqueeze(-1).to(visual.dtype)  # [B, T, 1]
 
-        # 1. Pure Spatio-Temporal LGT Dual-GCN Encoding (never mutated by noisy audio)
+        # 1. Pure Spatio-Temporal LGT Dual-GCN Encoding (with valid padding_mask isolation)
         visual_features = self.encode_video(visual, padding_mask, lengths_dev)
 
-        # 2. Extract Adapted Canonical + AAT Text Embeddings
+        # 2. Extract Adapted Canonical Text Embeddings
         text_features_ori = self.get_text_features(dev)  # [C, 512]
 
         # 3. Visual-Protected Cross-Modal Audio-Visual Branch (XD-Violence)
-        # Uses `visual_features.detach()` so soundtrack/SFX noise never poisons visual representations!
         logits_aux = None
         logits_aux_sem = None
         s_aux = None
@@ -1046,7 +1012,7 @@ class MARUPA(nn.Module):
         detector_score = torch.sigmoid(logits1)
 
         # 5. Video-Conditioned Fine-Grained Text-Visual Alignment (logits2)
-        logits_attn = logits1.permute(0, 2, 1)           # [B, 1, T]
+        logits_attn = (logits1 * valid_mask).permute(0, 2, 1)  # [B, 1, T]
         visual_attn = F.normalize(torch.bmm(logits_attn, visual_features), dim=-1)  # [B, 1, D]
         visual_attn_exp = visual_attn.expand(B, text_features_ori.shape[0], -1)     # [B, C, D]
 
@@ -1057,11 +1023,11 @@ class MARUPA(nn.Module):
         text_features_norm = F.normalize(text_features, dim=-1).permute(0, 2, 1)
         logits2 = torch.bmm(visual_features_norm, text_features_norm.to(visual_features_norm.dtype)) / 0.07  # [B, T, C]
 
-        # 6. Video-Level Event & Background Contrastive Pooling directly on `visual_features`
-        abn_logits = (scale * detector_score).exp() - 1.0
+        # 6. Valid-Masked Video-Level Event & Background Contrastive Pooling
+        abn_logits = ((scale * detector_score).exp() - 1.0) * valid_mask
         abn_weights = F.normalize(abn_logits, p=1, dim=1)
 
-        nor_logits = (scale * (1.0 - detector_score)).exp() - 1.0
+        nor_logits = ((scale * (1.0 - detector_score)).exp() - 1.0) * valid_mask
         nor_weights = F.normalize(nor_logits, p=1, dim=1)
 
         abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]
@@ -1074,16 +1040,14 @@ class MARUPA(nn.Module):
         logits3 = torch.bmm(abn_vis_norm, nor_text_norm.to(abn_vis_norm.dtype)) / 0.07  # [B, 1, C]
         logits4 = torch.bmm(nor_vis_norm, nor_text_norm.to(nor_vis_norm.dtype)) / 0.07  # [B, 1, C]
 
-        # 7. LAS-VAD Intention Awareness Module (IAM) & Anomaly-Connected Components (ACC)
+        # 7. Temperature-Calibrated Semantic Anomaly Score
         sem_temp = 2.5 if self.num_class == 14 else 2.0
         p_sem_clip = F.softmax(logits2.float() / sem_temp, dim=-1)
         semantic_score = (1.0 - p_sem_clip[:, :, :1]).to(visual_features.dtype).clamp(0.0, 1.0)
 
         iam_dict = None
         if self.iam_module is not None:
-            # 100% stop-gradient: IAM acts as a pure read-only intention probe with zero gradient leakage into visual backbone
-            f_iam_in = visual_features.detach()
-            iam_dict = self.iam_module(f_iam_in, valid_mask=valid_mask, sem_temp=sem_temp)
+            iam_dict = self.iam_module(visual_features.detach(), valid_mask=valid_mask, sem_temp=sem_temp)
 
         acc_dict = None
         if self.acc_module is not None:
@@ -1092,7 +1056,6 @@ class MARUPA(nn.Module):
                 lengths=lengths_dev, sem_temp=sem_temp,
             )
 
-        # LAS-VAD Fine-Grained Consensus Probability p^f (combines CLIP semantic + Kinematic Intention)
         if iam_dict is not None:
             p_iam = F.softmax(iam_dict['iam_logits'].float() / sem_temp, dim=-1)
             w_iam = torch.sigmoid(self.iam_module.gamma_iam).to(p_sem_clip.dtype) * 0.35
@@ -1127,15 +1090,15 @@ class MARUPA(nn.Module):
         if acc_dict is not None:
             dnp_dict.update(acc_dict)
 
-        # 8. Self-Guided Dynamic Normal Pattern Refiner (SGNM) & Stop-Gradient Safe-RUPA Calibration
+        # 8. Valid-Masked SGNM Prototype Refiner & CLIP-Cone Normalized Safe-RUPA Calibration
         if DNP_use and not self.no_rupa:
             reconstructed_features, dynamic_normal_patterns, g_loss = self.video_anomaly_refiner(
                 visual_features, logits1, lengths_dev
             )
             residual_features = visual_features - reconstructed_features
-            reconstruction_score = (
-                (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
-            ).clamp(0.0, 1.0)
+            reconstruction_score = compute_normalized_recon_error(
+                visual_features, reconstructed_features, lengths_dev
+            ).unsqueeze(-1).to(visual_features.dtype)
 
             dnp_dict.update({
                 'original_features': visual_features,
@@ -1151,7 +1114,15 @@ class MARUPA(nn.Module):
                 det_d = detector_score.detach()
                 rec_d = reconstruction_score.detach()
                 sem_d = semantic_score.detach()
-                det_anchor = det_d
+
+                # Lightweight Background Spike Isolation: damp isolated 1-frame glitches where
+                # raw det_d spikes far above its 3-frame local neighborhood AND both rec_d and sem_d disagree
+                with torch.no_grad():
+                    det_local = F.avg_pool1d(
+                        det_d.float().transpose(1, 2), kernel_size=3, stride=1, padding=1
+                    ).transpose(1, 2).to(det_d.dtype)
+                    isolated_spike = F.relu(det_d - det_local - 0.25) * F.relu(0.35 - 0.5 * (rec_d + sem_d))
+                    det_anchor = (det_d - 0.30 * isolated_spike).clamp(1e-5, 1.0 - 1e-5)
 
                 fixed_routing_prob = (
                     self.routing_det_weight * det_anchor
@@ -1161,16 +1132,16 @@ class MARUPA(nn.Module):
 
                 if self.routing_mode == 'safe_gate':
                     gate_inputs = torch.cat([
-                        det_d,
+                        det_anchor,
                         rec_d,
                         sem_d,
-                        (rec_d - det_d).abs(),
-                        (sem_d - det_d).abs(),
+                        (rec_d - det_anchor).abs(),
+                        (sem_d - det_anchor).abs(),
                     ], dim=-1)
                     routing_gate = torch.sigmoid(self.rupa_gate(gate_inputs)) * self.routing_gate_max
-                    routing_prob = (det_d + routing_gate * (fixed_routing_prob - det_d)).clamp(1e-5, 1.0 - 1e-5)
+                    routing_prob = (det_anchor + routing_gate * (fixed_routing_prob - det_anchor)).clamp(1e-5, 1.0 - 1e-5)
                 else:
-                    routing_gate = torch.ones_like(det_d)
+                    routing_gate = torch.ones_like(det_anchor)
                     routing_prob = fixed_routing_prob
 
                 dnp_dict.update({
