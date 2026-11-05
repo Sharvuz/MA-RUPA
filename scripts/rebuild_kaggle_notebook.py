@@ -212,17 +212,17 @@ print(f"🎯 Multi-Crop Check: UCF test video có {ucf_crops_found}/10 crops | "
       f"XD test video có {xd_crops_found} crops (tối đa 10).")""")
 
     # Cell 4: UCF-Crime Markdown
-    add_md(r"""## 3. Huấn luyện SOTA trên UCF-Crime (MA-RUPA v6 Argon-4 Gradient Conservation | Dual GPU Tesla T4 | Batch Size 64 = 250 Steps/Epoch)
+    add_md(r"""## 3. Huấn luyện SOTA trên UCF-Crime (MA-RUPA v7 Counterfactual SGNM Overhaul | Smooth 10-Epoch Convergence | Batch Size 64 = 250 Steps/Epoch)
 
-* **Mục tiêu:** **$\ge 89.2\%$ Frame-level ROC-AUC** & **$\ge 14.0\%$ Avg Localization mAP** (vượt qua mốc `88.34%` của nhánh `ucf-sota-88.34`).
-* **Cấu hình hội tụ Bảo toàn Gradient (Argon-4):**
-  * `Batch Size = 64` (`32 Normal + 32 Abnormal` đan xen đều trên 2 GPU, cung cấp đúng `250` bước cập nhật gradient/epoch tại `LR = 7e-5`).
-  * **Gradient-Conserving Multi-Scale Logit-MIL + CLIP-Cone Baseline Normalization:** Không sử dụng các nhánh điều hòa phụ gây nhiễu (`--no-iam --no-acc --aat-weight 0.0`), khôi phục 100% nhãn khái niệm đơn từ chuẩn của CLIP (`DESCRIPTIONS_ORI`) và cách ly hoàn toàn khung hình đệm 0 (`valid_mask`) trong `SGNM` & `nor_logits`.
-  * **Epoch-End Best-Checkpoint Rollback (No LR Freeze):** Cuối mỗi epoch, mô hình tự động neo lại trọng số có AUC tổng quát hóa cao nhất mà không bóp nghẹt biên độ `WarmCosineScheduler`.
-  * **10-Crop Parallel Evaluation (`__0..__9`):** Đánh giá đồng thời cả 10 góc cắt không gian trên toàn bộ 290 video test.""")
+* **Mục tiêu:** **$\ge 89.2\%$ Frame-level ROC-AUC**, **$\ge 36.5\%$ AP** & **$\ge 11.5\%$ Avg Localization mAP** (vượt qua mốc `89.17%` AUC / `36.60%` AP của DSANet gốc).
+* **Đại cải cách Sức mạnh Nội tại Mô hình & Hội tụ Mượt 10 Epoch (Không phụ thuộc Rollback):**
+  1. **Counterfactual Background-Subtracted Residual Injection (`res_adapter` + `beta_res`):** Kết nối trực tiếp đầu ra tái tạo nền của 8 lớp Transformer Decoder trong `SGNM` (`reconstructed_features.detach()`) vào nhánh phát hiện bất thường và căn chỉnh ngữ nghĩa thông qua phần dư phản thực tế $\Delta F_t = (F_t - \hat{F}_t^{\text{norm}}) \odot \text{valid\_mask}$.
+  2. **Valid-Length Masking & Reliability Weighting trong `SGNM` & `logits3/logits4`:** Che mặt nạ `+inf` cho toàn bộ khung hình đệm 0 (`t >= lengths[i]`) trước khi chọn mẫu chuẩn động, ngăn chặn triệt để hiện tượng chọn nhầm khung đệm 0 làm prototype bình thường trên các video ngắn.
+  3. **Hội tụ Mượt 10 Epoch (`--use-rollback False`, `WarmCosineScheduler`, `LR = 5e-5`, `WD = 1e-3`, `Dropout = 0.15`, `Stochastic Bin Jitter`):** Loại bỏ cơ chế rollback giật cục, giữ `MIL` và `CLASM` hội tụ mượt mà suốt 10 epoch vào vùng tối ưu vàng (`MIL ~ 0.035–0.050`, `CLASM ~ 0.22–0.32`).
+  4. **Đánh giá Kép Đồng thời `1-Crop Center (__5)` & `10-Crop Spatial Ensemble` (Unblurred):** Đánh giá chính xác trên góc cắt trung tâm `__5.npy` chuẩn benchmark (không làm mờ đỉnh bất thường bằng Gaussian blur) song song với tổ hợp 10-crop.""")
 
     # Cell 5: Train UCF-Crime Code
-    add_code("""# ========================= 3. TRAIN UCF-CRIME (MA-RUPA v6 ARGON-4 | BATCH 64 | LR 7e-5 | 250 ITERS/EP) =========================
+    add_code("""# ========================= 3. TRAIN UCF-CRIME (MA-RUPA v7 OVERHAUL | SMOOTH 10 EPOCHS | NO ROLLBACK | BS 64) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -246,8 +246,11 @@ cmd_train_ucf = [
     "--gt-segment-path", "list/gt_segment_ucf.npy",
     "--gt-label-path", "list/gt_label_ucf.npy",
     "--batch-size", "64",
-    "--lr", "7e-5",
+    "--lr", "5e-5",
+    "--weight-decay", "1e-3",
+    "--mlp-dropout", "0.15",
     "--max-epoch", "10",
+    "--use-rollback", "False",
     "--visual-layers", "2",
     "--visual-head", "1",
     "--attn-window", "8",
@@ -271,18 +274,18 @@ cmd_train_ucf = [
     "--loss-routing-anchor-weight", "0.05",
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
-    "--collab-alpha", "0.08",
-    "--smooth-eval", "True",
-    "--smooth-sigma", "1.00",
+    "--collab-alpha", "0.0",
+    "--smooth-eval", "False",
     "--eval-interval", "50",
     "--use-ema", "True",
+    "--ema-decay", "0.998",
     "--use-checkpoint", "True",
     "--seed", "234",
     "--model-path", str(ucf_model_path),
     "--checkpoint-path", str(ucf_checkpoint_path),
 ]
 
-print("🚀 Bắt đầu huấn luyện MA-RUPA v6 (Argon-4 Gradient Conservation) trên UCF-Crime (10-Crop Eval, Target ≥89.2% AUC)...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện MA-RUPA v7 (Counterfactual SGNM Overhaul - Smooth 10 Epochs, No Rollback) trên UCF-Crime...\\n", flush=True)
 proc = subprocess.Popen(cmd_train_ucf, cwd=REPO_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
 for line in proc.stdout:
     print(line, end="", flush=True)
@@ -291,7 +294,7 @@ if proc.wait() != 0:
 print(f"\\n✅ Hoàn tất! Checkpoint tốt nhất đã lưu tại: {ucf_model_path}")""")
 
     # Cell 6: Evaluate UCF-Crime Code
-    add_code("""# ========================= 4. EVALUATE UCF-CRIME (10-CROP + LOCALIZATION mAP + PROBER) =========================
+    add_code("""# ========================= 4. EVALUATE UCF-CRIME (1-CROP CENTER __5 + 10-CROP + LOCALIZATION mAP + PROBER) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -316,9 +319,8 @@ subprocess.run([
     "--no-acc",
     "--multi-crop-eval", "True",
     "--max-test-crops", "10",
-    "--collab-alpha", "0.08",
-    "--smooth-eval", "True",
-    "--smooth-sigma", "1.00",
+    "--collab-alpha", "0.0",
+    "--smooth-eval", "False",
 ], cwd=REPO_DIR, check=True)
 
 subprocess.run([

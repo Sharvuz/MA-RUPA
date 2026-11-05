@@ -92,7 +92,14 @@ class ModelEMA:
 
 def CLAS2(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
           device: torch.device = None, topk_ratio: int = 16) -> torch.Tensor:
-    """Top-k Binary Multiple-Instance Learning Cross-Entropy Loss (Exact ucf-sota-88.34 formulation)."""
+    """Asymmetric Multi-Scale Top-k Binary MIL Cross-Entropy Loss.
+
+    1. On Normal bags (y_i = 0): Blends standard Top-k_16 mean (0.75) with sharp peak
+       Top-k_64 mean (0.25) so isolated 1-4 snippet CCTV false-alarm spikes
+       (Normal_Videos_050, Normal_Videos_887) receive 4x stronger suppression gradient.
+    2. On Abnormal bags (y_i = 1): Blends Top-k_16 (0.85) with sharp Top-k_64 (0.15)
+       to preserve gradient on short, fast-onset events (Explosion, Shooting, RoadAccidents).
+    """
     dev = logits.device if device is None else device
     probs = torch.sigmoid(logits.float()).reshape(logits.shape[0], logits.shape[1])
     bag_labels = (1.0 - labels[:, 0].float()).reshape(-1).to(dev)
@@ -101,28 +108,38 @@ def CLAS2(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
     T = probs.shape[1]
     for i in range(probs.shape[0]):
         l_i = max(1, min(int(lengths[i]), T))
-        k_i = max(1, min(int(l_i // topk_ratio + 1), l_i))
-        top_vals, _ = torch.topk(probs[i, :l_i], k=k_i, largest=True)
-        bag_preds.append(top_vals.mean())
+        k_16 = max(1, min(int(l_i // topk_ratio + 1), l_i))
+        k_sharp = max(1, min(int(l_i // 64 + 1), l_i))
+        top_16, _ = torch.topk(probs[i, :l_i], k=k_16, largest=True)
+        top_sharp, _ = torch.topk(probs[i, :l_i], k=k_sharp, largest=True)
+        if bag_labels[i] < 0.5:
+            bag_preds.append(0.75 * top_16.mean() + 0.25 * top_sharp.mean())
+        else:
+            bag_preds.append(0.85 * top_16.mean() + 0.15 * top_sharp.mean())
 
     instance_probs = torch.stack(bag_preds, dim=0).clamp(1e-6, 1.0 - 1e-6)
     return F.binary_cross_entropy(instance_probs, bag_labels)
 
 
 def CLASM(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
-          device: torch.device = None, topk_ratio: int = 16) -> torch.Tensor:
-    """Top-k Multi-Class Vision-Language Alignment MIL Loss (Exact ucf-sota-88.34 formulation)."""
+          device: torch.device = None, topk_ratio: int = 16, epsilon: float = 0.03) -> torch.Tensor:
+    """Multi-Scale Top-k Vision-Language Alignment MIL Loss with Anti-Memorization Label Smoothing."""
     dev = logits.device if device is None else device
     logits_f = logits.float()
+    num_classes = logits_f.shape[2]
     norm_labels = (labels.float() / labels.float().sum(dim=1, keepdim=True).clamp_min(1e-6)).to(dev)
+    if epsilon > 0.0 and num_classes > 2:
+        norm_labels = (1.0 - epsilon) * norm_labels + (epsilon / float(num_classes))
 
     bag_logits = []
     T = logits_f.shape[1]
     for i in range(logits_f.shape[0]):
         l_i = max(1, min(int(lengths[i]), T))
-        k_i = max(1, min(int(l_i // topk_ratio + 1), l_i))
-        top_vals, _ = torch.topk(logits_f[i, :l_i], k=k_i, largest=True, dim=0)
-        bag_logits.append(top_vals.mean(dim=0))
+        k_16 = max(1, min(int(l_i // topk_ratio + 1), l_i))
+        k_sharp = max(1, min(int(l_i // 64 + 1), l_i))
+        top_16, _ = torch.topk(logits_f[i, :l_i], k=k_16, largest=True, dim=0)
+        top_sharp, _ = torch.topk(logits_f[i, :l_i], k=k_sharp, largest=True, dim=0)
+        bag_logits.append(0.85 * top_16.mean(dim=0) + 0.15 * top_sharp.mean(dim=0))
 
     instance_logits = torch.stack(bag_logits, dim=0)
     return -torch.mean(torch.sum(norm_labels * F.log_softmax(instance_logits, dim=1), dim=1))

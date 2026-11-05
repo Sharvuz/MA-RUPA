@@ -147,18 +147,22 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     main_lr = args.lr if args.main_lr is None else args.main_lr
     refiner_lr = args.lr if args.refiner_lr is None else args.refiner_lr
 
+    num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
+    total_iters = max(1, args.max_epoch * num_batches_per_epoch)
+    total_iters_refiner = max(1, args.max_epoch * num_batches_per_epoch)
+
     optimizer_main = torch.optim.AdamW(
         [{'params': main_model_params}],
         lr=main_lr,
         weight_decay=args.weight_decay,
     )
-    scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_main, T_max=max(1, args.max_epoch)
+    scheduler_main = WarmCosineScheduler(
+        optimizer_main,
+        base_value=main_lr,
+        final_value=main_lr * 0.10,
+        total_iters=total_iters,
+        warmup_iters=min(100, max(0, total_iters // 10)),
     )
-
-    num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
-    total_iters = max(1, args.max_epoch * num_batches_per_epoch)
-    total_iters_refiner = max(1, args.max_epoch * (len(normal_loader) + len(anomaly_loader)))
 
     optimizer_refiner = StableAdamW(
         [{'params': refiner_params}],
@@ -171,13 +175,14 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     scheduler_refiner = WarmCosineScheduler(
         optimizer_refiner,
         base_value=refiner_lr,
-        final_value=refiner_lr * 0.1,
+        final_value=refiner_lr * 0.10,
         total_iters=total_iters_refiner,
-        warmup_iters=min(100, max(0, total_iters_refiner - 1)),
+        warmup_iters=min(100, max(0, total_iters_refiner // 10)),
     )
 
     consistency_loss_fn = ConsistencyLoss()
     prompt_text = get_prompt_text(label_map)
+    use_rollback = bool(getattr(args, 'use_rollback', False))
 
     auc_best = -1.0
     best_live_state = None
@@ -186,29 +191,26 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         saved_ep = checkpoint.get('epoch', -1) + 1
-        if 0 < saved_ep < args.max_epoch:
+        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v7_overhaul') or (args.max_epoch <= 3)
+        if 0 < saved_ep < args.max_epoch and is_compatible_ckpt:
             load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
             best_live_state = unwrap_compact_state_dict(model)
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'optimizer_refiner_state_dict' in checkpoint:
-                optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner_state_dict'])
-            if 'scheduler_main_state_dict' in checkpoint:
-                scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
-            if 'scheduler_refiner_state_dict' in checkpoint:
-                scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
+            try:
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'optimizer_refiner_state_dict' in checkpoint:
+                    optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner_state_dict'])
+                if 'scheduler_main_state_dict' in checkpoint:
+                    scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
+                if 'scheduler_refiner_state_dict' in checkpoint:
+                    scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
+            except Exception:
+                pass
             start_epoch = saved_ep
             auc_best = checkpoint.get('auc', checkpoint.get('ap', auc_best))
-            if hasattr(scheduler_main, 'base_lrs'):
-                scheduler_main.base_lrs = [lr * 0.85 for lr in scheduler_main.base_lrs]
-            for pg in optimizer_main.param_groups:
-                pg['lr'] *= 0.85
-            if hasattr(scheduler_refiner, 'schedule'):
-                scheduler_refiner.schedule *= 0.85
-                scheduler_refiner.final_value *= 0.85
-            for pg in optimizer_refiner.param_groups:
-                pg['lr'] *= 0.85
             print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AUC={auc_best * 100:.2f}%", flush=True)
+        elif 0 < saved_ep < args.max_epoch:
+            print(f"[Checkpoint] Ignoring legacy pre-overhaul checkpoint (epoch {saved_ep}) -> Starting fresh 10-epoch overhaul run!", flush=True)
 
     ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
 
@@ -216,11 +218,11 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v4+ (ARGON-4 GRADIENT CONSERVATION) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v7 (COUNTERFACTUAL SGNM OVERHAUL) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)", flush=True)
-    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} gradient steps | LR = {main_lr:.1e}", flush=True)
+    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} gradient steps | WarmCosine LR = {main_lr:.1e}, WD = {args.weight_decay:.1e}", flush=True)
     print(f"  Loss Eq.   : GC-MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | ResEv={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
-    print(f"  Multi-Crop : {'10-Crop Parallel Eval Active' if args.multi_crop_eval else '1-Crop Eval'} (sigma={args.smooth_sigma})", flush=True)
+    print(f"  Mode       : {'Smooth 10-Epoch Convergence (No Rollback)' if not use_rollback else 'Rollback Active'} | Dual 1-Crop (__5) + 10-Crop Eval", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
@@ -320,6 +322,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
             optimizer_main.step()
             optimizer_refiner.step()
+            scheduler_main.step()
             scheduler_refiner.step()
 
             if ema is not None:
@@ -359,8 +362,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     print(f"  [*] [NEW BEST UCF-CRIME] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
                 model.train()
 
-        scheduler_main.step()
-
         print(f"\n--- Epoch {e+1}/{args.max_epoch} Complete | Evaluating Live Weights ---", flush=True)
         auc_live, _ = test(
             model, testloader, args.visual_length, prompt_text,
@@ -376,7 +377,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
         torch.save({
             'epoch': e,
-            'model_state_dict': best_live_state if best_live_state is not None else live_state,
+            'arch_version': 'marupa_v7_overhaul',
+            'model_state_dict': (best_live_state if (use_rollback and best_live_state is not None) else live_state),
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
             'scheduler_main_state_dict': scheduler_main.state_dict(),
@@ -390,7 +392,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             print(f"--- Epoch {e+1}/{args.max_epoch} | Evaluating Polyak-EMA Weights ---", flush=True)
             auc_ema, _ = test(
                 model, testloader, args.visual_length, prompt_text,
-                gt, gtsegments, gtlabels, DNP_use, device, args, compute_dmap=False,
+                gt, gtsegments, gtlabels, DNP_use, device, args, compute_dmap=(e == args.max_epoch - 1),
             )
             if auc_ema > auc_best:
                 auc_best = auc_ema
@@ -400,10 +402,13 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 print(f"  [*] [NEW BEST UCF-CRIME (EMA)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
             ema.restore(model, backup)
 
-        if best_live_state is not None:
+        if use_rollback and best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
-                if hasattr(scheduler_main, 'base_lrs'):
+                if hasattr(scheduler_main, 'schedule'):
+                    scheduler_main.schedule *= 0.85
+                    scheduler_main.final_value *= 0.85
+                elif hasattr(scheduler_main, 'base_lrs'):
                     scheduler_main.base_lrs = [lr * 0.85 for lr in scheduler_main.base_lrs]
                 for pg in optimizer_main.param_groups:
                     pg['lr'] *= 0.85

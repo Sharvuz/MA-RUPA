@@ -268,6 +268,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
     consistency_loss_fn = ConsistencyLoss()
     prompt_text = get_prompt_text(label_map)
+    use_rollback = bool(getattr(args, 'use_rollback', False))
 
     ap_best = -1.0
     auc_best = -1.0
@@ -277,7 +278,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         saved_ep = checkpoint.get('epoch', -1) + 1
-        if 0 < saved_ep < args.max_epoch:
+        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v7_overhaul') or (args.max_epoch <= 3)
+        if 0 < saved_ep < args.max_epoch and is_compatible_ckpt:
             load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
             best_live_state = unwrap_compact_state_dict(model)
             if 'optimizer_state_dict' in checkpoint:
@@ -304,6 +306,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             ap_best = checkpoint.get('best_ap', checkpoint.get('ap', ap_best))
             auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
             print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AP={ap_best * 100:.2f}%", flush=True)
+        elif 0 < saved_ep < args.max_epoch:
+            print(f"[Checkpoint] Ignoring legacy pre-overhaul checkpoint (epoch {saved_ep}) -> Starting fresh 10-epoch overhaul run!", flush=True)
 
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
@@ -506,7 +510,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
         torch.save({
             'epoch': e,
-            'model_state_dict': best_live_state if best_live_state is not None else live_state,
+            'arch_version': 'marupa_v7_overhaul',
+            'model_state_dict': (best_live_state if (use_rollback and best_live_state is not None) else live_state),
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
             'scheduler_main_state_dict': scheduler_main.state_dict(),
@@ -528,15 +533,15 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 ap_best = ap_ema
                 auc_best = auc_ema
                 epoch_improved = True
-                best_live_state = unwrap_compact_state_dict(model)
-                torch.save({'epoch': e, 'model_state_dict': best_live_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
+                ema_state = unwrap_compact_state_dict(model)
+                torch.save({'epoch': e, 'model_state_dict': ema_state, 'ap': ap_best, 'auc': auc_best}, args.model_path)
                 print(
                     f"  [*] [NEW BEST XD-VIOLENCE (EMA)] AP = {ap_best * 100:.2f}% | AUC = {auc_best * 100:.2f}% saved -> {args.model_path}",
                     flush=True,
                 )
             ema.restore(model, backup)
 
-        if best_live_state is not None:
+        if use_rollback and best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
                 cur_lr = optimizer_main.param_groups[0]['lr']

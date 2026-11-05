@@ -59,15 +59,21 @@ def random_extract(feat, t_max):
    r = np.random.randint(feat.shape[0] - t_max)
    return feat[r : r+t_max, :]
 
-def uniform_extract(feat, t_max, avg: bool = True):
+def uniform_extract(feat, t_max, avg: bool = True, jitter: bool = False):
     new_feat = np.zeros((t_max, feat.shape[1])).astype(np.float32)
     r = np.linspace(0, len(feat), t_max+1, dtype=np.int32)
+    if jitter and len(feat) > t_max and t_max > 2:
+        half_w = max(1, (len(feat) - t_max) // (2 * t_max))
+        shifts = np.random.randint(-half_w, half_w + 1, size=t_max - 1)
+        r_mid = np.clip(r[1:-1] + shifts, 1, len(feat) - 1)
+        r[1:-1] = np.maximum.accumulate(r_mid)
     if avg == True:
         for i in range(t_max):
             if r[i]!=r[i+1]:
                 new_feat[i,:] = np.mean(feat[r[i]:r[i+1],:], 0)
             else:
-                new_feat[i,:] = feat[r[i],:]
+                idx = max(0, min(int(r[i]), len(feat) - 1))
+                new_feat[i,:] = feat[idx,:]
     else:
         r = np.linspace(0, feat.shape[0]-1, t_max, dtype=np.uint16)
         new_feat = feat[r, :]
@@ -82,22 +88,19 @@ def pad(feat, min_len):
        return feat
 
 
-
-def process_feat(feat, length, is_random=False):
-    clip_length = feat.shape[0] #chia segment
-    #TH: video dài hơn 256 segment thì lấy N segment / 256 và lấy TB từng khoảng trải đều
+def process_feat(feat, length, is_random=False, jitter=False):
+    clip_length = feat.shape[0]
     if feat.shape[0] > length:
         if is_random:
             return random_extract(feat, length), length
         else:
-            return uniform_extract(feat, length), length
+            return uniform_extract(feat, length, jitter=jitter), length
     else:
         return pad(feat, length), clip_length
 
 def process_split(feat, length):
     clip_length = feat.shape[0]
 
-    #TH: video ngắn hơn 256 segment thì padding thêm vecto 0 vào sau cho đủ 256 segment
     if clip_length < length:
         return pad(feat, length), clip_length
     else:
@@ -341,5 +344,3 @@ def apply_dodo_refinement(prob_np: np.ndarray, sigma: float = 1.2) -> np.ndarray
     blend_w = 0.30 * edge_alpha
     s_dodo = (1.0 - blend_w) * s_sharp + blend_w * np.maximum(s_sharp, 0.85 * s_closed)
     return np.clip(s_dodo, 0.0, 1.0).astype(np.float32)
-
-

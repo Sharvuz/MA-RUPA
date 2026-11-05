@@ -34,6 +34,8 @@ from utils.losses import compute_normalized_recon_error
 
 OPTIONAL_STATE_PREFIXES = (
     'rupa_gate.',
+    'res_adapter.',
+    'beta_res',
     'mst_adapter.',
     'audio_adapter.',
     'iam_module.',
@@ -665,9 +667,12 @@ class SGNM(nn.Module):
         ])
 
     @staticmethod
-    def gather_loss(query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+    def gather_loss(query: torch.Tensor, keys: torch.Tensor, reliability: torch.Tensor = None) -> torch.Tensor:
         distribution = 1.0 - F.cosine_similarity(query.unsqueeze(2), keys.unsqueeze(1), dim=-1)
         distance, _ = torch.min(distribution, dim=2)
+        if reliability is not None:
+            rel = reliability.squeeze(-1).to(distance.dtype).clamp(min=0.05)
+            return (distance * rel).sum() / rel.sum().clamp_min(1e-6)
         return distance.mean()
 
     def forward(self, visual_features: torch.Tensor, logits1: torch.Tensor, lengths: torch.Tensor = None):
@@ -675,20 +680,37 @@ class SGNM(nn.Module):
 
         with torch.no_grad():
             anomaly_scores = torch.sigmoid(logits1.squeeze(-1))
+            masked_scores = anomaly_scores.clone()
+            if lengths is not None:
+                for i in range(B):
+                    l_i = max(1, min(int(lengths[i]), N))
+                    if l_i < N:
+                        masked_scores[i, l_i:] = float('inf')
+
             num_normal_frames = max(1, int(N * self.normal_selection_ratio))
-            _, indices = torch.topk(anomaly_scores, k=N, largest=False, dim=1)
+            _, indices = torch.topk(masked_scores, k=N, largest=False, dim=1)
             normal_indices = indices[:, :num_normal_frames]
+
+            if lengths is not None:
+                for i in range(B):
+                    l_i = max(1, min(int(lengths[i]), N))
+                    if l_i < num_normal_frames:
+                        wrap_idx = torch.arange(num_normal_frames, device=visual_features.device) % l_i
+                        normal_indices[i] = indices[i, wrap_idx]
 
             selected_normal_features = torch.gather(
                 visual_features, 1, normal_indices.unsqueeze(-1).expand(-1, -1, D)
             )
+            selected_scores = torch.gather(anomaly_scores, 1, normal_indices).unsqueeze(-1)
+            reliability = (1.0 - selected_scores).clamp(0.0, 1.0)
+            weighted_normal_features = selected_normal_features * (0.5 + 0.5 * reliability)
 
         agg_prototype = self.video_prototypes.unsqueeze(0).expand(B, -1, -1)
         for blk in self.dnp_extractor:
-            agg_prototype = blk(agg_prototype, selected_normal_features)
+            agg_prototype = blk(agg_prototype, weighted_normal_features)
 
         dynamic_normal_patterns = agg_prototype
-        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns)
+        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns, reliability=reliability)
 
         reconstructed_features = self.bottleneck(visual_features)
         for blk in self.decoder:
@@ -774,6 +796,7 @@ class MARUPA(nn.Module):
         self.frame_position_embeddings = nn.Embedding(visual_length, visual_width)
 
         mlp_dropout = float(getattr(args, 'mlp_dropout', 0.1))
+        self.mlp_dropout = mlp_dropout
         self.mst_adapter = (
             MSTSensitivityAdapter(embed_dim=visual_width, dilations=(1, 2, 4), dropout=mlp_dropout)
             if self.use_mdtp else None
@@ -826,7 +849,7 @@ class MARUPA(nn.Module):
             if self.use_acc else None
         )
 
-        # 6. Dynamic Normal Pattern Refiner (SGNM) & Stop-Gradient SafeGate
+        # 6. Dynamic Normal Pattern Refiner (SGNM), Counterfactual Residual Adapter & Stop-Gradient SafeGate
         num_prototypes = int(getattr(args, 'num_prototypes', 16))
         decoder_depth = int(getattr(args, 'decoder_depth', 8))
         normal_selection_ratio = float(getattr(args, 'normal_selection_ratio', 0.8))
@@ -838,6 +861,15 @@ class MARUPA(nn.Module):
             decoder_depth=decoder_depth,
             normal_selection_ratio=normal_selection_ratio,
         )
+
+        self.res_adapter = nn.Sequential(OrderedDict([
+            ("ln", LayerNorm(visual_width)),
+            ("c_fc", nn.Linear(visual_width, visual_width)),
+            ("gelu", QuickGELU()),
+            ("drop", nn.Dropout(mlp_dropout)),
+            ("c_proj", nn.Linear(visual_width, visual_width)),
+        ]))
+        self.beta_res = nn.Parameter(torch.zeros(1))
 
         self.rupa_gate = nn.Sequential(
             nn.Linear(5, routing_gate_hidden),
@@ -853,6 +885,12 @@ class MARUPA(nn.Module):
         self._eval_text_cache = None
         return self
 
+    def _apply_mlp(self, mlp: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+        h = mlp.gelu(mlp.c_fc(x))
+        if self.training and self.mlp_dropout > 0.0:
+            h = F.dropout(h, p=self.mlp_dropout, training=True)
+        return mlp.c_proj(h)
+
     def initialize_parameters(self):
         nn.init.normal_(self.frame_position_embeddings.weight, std=0.01)
 
@@ -864,6 +902,16 @@ class MARUPA(nn.Module):
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.bias, 0.0)
                 nn.init.constant_(m.weight, 1.0)
+
+        for m in self.res_adapter.modules():
+            if isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=0.01, a=-0.03, b=0.03)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.constant_(m.bias, 0.0)
+                nn.init.constant_(m.weight, 1.0)
+        nn.init.constant_(self.beta_res, 0.0)
 
         nn.init.normal_(self.rupa_gate[0].weight, std=0.01)
         nn.init.constant_(self.rupa_gate[0].bias, 0.0)
@@ -988,31 +1036,57 @@ class MARUPA(nn.Module):
             )
             logits_aux_sem = self.audio_adapter.last_logits_aux_sem
 
-        # 4. Sensitivity Anomaly Detector Head (logits1)
-        logits1 = self.classifier(visual_features + self.mlp2(visual_features))  # [B, T, 1]
+        # 4. Sensitivity Anomaly Detector Head & SGNM Counterfactual Residual Feedback
+        logits1_init = self.classifier(visual_features + self._apply_mlp(self.mlp2, visual_features))  # [B, T, 1]
+
+        reconstructed_features = None
+        dynamic_normal_patterns = None
+        g_loss = None
+        residual_features = None
+        reconstruction_score = None
+
+        if DNP_use and not self.no_rupa:
+            reconstructed_features, dynamic_normal_patterns, g_loss = self.video_anomaly_refiner(
+                visual_features, logits1_init, lengths_dev
+            )
+            residual_features = visual_features - reconstructed_features
+            reconstruction_score = (
+                (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
+            ).clamp(0.0, 1.0)
+
+            # Stop-gradient on reconstructed_features preserves pure normal reconstruction in SGNM
+            # while injecting background-subtracted counterfactual residuals into detection & alignment
+            cf_residual = (visual_features - reconstructed_features.detach()) * valid_mask
+            res_delta = self.res_adapter(cf_residual) * valid_mask
+            enh_visual_features = visual_features + torch.tanh(self.beta_res) * res_delta
+            logits1 = self.classifier(enh_visual_features + self._apply_mlp(self.mlp2, enh_visual_features))
+        else:
+            enh_visual_features = visual_features
+            logits1 = logits1_init
+
         detector_score = torch.sigmoid(logits1)
 
         # 5. Video-Conditioned Fine-Grained Text-Visual Alignment (logits2)
         logits_attn = logits1.permute(0, 2, 1)  # [B, 1, T]
-        visual_attn = F.normalize(torch.bmm(logits_attn, visual_features), dim=-1)  # [B, 1, D]
-        visual_attn_exp = visual_attn.expand(B, text_features_ori.shape[0], -1)     # [B, C, D]
+        visual_attn = F.normalize(torch.bmm(logits_attn, enh_visual_features), dim=-1)  # [B, 1, D]
+        visual_attn_exp = visual_attn.expand(B, text_features_ori.shape[0], -1)         # [B, C, D]
 
         text_features = text_features_ori.unsqueeze(0).expand(B, -1, -1) + visual_attn_exp
-        text_features = text_features + self.mlp1(text_features)
+        text_features = text_features + self._apply_mlp(self.mlp1, text_features)
 
-        visual_features_norm = F.normalize(visual_features, dim=-1)
+        visual_features_norm = F.normalize(enh_visual_features, dim=-1)
         text_features_norm = F.normalize(text_features, dim=-1).permute(0, 2, 1)
         logits2 = torch.bmm(visual_features_norm, text_features_norm.to(visual_features_norm.dtype)) / 0.07  # [B, T, C]
 
-        # 6. Video-Level Event & Background Contrastive Pooling (Exact ucf-sota-88.34 Core)
-        abn_logits = (scale * detector_score).exp() - 1.0
+        # 6. Valid-Masked Video-Level Event & Background Contrastive Pooling
+        abn_logits = ((scale * detector_score).exp() - 1.0) * valid_mask
         abn_weights = F.normalize(abn_logits, p=1, dim=1)
 
-        nor_logits = (scale * (1.0 - detector_score)).exp() - 1.0
+        nor_logits = ((scale * (1.0 - detector_score)).exp() - 1.0) * valid_mask
         nor_weights = F.normalize(nor_logits, p=1, dim=1)
 
-        abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]
-        nor_feat = torch.bmm(nor_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]
+        abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), enh_visual_features)  # [B, 1, D]
+        nor_feat = torch.bmm(nor_weights.permute(0, 2, 1), visual_features)      # [B, 1, D]
 
         nor_text_norm = F.normalize(text_features_ori, dim=-1).t().unsqueeze(0).expand(B, -1, -1)  # [B, D, C]
         abn_vis_norm = F.normalize(abn_feat, dim=-1)
@@ -1028,12 +1102,12 @@ class MARUPA(nn.Module):
 
         iam_dict = None
         if self.iam_module is not None:
-            iam_dict = self.iam_module(visual_features.detach(), valid_mask=valid_mask, sem_temp=sem_temp)
+            iam_dict = self.iam_module(enh_visual_features.detach(), valid_mask=valid_mask, sem_temp=sem_temp)
 
         acc_dict = None
         if self.acc_module is not None:
             acc_dict = self.acc_module(
-                visual_features.detach(), logits2.detach(), detector_score.detach(),
+                enh_visual_features.detach(), logits2.detach(), detector_score.detach(),
                 lengths=lengths_dev, sem_temp=sem_temp,
             )
 
@@ -1071,16 +1145,8 @@ class MARUPA(nn.Module):
         if acc_dict is not None:
             dnp_dict.update(acc_dict)
 
-        # 8. SGNM Prototype Refiner & Stop-Gradient Safe-RUPA Calibration (Exact ucf-sota-88.34 Core)
-        if DNP_use and not self.no_rupa:
-            reconstructed_features, dynamic_normal_patterns, g_loss = self.video_anomaly_refiner(
-                visual_features, logits1, lengths_dev
-            )
-            residual_features = visual_features - reconstructed_features
-            reconstruction_score = (
-                (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
-            ).clamp(0.0, 1.0)
-
+        # 8. SGNM Prototype Outputs & Stop-Gradient Safe-RUPA Calibration
+        if DNP_use and not self.no_rupa and reconstructed_features is not None:
             dnp_dict.update({
                 'original_features': visual_features,
                 'reconstructed_features': reconstructed_features,

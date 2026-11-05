@@ -77,8 +77,9 @@ parser.add_argument('--audio-lr', type=float, default=3e-5, help='Optional LR wh
 parser.add_argument('--refiner-lr', type=float, default=None)
 parser.add_argument('--weight-decay', type=float, default=1e-2, help='Exact AdamW weight decay from 84.99% AP DSANet reference')
 parser.add_argument('--grad-clip', type=float, default=0.0, help='No gradient clipping (0.0) to preserve full 5.0x CLASM + MIL step size')
-parser.add_argument('--use-ema', default=False, type=str2bool)
-parser.add_argument('--ema-decay', default=0.997, type=float)
+parser.add_argument('--use-ema', default=True, type=str2bool)
+parser.add_argument('--ema-decay', default=0.998, type=float)
+parser.add_argument('--use-rollback', default=False, type=str2bool, help='Disable destructive rollback resets for smooth 10-epoch training')
 
 # Verified 84.99% AP Loss Equilibrium (Pure LGT-SGNM without Dead-Weight Auxiliary Penalties)
 parser.add_argument('--loss2-weight', '--loss2_weight', dest='loss2_weight', type=float, default=5.0, help='CLASM multi-class vision-language alignment weight for XD-Violence')

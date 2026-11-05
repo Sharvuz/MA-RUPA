@@ -280,6 +280,10 @@ def resolve_multicrop_paths(primary_path: str, data_dir: str = None, max_crops: 
 
     found_crops = []
     seen = set()
+    if os.path.exists(resolved_primary):
+        seen.add(resolved_primary)
+        found_crops.append(resolved_primary)
+
     for c_idx in range(max_crops):
         cand_name = f"{stem_prefix}__{c_idx}.npy"
         cand_full = None
@@ -296,6 +300,8 @@ def resolve_multicrop_paths(primary_path: str, data_dir: str = None, max_crops: 
         if cand_full is not None and cand_full not in seen:
             seen.add(cand_full)
             found_crops.append(cand_full)
+            if len(found_crops) >= max_crops:
+                break
 
     if not found_crops:
         found_crops = [resolved_primary]
@@ -445,7 +451,7 @@ class UCFDataset(data.Dataset):
             clip_feature = np.zeros((self.clip_dim, 512), dtype=np.float32)
 
         if not self.test_mode:
-            clip_feature, clip_length = tools.process_feat(clip_feature, self.clip_dim)
+            clip_feature, clip_length = tools.process_feat(clip_feature, self.clip_dim, jitter=True)
             return torch.tensor(clip_feature, dtype=torch.float32), label, clip_length
         else:
             clip_feature, clip_length = tools.process_split(clip_feature, self.clip_dim)
