@@ -91,69 +91,27 @@ class ModelEMA:
 
 
 def CLAS2(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
-          device: torch.device = None, topk_ratio: int = 16,
-          gc_weight: float = 0.35) -> torch.Tensor:
-    """Gradient-Conserving Multi-Scale Top-k Binary MIL Loss (Argon-4 Law).
-
-    Why standard post-sigmoid Top-k BCE stalls at ~88.3% AUC:
-      In post-sigmoid averaging `p_bag = mean_{t in K} sigmoid(z_t)`, the gradient w.r.t.
-      snippet logit `z_t` carries the factor `p_t * (1 - p_t)`:
-        1. On subtle/dark Abnormal videos (`Arson022`, `Explosion025`, `City.of.God`) where
-           `p_t ~ 0.02`, `p_t * (1 - p_t) ~ 0.0196 -> 0`, starving hard positives of gradient.
-        2. On Normal videos with a 1-frame false-alarm spike (`Normal_887 max=0.979`),
-           `p_bag` is diluted by 15 low frames (`p_bag ~ 0.07`) AND `p_1 * (1 - p_1) ~ 0.02 -> 0`,
-           leaving the spike completely unpenalized!
-      By coupling probability-space Top-k BCE with analytical Logit-Space Multi-Scale Top-k
-      (`BCEWithLogits` at `k_16 = L//16 + 1` and `k_sharp = L//64 + 1`), the `p_t*(1-p_t)`
-      saturation factor is analytically cancelled (`dL/dz_t = (sigmoid(z_bar) - y) / k`),
-      guaranteeing non-vanishing gradients for both hard anomalies and isolated normal spikes.
-    """
+          device: torch.device = None, topk_ratio: int = 16) -> torch.Tensor:
+    """Top-k Binary Multiple-Instance Learning Cross-Entropy Loss (Exact ucf-sota-88.34 formulation)."""
     dev = logits.device if device is None else device
-    z_all = logits.float().reshape(logits.shape[0], logits.shape[1])
-    probs = torch.sigmoid(z_all)
+    probs = torch.sigmoid(logits.float()).reshape(logits.shape[0], logits.shape[1])
     bag_labels = (1.0 - labels[:, 0].float()).reshape(-1).to(dev)
 
-    bag_probs = []
-    bag_logits_k = []
-    bag_logits_sharp = []
-    T = z_all.shape[1]
-
-    for i in range(z_all.shape[0]):
+    bag_preds = []
+    T = probs.shape[1]
+    for i in range(probs.shape[0]):
         l_i = max(1, min(int(lengths[i]), T))
         k_i = max(1, min(int(l_i // topk_ratio + 1), l_i))
-        k_sharp = max(1, min(int(l_i // (topk_ratio * 4) + 1), k_i))
+        top_vals, _ = torch.topk(probs[i, :l_i], k=k_i, largest=True)
+        bag_preds.append(top_vals.mean())
 
-        top_z, top_idx = torch.topk(z_all[i, :l_i], k=k_i, largest=True)
-        top_p = probs[i, :l_i][top_idx]
-
-        bag_probs.append(top_p.mean())
-        bag_logits_k.append(top_z.mean())
-        bag_logits_sharp.append(top_z[:k_sharp].mean())
-
-    instance_probs = torch.stack(bag_probs, dim=0).clamp(1e-6, 1.0 - 1e-6)
-    loss_prob = F.binary_cross_entropy(instance_probs, bag_labels)
-
-    if gc_weight <= 0.0:
-        return loss_prob
-
-    z_k = torch.stack(bag_logits_k, dim=0)
-    z_sharp = torch.stack(bag_logits_sharp, dim=0)
-    loss_logit_k = F.binary_cross_entropy_with_logits(z_k, bag_labels)
-    loss_logit_sharp = F.binary_cross_entropy_with_logits(z_sharp, bag_labels)
-    loss_gc = 0.60 * loss_logit_k + 0.40 * loss_logit_sharp
-
-    return (1.0 - gc_weight) * loss_prob + gc_weight * loss_gc
+    instance_probs = torch.stack(bag_preds, dim=0).clamp(1e-6, 1.0 - 1e-6)
+    return F.binary_cross_entropy(instance_probs, bag_labels)
 
 
 def CLASM(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
-          device: torch.device = None, topk_ratio: int = 16,
-          sharp_blend: float = 0.20) -> torch.Tensor:
-    """Multi-Scale Top-k Vision-Language Alignment MIL Loss.
-
-    Blends standard `k_16 = L//16 + 1` bag logits with sharp `k_64 = L//64 + 1` peak logits
-    so brief, explosive anomalies (Explosion, Shooting, RoadAccidents, Arson) are not
-    diluted by normal surrounding snippets during multi-class CLIP alignment.
-    """
+          device: torch.device = None, topk_ratio: int = 16) -> torch.Tensor:
+    """Top-k Multi-Class Vision-Language Alignment MIL Loss (Exact ucf-sota-88.34 formulation)."""
     dev = logits.device if device is None else device
     logits_f = logits.float()
     norm_labels = (labels.float() / labels.float().sum(dim=1, keepdim=True).clamp_min(1e-6)).to(dev)
@@ -163,15 +121,8 @@ def CLASM(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
     for i in range(logits_f.shape[0]):
         l_i = max(1, min(int(lengths[i]), T))
         k_i = max(1, min(int(l_i // topk_ratio + 1), l_i))
-        k_sharp = max(1, min(int(l_i // (topk_ratio * 4) + 1), k_i))
-
         top_vals, _ = torch.topk(logits_f[i, :l_i], k=k_i, largest=True, dim=0)
-        mean_k = top_vals.mean(dim=0)
-        if sharp_blend > 0.0 and k_sharp < k_i:
-            mean_sharp = top_vals[:k_sharp].mean(dim=0)
-            bag_logits.append((1.0 - sharp_blend) * mean_k + sharp_blend * mean_sharp)
-        else:
-            bag_logits.append(mean_k)
+        bag_logits.append(top_vals.mean(dim=0))
 
     instance_logits = torch.stack(bag_logits, dim=0)
     return -torch.mean(torch.sum(norm_labels * F.log_softmax(instance_logits, dim=1), dim=1))
@@ -283,39 +234,21 @@ def compute_normalized_recon_error(original_features: torch.Tensor,
 
 
 class ConsistencyLoss(nn.Module):
-    """Gradient-Conserving & CLIP-Cone Normalized Detector-Prototype Consistency Loss.
+    """Valid-masked MSE aligning detector probabilities with prototype reconstruction error (Exact ucf-sota-88.34 anti-overfitting tether)."""
 
-    Prevents uncalibrated cosine reconstruction error from pulling down high-confidence
-    Top-k MIL anomaly peaks (`p_det > e_rec`), while maintaining full background
-    suppression on normal snippets (`p_det <= e_rec`).
-    """
-
-    def __init__(self, peak_tether_weight: float = 0.25):
+    def __init__(self):
         super().__init__()
-        self.peak_tether_weight = peak_tether_weight
+        self.mse = nn.MSELoss(reduction='mean')
 
     def forward(self, logits1: torch.Tensor, original_features: torch.Tensor,
                 reconstructed_features: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        recon_err = compute_normalized_recon_error(original_features, reconstructed_features, lengths)
+        recon_err = ((1.0 - F.cosine_similarity(original_features.float(), reconstructed_features.float(), dim=-1)) / 2.0).clamp(0.0, 1.0)
         det_prob = torch.sigmoid(logits1.float().squeeze(-1))
         B, N = det_prob.shape
         mask = torch.arange(N, device=logits1.device)[None, :] < lengths.to(logits1.device)[:, None]
         if not torch.any(mask):
             return logits1.sum() * 0.0
-
-        det_v = det_prob[mask]
-        rec_v = recon_err[mask]
-
-        # 1. Train SGNM reconstruction error to track detached detector probabilities across all valid frames
-        loss_rec_tracks_det = F.mse_loss(rec_v, det_v.detach())
-
-        # 2. Asymmetric tether on logits1: full regularization on background, damped downward pull on anomaly peaks
-        rec_d = rec_v.detach()
-        diff = det_v - rec_d
-        asymmetric_weight = torch.where(diff > 0.15, torch.full_like(diff, self.peak_tether_weight), torch.ones_like(diff))
-        loss_det_tether = (asymmetric_weight * (diff ** 2)).mean()
-
-        return 0.50 * loss_rec_tracks_det + 0.50 * loss_det_tether
+        return self.mse(det_prob[mask], recon_err[mask])
 
 
 def routing_anchor_loss(dnp_dict: dict, lengths: torch.Tensor) -> torch.Tensor:

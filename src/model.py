@@ -665,47 +665,30 @@ class SGNM(nn.Module):
         ])
 
     @staticmethod
-    def gather_loss(query: torch.Tensor, keys: torch.Tensor, reliability: torch.Tensor = None) -> torch.Tensor:
+    def gather_loss(query: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
         distribution = 1.0 - F.cosine_similarity(query.unsqueeze(2), keys.unsqueeze(1), dim=-1)
         distance, _ = torch.min(distribution, dim=2)
-        if reliability is None:
-            return distance.mean()
-        rel_norm = reliability / reliability.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        return (distance * rel_norm).sum(dim=1).mean()
+        return distance.mean()
 
     def forward(self, visual_features: torch.Tensor, logits1: torch.Tensor, lengths: torch.Tensor = None):
         B, N, D = visual_features.shape
-        dev = visual_features.device
 
         with torch.no_grad():
-            anomaly_scores = torch.sigmoid(logits1.float().squeeze(-1))
-            if lengths is not None:
-                lengths_clamped = lengths.to(device=dev, dtype=torch.long).clamp(min=1, max=N)
-                valid_mask = torch.arange(N, device=dev)[None, :] < lengths_clamped[:, None]
-                masked_scores = anomaly_scores.masked_fill(~valid_mask, float('inf'))
-                min_valid_length = int(lengths_clamped.min().item())
-            else:
-                masked_scores = anomaly_scores
-                min_valid_length = N
-
-            num_normal_frames = max(1, min(int(N * self.normal_selection_ratio), min_valid_length))
-            _, indices = torch.topk(masked_scores, k=num_normal_frames, largest=False, dim=1)
+            anomaly_scores = torch.sigmoid(logits1.squeeze(-1))
+            num_normal_frames = max(1, int(N * self.normal_selection_ratio))
+            _, indices = torch.topk(anomaly_scores, k=N, largest=False, dim=1)
             normal_indices = indices[:, :num_normal_frames]
 
             selected_normal_features = torch.gather(
                 visual_features, 1, normal_indices.unsqueeze(-1).expand(-1, -1, D)
             )
-            selected_scores = torch.gather(anomaly_scores, 1, normal_indices)
-            reliability = (1.0 - selected_scores).clamp(min=1e-4, max=1.0).to(visual_features.dtype)
-
-        weighted_normal_features = selected_normal_features * (0.5 + 0.5 * reliability.unsqueeze(-1))
 
         agg_prototype = self.video_prototypes.unsqueeze(0).expand(B, -1, -1)
         for blk in self.dnp_extractor:
-            agg_prototype = blk(agg_prototype, weighted_normal_features)
+            agg_prototype = blk(agg_prototype, selected_normal_features)
 
         dynamic_normal_patterns = agg_prototype
-        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns, reliability=reliability)
+        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns)
 
         reconstructed_features = self.bottleneck(visual_features)
         for blk in self.decoder:
@@ -805,17 +788,15 @@ class MARUPA(nn.Module):
         else:
             self.audio_adapter = None
 
-        # 3. Sensitivity Detector & Video-Conditioned Prompt MLPs (with DSANet Dropout Restored)
+        # 3. Sensitivity Detector & Video-Conditioned Prompt MLPs (Exact ucf-sota-88.34 geometry)
         self.mlp1 = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(visual_width, visual_width * 4)),
             ("gelu", QuickGELU()),
-            ("dropout", nn.Dropout(mlp_dropout)),
             ("c_proj", nn.Linear(visual_width * 4, visual_width)),
         ]))
         self.mlp2 = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(visual_width, visual_width * 4)),
             ("gelu", QuickGELU()),
-            ("dropout", nn.Dropout(mlp_dropout)),
             ("c_proj", nn.Linear(visual_width * 4, visual_width)),
         ]))
         self.classifier = nn.Linear(visual_width, 1)
@@ -944,7 +925,7 @@ class MARUPA(nn.Module):
         )
 
         x = (images + pos_emb).permute(1, 0, 2)  # [T, B, D]
-        x = self.temporal(x, attn_mask=attn_mask, padding_mask=padding_mask)
+        x = self.temporal(x, attn_mask=attn_mask, padding_mask=None)
         x = x.permute(1, 0, 2)  # [B, T, D]
 
         adj = self.adj4(x, lengths)
@@ -1012,7 +993,7 @@ class MARUPA(nn.Module):
         detector_score = torch.sigmoid(logits1)
 
         # 5. Video-Conditioned Fine-Grained Text-Visual Alignment (logits2)
-        logits_attn = (logits1 * valid_mask).permute(0, 2, 1)  # [B, 1, T]
+        logits_attn = logits1.permute(0, 2, 1)  # [B, 1, T]
         visual_attn = F.normalize(torch.bmm(logits_attn, visual_features), dim=-1)  # [B, 1, D]
         visual_attn_exp = visual_attn.expand(B, text_features_ori.shape[0], -1)     # [B, C, D]
 
@@ -1023,11 +1004,11 @@ class MARUPA(nn.Module):
         text_features_norm = F.normalize(text_features, dim=-1).permute(0, 2, 1)
         logits2 = torch.bmm(visual_features_norm, text_features_norm.to(visual_features_norm.dtype)) / 0.07  # [B, T, C]
 
-        # 6. Valid-Masked Video-Level Event & Background Contrastive Pooling
-        abn_logits = ((scale * detector_score).exp() - 1.0) * valid_mask
+        # 6. Video-Level Event & Background Contrastive Pooling (Exact ucf-sota-88.34 Core)
+        abn_logits = (scale * detector_score).exp() - 1.0
         abn_weights = F.normalize(abn_logits, p=1, dim=1)
 
-        nor_logits = ((scale * (1.0 - detector_score)).exp() - 1.0) * valid_mask
+        nor_logits = (scale * (1.0 - detector_score)).exp() - 1.0
         nor_weights = F.normalize(nor_logits, p=1, dim=1)
 
         abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), visual_features)  # [B, 1, D]
@@ -1090,15 +1071,15 @@ class MARUPA(nn.Module):
         if acc_dict is not None:
             dnp_dict.update(acc_dict)
 
-        # 8. Valid-Masked SGNM Prototype Refiner & CLIP-Cone Normalized Safe-RUPA Calibration
+        # 8. SGNM Prototype Refiner & Stop-Gradient Safe-RUPA Calibration (Exact ucf-sota-88.34 Core)
         if DNP_use and not self.no_rupa:
             reconstructed_features, dynamic_normal_patterns, g_loss = self.video_anomaly_refiner(
                 visual_features, logits1, lengths_dev
             )
             residual_features = visual_features - reconstructed_features
-            reconstruction_score = compute_normalized_recon_error(
-                visual_features, reconstructed_features, lengths_dev
-            ).unsqueeze(-1).to(visual_features.dtype)
+            reconstruction_score = (
+                (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
+            ).clamp(0.0, 1.0)
 
             dnp_dict.update({
                 'original_features': visual_features,
@@ -1115,33 +1096,24 @@ class MARUPA(nn.Module):
                 rec_d = reconstruction_score.detach()
                 sem_d = semantic_score.detach()
 
-                # Lightweight Background Spike Isolation: damp isolated 1-frame glitches where
-                # raw det_d spikes far above its 3-frame local neighborhood AND both rec_d and sem_d disagree
-                with torch.no_grad():
-                    det_local = F.avg_pool1d(
-                        det_d.float().transpose(1, 2), kernel_size=3, stride=1, padding=1
-                    ).transpose(1, 2).to(det_d.dtype)
-                    isolated_spike = F.relu(det_d - det_local - 0.25) * F.relu(0.35 - 0.5 * (rec_d + sem_d))
-                    det_anchor = (det_d - 0.30 * isolated_spike).clamp(1e-5, 1.0 - 1e-5)
-
                 fixed_routing_prob = (
-                    self.routing_det_weight * det_anchor
+                    self.routing_det_weight * det_d
                     + self.routing_rec_weight * rec_d
                     + self.routing_sem_weight * sem_d
                 ).clamp(1e-5, 1.0 - 1e-5)
 
                 if self.routing_mode == 'safe_gate':
                     gate_inputs = torch.cat([
-                        det_anchor,
+                        det_d,
                         rec_d,
                         sem_d,
-                        (rec_d - det_anchor).abs(),
-                        (sem_d - det_anchor).abs(),
+                        (rec_d - det_d).abs(),
+                        (sem_d - det_d).abs(),
                     ], dim=-1)
                     routing_gate = torch.sigmoid(self.rupa_gate(gate_inputs)) * self.routing_gate_max
-                    routing_prob = (det_anchor + routing_gate * (fixed_routing_prob - det_anchor)).clamp(1e-5, 1.0 - 1e-5)
+                    routing_prob = (det_d + routing_gate * (fixed_routing_prob - det_d)).clamp(1e-5, 1.0 - 1e-5)
                 else:
-                    routing_gate = torch.ones_like(det_anchor)
+                    routing_gate = torch.ones_like(det_d)
                     routing_prob = fixed_routing_prob
 
                 dnp_dict.update({
