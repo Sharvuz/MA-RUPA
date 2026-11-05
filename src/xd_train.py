@@ -209,11 +209,12 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     for name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'video_anomaly_refiner' in name or 'rupa_gate' in name:
+        if 'video_anomaly_refiner' in name or (args.rupa_use and 'rupa_gate' in name):
             refiner_params.append(param)
         elif 'audio_adapter' in name:
-            audio_adapter_params.append(param)
-        else:
+            if not args.no_audio:
+                audio_adapter_params.append(param)
+        elif 'rupa_gate' not in name:
             main_model_params.append(param)
 
     main_lr = args.lr if args.main_lr is None else args.main_lr
@@ -221,7 +222,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     refiner_lr = args.lr if args.refiner_lr is None else args.refiner_lr
 
     main_param_groups = [{'params': main_model_params, 'lr': main_lr, 'weight_decay': args.weight_decay}]
-    if audio_adapter_params:
+    if audio_adapter_params and not args.no_audio:
         main_param_groups.append({'params': audio_adapter_params, 'lr': audio_lr, 'weight_decay': 1e-4})
 
     optimizer_main = torch.optim.AdamW(main_param_groups)
@@ -275,35 +276,44 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
-        load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
-        best_live_state = unwrap_compact_state_dict(model)
-        if 'optimizer_state_dict' in checkpoint:
-            try:
-                optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
-            except Exception:
-                pass
-        if 'optimizer_refiner_state_dict' in checkpoint:
-            optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner_state_dict'])
-        if 'scheduler_main_state_dict' in checkpoint:
-            try:
-                scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
-            except Exception:
-                pass
-        if 'scheduler_refiner_state_dict' in checkpoint:
-            scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
-        start_epoch = checkpoint.get('epoch', -1) + 1
-        ap_best = checkpoint.get('best_ap', checkpoint.get('ap', ap_best))
-        auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
-        print(f"[Resume] Resumed from epoch {start_epoch}, best AP={ap_best * 100:.2f}%", flush=True)
+        saved_ep = checkpoint.get('epoch', -1) + 1
+        if 0 < saved_ep < args.max_epoch:
+            load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
+            best_live_state = unwrap_compact_state_dict(model)
+            if 'optimizer_state_dict' in checkpoint:
+                try:
+                    optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
+                except Exception:
+                    pass
+            if 'optimizer_refiner_state_dict' in checkpoint:
+                try:
+                    optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner_state_dict'])
+                except Exception:
+                    pass
+            if 'scheduler_main_state_dict' in checkpoint:
+                try:
+                    scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
+                except Exception:
+                    pass
+            if 'scheduler_refiner_state_dict' in checkpoint:
+                try:
+                    scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
+                except Exception:
+                    pass
+            start_epoch = saved_ep
+            ap_best = checkpoint.get('best_ap', checkpoint.get('ap', ap_best))
+            auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
+            print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AP={ap_best * 100:.2f}%", flush=True)
 
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
+    mode_tag = "PURE LGT-SGNM VISUAL SOTA (NO DEAD-WEIGHT AUDIO/RUPA)" if args.no_audio else "MULTIMODAL SOTA"
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v4+ (ARGON-4 GRADIENT CONSERVATION) MULTIMODAL SOTA ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v4+ ({mode_tag}) ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {sampling_desc}", flush=True)
-    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps | Main LR={main_lr:.1e}, Audio LR={audio_lr:.1e}", flush=True)
-    print(f"  Loss Eq.   : GC-MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | ResEv={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight} | AuxAV={args.lambda_aux}", flush=True)
-    print(f"  Multi-Crop : {'5-Crop Parallel Multimodal Eval Active' if args.multi_crop_eval else '1-Crop Eval'} (sigma={args.smooth_sigma})", flush=True)
+    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps | LR = {main_lr:.1e} (WD={args.weight_decay:.0e})", flush=True)
+    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Ev={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
+    print(f"  Eval Mode  : {'Simultaneous 1-Crop (__0) + 5-Crop Spatial Eval' if args.multi_crop_eval else '1-Crop (__0) Eval'} (Epoch-End Only)", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
@@ -311,7 +321,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         DNP_use = args.DNP_use and (not args.no_rupa)
         epoch_improved = False
 
-        sum_l1 = sum_l2 = sum_l3 = sum_cons = sum_g = sum_aux = 0.0
+        sum_l1 = sum_l2 = sum_l3 = sum_l4 = sum_l5 = sum_cons = sum_g = sum_aux = 0.0
         epoch_t0 = time.time()
 
         if dual_loader_mode:
@@ -437,19 +447,23 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             sum_l1 += loss1.item()
             sum_l2 += loss2.item()
             sum_l3 += loss3.item()
+            sum_l4 += loss4.item()
+            sum_l5 += loss5.item()
             sum_cons += cons_loss.item()
             sum_g += g_loss.item()
             sum_aux += loss_aux.item()
 
             iter_num = i + 1
-            if iter_num == 1 or iter_num % 25 == 0 or iter_num == num_batches_per_epoch:
+            if iter_num == 1 or iter_num % 50 == 0 or iter_num == num_batches_per_epoch:
                 elapsed = max(1e-3, time.time() - epoch_t0)
                 it_s = iter_num / elapsed
                 eta_s = (num_batches_per_epoch - iter_num) / max(it_s, 1e-4)
+                aux_str = f" AuxAV:{sum_aux/iter_num:.4f}" if (not args.no_audio and args.lambda_aux > 0) else ""
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
-                    f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
-                    f"Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} AuxAV:{sum_aux/iter_num:.4f} | "
+                    f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{loss3.item():.4f} "
+                    f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} "
+                    f"Cons:{cons_loss.item():.4f} G:{g_loss.item():.4f}{aux_str} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )
@@ -525,17 +539,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         if best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
-                if hasattr(scheduler_main, 'base_lrs'):
-                    scheduler_main.base_lrs = [lr * 0.85 for lr in scheduler_main.base_lrs]
-                for pg in optimizer_main.param_groups:
-                    pg['lr'] *= 0.85
-                if hasattr(scheduler_refiner, 'schedule'):
-                    scheduler_refiner.schedule *= 0.85
-                    scheduler_refiner.final_value *= 0.85
-                for pg in optimizer_refiner.param_groups:
-                    pg['lr'] *= 0.85
                 cur_lr = optimizer_main.param_groups[0]['lr']
-                print(f"  [Rollback] Restored best checkpoint (AP={ap_best*100:.2f}%) | Gentle LR damping x0.85 -> {cur_lr:.2e}", flush=True)
+                print(f"  [Rollback] Restored best checkpoint (AP={ap_best*100:.2f}%) | Cosine LR -> {cur_lr:.2e}", flush=True)
         print("", flush=True)
 
     print(f"[FINISH] XD-Violence Training Complete! Best AP: {ap_best * 100:.2f}% | Best AUC: {auc_best * 100:.2f}%", flush=True)

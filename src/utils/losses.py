@@ -181,12 +181,18 @@ def CLASM_BKG(logits: torch.Tensor, labels: torch.Tensor, lengths: torch.Tensor,
 def text_orthogonality_loss(text_features: torch.Tensor, num_classes: int = None) -> torch.Tensor:
     """Enforces strict orthogonality between normalized 'Normal' prompt and all Anomaly prompts.
 
-    Handles `torch.nn.DataParallel` multi-GPU gathering automatically: when `DataParallel`
-    concatenates `[C, 512]` from `G` GPUs into `[G * C, 512]`, slices the first `[C, 512]`
-    replica so GPU 1's 'Normal' vector is never mistaken for an Anomaly class.
+    Handles `torch.nn.DataParallel` multi-GPU gathering symmetrically: when `DataParallel`
+    concatenates `[C, 512]` from `G` GPUs into `[G * C, 512]`, reshapes to `[G, C, 512]`
+    and averages across replicas so every GPU replica receives symmetric gradients and
+    GPU 1's 'Normal' vector is never mistaken for an Anomaly class.
     """
     t_norm = F.normalize(text_features.float(), dim=-1)
-    if num_classes is not None and t_norm.shape[0] > num_classes:
+    if num_classes is not None and t_norm.shape[0] > num_classes and t_norm.shape[0] % num_classes == 0:
+        t_replicas = t_norm.view(-1, num_classes, t_norm.shape[-1])  # [G, C, D]
+        t_normal = t_replicas[:, 0:1, :]                            # [G, 1, D]
+        t_abn = t_replicas[:, 1:, :]                                # [G, C-1, D]
+        return torch.abs(torch.bmm(t_abn, t_normal.transpose(1, 2))).mean()
+    elif num_classes is not None and t_norm.shape[0] > num_classes:
         t_norm = t_norm[:num_classes]
     elif t_norm.shape[0] > 1:
         cos_with_normal = t_norm[1:] @ t_norm[0]
@@ -194,7 +200,10 @@ def text_orthogonality_loss(text_features: torch.Tensor, num_classes: int = None
         if dup_idx.numel() > 0:
             c_inferred = int(dup_idx[0].item()) + 1
             if c_inferred > 1 and t_norm.shape[0] % c_inferred == 0:
-                t_norm = t_norm[:c_inferred]
+                t_replicas = t_norm.view(-1, c_inferred, t_norm.shape[-1])
+                t_normal = t_replicas[:, 0:1, :]
+                t_abn = t_replicas[:, 1:, :]
+                return torch.abs(torch.bmm(t_abn, t_normal.transpose(1, 2))).mean()
 
     t_normal = t_norm[0]     # [D]
     t_abn = t_norm[1:]       # [C-1, D]

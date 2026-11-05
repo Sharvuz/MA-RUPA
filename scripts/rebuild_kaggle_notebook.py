@@ -330,16 +330,16 @@ subprocess.run([
 ], cwd=REPO_DIR, check=False)""")
 
     # Cell 7: XD-Violence Markdown
-    add_md(r"""## 5. Huấn luyện Đa phương thức Bảo vệ Thị giác SOTA trên XD-Violence (MA-RUPA v6 Argon-4 Gradient Conservation)
+    add_md(r"""## 5. Huấn luyện Tinh khiết LGT-SGNM SOTA trên XD-Violence (Cắt bỏ Nhánh Tạ VGGish & RUPA Dilution | Batch Size 64 = 618 Steps/Epoch)
 
-* **Mục tiêu:** **$\ge 86.5\%$ Frame-level Average Precision (AP)** & **$\ge 96.2\%$ ROC-AUC** với 5-Crop + Peak-Preserving Audio Concordance.
-* **Cấu hình chuẩn thực nghiệm (Chuẩn 5-Crop + `Batch Size = 96` của DSANet = `206` steps/epoch):**
-  * **Stratified 5-Crop Slot Sampling + DSANet `Batch Size = 96` (`48` clips/GPU, `206` steps/epoch):** Khi kết hợp chuẩn **5-Crop (`19,770` clips/epoch)** với **`Batch Size = 96`** gốc của DSANet, mỗi epoch có đúng **`206` bước cập nhật** — kết thúc ngay tại đỉnh hội tụ vàng (`150–206` steps) trước khi hiện tượng học vẹt nền (`>300` steps) kịp xảy ra, đồng thời đảm bảo mọi batch đều phủ đủ các lớp hiếm (`riot`, `abuse`, `explosion`) cho nhánh `CLASM` (`loss2_weight = 5.0`).
-  * **Gradient-Conserving Multi-Scale Logit-MIL + CLIP-Cone Baseline Normalization:** Phá vỡ trần điểm số `0.30` trên các phim hành động khó (`Operation.Red.Sea`, `City.of.God`, `Salt`).
-  * **Peak-Preserving Multiplicative Audio Concordance:** Kết hợp âm thanh VGGish theo cơ chế đồng thuận nhân tính, tăng áp các đỉnh bạo lực có cả hình ảnh và âm thanh mà không kéo tụt các phân cảnh bạo lực câm.""")
+* **Mục tiêu:** **$\ge 85.0\%$ Frame-level Average Precision (AP)**, **$\ge 95.0\%$ ROC-AUC** & **$\ge 31.5\%$ Avg Localization mAP** (khôi phục hoàn toàn quỹ đạo `84.30%` AP ngay Epoch 1 và `84.99%` AP tại Epoch 8 của DSANet gốc).
+* **Giải phẫu & Cắt bỏ các nhánh "Tạ" (Dead-Weight Pruning):**
+  1. **Tắt hoàn toàn nhánh VGGish Audio (`--no-audio True`, `--lambda-aux 0.0`, `--aux-eval-alpha 0.0`):** Nhánh VGGish chỉ đạt `~70.3%` AP, làm loãng điểm số thị giác xuống `-1.9%` AP và làm chậm tốc độ I/O + huấn luyện gấp 3 lần (`0.16 it/s`). Loại bỏ VGGish giúp tốc độ huấn luyện vọt lên **`>1.2 it/s`** và giải phóng `optimizer_main` khỏi nhiễu gradient âm thanh.
+  2. **Tắt hoàn toàn pha loãng ngữ nghĩa 7 lớp vào điểm nhị phân (`--rupa-use False`, `--collab-alpha 0.0`):** Trên XD-Violence, nhánh `logits2` (`CLASM`, trọng số `5.0`) là bộ phân loại đa nhãn 7 lớp dùng để định hình đặc trưng và phân bổ xác suất qua `refine_scores_hierarchical(logits1, logits2)` cho bài toán định vị `mAP@IoU` (`32.43%`). Việc trộn trực tiếp `logits2` (`~65-78%` AP) vào điểm nhị phân `logits1` làm tụt AP nghiêm trọng — nay được cắt bỏ triệt để.
+  3. **Khôi phục `Batch Size = 64` trên toàn bộ `39,540` crops (`618` steps/epoch tại `LR = 1e-5`) & Đánh giá Cuối Epoch (`--eval-interval 0`):** Tại `LR = 1e-5`, mô hình cần đủ `618` bước cập nhật trong Epoch 1 để `Orth` hội tụ từ `0.97 -> 0.10` và `CLASM` từ `1.93 -> 0.91` (đạt ngay **`84.30%` AP** cuối Epoch 1), không bị cắt cụt ở step 206 hay bị rollback giữa chừng.""")
 
     # Cell 8: Train XD-Violence Code
-    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (MA-RUPA v6 ARGON-4 MULTIMODAL | BATCH 96 | 5 CROPS/VIDEO = 206 ITERS/EP) =========================
+    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (PURE LGT-SGNM SOTA | NO AUDIO/RUPA DEAD-WEIGHT | BATCH 64 = 618 ITERS/EP) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -362,24 +362,26 @@ cmd_train_xd = [
     "--gt-path", "list/gt.npy",
     "--gt-segment-path", "list/gt_segment.npy",
     "--gt-label-path", "list/gt_label.npy",
-    "--audio-dim", "128",
-    "--batch-size", "96",
+    "--no-audio", "True",
+    "--rupa-use", "False",
+    "--batch-size", "64",
     "--balanced-sampling", "False",
-    "--sample-one-crop-per-video", "True",
-    "--crops-per-video", "5",
+    "--sample-one-crop-per-video", "False",
     "--lr", "1e-5",
-    "--audio-lr", "3e-5",
+    "--weight-decay", "1e-2",
+    "--grad-clip", "0.0",
     "--max-epoch", "10",
     "--visual-layers", "1",
     "--visual-head", "1",
     "--attn-window", "64",
     "--decoder-depth", "8",
     "--num-prototypes", "16",
+    "--normal-selection-ratio", "0.8",
     "--text-adapt-until", "1",
     "--t-w", "0.6",
     "--aat-weight", "0.0",
-    "--no-iam",
-    "--no-acc",
+    "--no-iam", "True",
+    "--no-acc", "True",
     "--temp", "1.0",
     "--loss2-weight", "5.0",
     "--loss-sep-weight", "1.0",
@@ -389,23 +391,23 @@ cmd_train_xd = [
     "--lambda-acc", "0.0",
     "--loss-consistency-weight", "1.0",
     "--loss-gather-weight", "1.0",
-    "--loss-routing-weight", "0.20",
-    "--loss-routing-anchor-weight", "0.05",
-    "--lambda-aux", "0.80",
+    "--loss-routing-weight", "0.0",
+    "--loss-routing-anchor-weight", "0.0",
+    "--lambda-aux", "0.0",
     "--multi-crop-eval", "True",
-    "--max-test-crops", "10",
-    "--collab-alpha", "0.12",
-    "--aux-eval-alpha", "0.08",
-    "--smooth-eval", "True",
-    "--smooth-sigma", "1.00",
-    "--eval-interval", "100",
-    "--use-ema", "True",
+    "--max-test-crops", "5",
+    "--collab-alpha", "0.0",
+    "--aux-eval-alpha", "0.0",
+    "--smooth-eval", "False",
+    "--eval-interval", "0",
+    "--use-ema", "False",
+    "--use-checkpoint", "True",
     "--seed", "234",
     "--model-path", str(xd_model_path),
     "--checkpoint-path", str(xd_checkpoint_path),
 ]
 
-print("🚀 Bắt đầu huấn luyện MA-RUPA v6 (Argon-4 Gradient Conservation) trên XD-Violence (Chuẩn 5-Crop + BS 96 = 206 steps/epoch, Target ≥86.5% AP)...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện Pure LGT-SGNM SOTA trên XD-Violence (Đã cắt bỏ nhánh tạ VGGish & RUPA dilution, BS=64, 618 steps/ep)...\\n", flush=True)
 proc = subprocess.Popen(cmd_train_xd, cwd=REPO_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
 for line in proc.stdout:
     print(line, end="", flush=True)
@@ -424,6 +426,9 @@ ARTIFACTS = WORK / "rupa_artifacts"
 xd_test_csv = ARTIFACTS / "xd_test.csv" if (ARTIFACTS / "xd_test.csv").exists() else REPO_DIR / "list/xd_CLIP_rgbtest.csv"
 xd_model_path = ARTIFACTS / "model_xd_best.pth"
 
+subprocess.run(["git", "fetch", "origin", "main"], cwd=REPO_DIR, check=False)
+subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=REPO_DIR, check=False)
+
 subprocess.run([
     sys.executable, "-u", "src/xd_test.py",
     "--test-list", str(xd_test_csv),
@@ -431,15 +436,16 @@ subprocess.run([
     "--gt-segment-path", "list/gt_segment.npy",
     "--gt-label-path", "list/gt_label.npy",
     "--model-path", str(xd_model_path),
+    "--no-audio", "True",
+    "--rupa-use", "False",
     "--aat-weight", "0.0",
-    "--no-iam",
-    "--no-acc",
+    "--no-iam", "True",
+    "--no-acc", "True",
     "--multi-crop-eval", "True",
-    "--max-test-crops", "10",
-    "--collab-alpha", "0.12",
-    "--aux-eval-alpha", "0.08",
-    "--smooth-eval", "True",
-    "--smooth-sigma", "1.00",
+    "--max-test-crops", "5",
+    "--collab-alpha", "0.0",
+    "--aux-eval-alpha", "0.0",
+    "--smooth-eval", "False",
 ], cwd=REPO_DIR, check=True)
 
 subprocess.run([

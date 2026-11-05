@@ -489,6 +489,14 @@ class XDDataset(data.Dataset):
             for grp in grouped.values():
                 existing_grp = [(p, l) for p, l in grp if os.path.exists(resolve_feature_path(p, self.data_dir))]
                 self.video_groups.append(existing_grp if existing_grp else grp)
+        elif not self.test_mode and len(self.raw_paths) > 0:
+            # Fast sample check: if real .npy files exist on disk, filter out any non-existent crop rows
+            sample_check = [os.path.exists(resolve_feature_path(p, self.data_dir)) for p in self.raw_paths[:min(20, len(self.raw_paths))]]
+            if any(sample_check) and not all(sample_check):
+                valid_pairs = [(p, l) for p, l in zip(self.raw_paths, self.labels) if os.path.exists(resolve_feature_path(p, self.data_dir))]
+                if valid_pairs:
+                    self.raw_paths = [p for p, _ in valid_pairs]
+                    self.labels = [l for _, l in valid_pairs]
 
         self.audio_dict = {}
         if audio_file_path and os.path.exists(audio_file_path):
@@ -576,6 +584,10 @@ class XDDataset(data.Dataset):
             a_raw = F.interpolate(a_t, size=v_len, mode='linear', align_corners=False).squeeze(0).transpose(0, 1).numpy()
 
         if not self.test_mode:
+            if self.no_audio:
+                v_feat, clip_length = tools.process_feat(v_raw, self.clip_dim)
+                return torch.tensor(v_feat, dtype=torch.float32), label, clip_length, None
+
             if v_len > self.clip_dim:
                 r = np.linspace(0, v_len, self.clip_dim + 1, dtype=np.int32)
                 v_feat = np.zeros((self.clip_dim, v_raw.shape[1]), dtype=np.float32)

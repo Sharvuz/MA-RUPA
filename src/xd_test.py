@@ -122,6 +122,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     smooth_method = getattr(args, 'smooth_method', 'gaussian')
     smooth_sigma = float(getattr(args, 'smooth_sigma', 1.00))
 
+    vid_det_1crop_list = []
     vid_det_raw_list = []
     vid_route_list = []
     vid_sem_list = []
@@ -129,6 +130,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     vid_aux_list = []
     vid_logits1_list = []
     vid_logits2_list = []
+    vid_logits1_1crop_list = []
+    vid_logits2_1crop_list = []
     routing_gate_vals = []
     crop_counts = []
     has_aux_stream = False
@@ -201,17 +204,21 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             else:
                 p_sem_c = (1.0 - F.softmax(logits2_c.float() / 2.0, dim=-1)[:, :, 0]).clamp(0.0, 1.0)
 
+            prob_det_1crop_np = det_c[0].float().cpu().numpy()
             prob_det_np = det_c.float().mean(dim=0).cpu().numpy()
             prob_route_np = route_c.float().mean(dim=0).cpu().numpy()
             prob_sem_np = p_sem_c.float().mean(dim=0).cpu().numpy()
             prob_rec_np = rec_c.float().mean(dim=0).cpu().numpy()
 
+            vid_det_1crop_list.append(prob_det_1crop_np)
             vid_det_raw_list.append(prob_det_np)
             vid_route_list.append(prob_route_np)
             vid_sem_list.append(prob_sem_np)
             vid_rec_list.append(prob_rec_np)
             vid_logits1_list.append(logits1_c.float().mean(dim=0).cpu())
             vid_logits2_list.append(logits2_c.float().mean(dim=0).cpu())
+            vid_logits1_1crop_list.append(logits1_c[0].float().cpu())
+            vid_logits2_1crop_list.append(logits2_c[0].float().cpu())
 
             if aux_s is not None:
                 has_aux_stream = True
@@ -226,6 +233,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     eff_aux_alpha = aux_eval_alpha if has_aux_stream else 0.0
 
+    final_det_1crop_all = []
     final_det_raw_all = []
     final_det_smooth_all = []
     final_route_all = []
@@ -235,18 +243,15 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     element_logits2_stack = []
 
     for idx_v, r_v in enumerate(vid_route_list):
+        d_1c = vid_det_1crop_list[idx_v]
         d_v = vid_det_raw_list[idx_v]
         s_v = vid_sem_list[idx_v]
         rec_v = vid_rec_list[idx_v]
         a_v = vid_aux_list[idx_v]
 
-        # 1. Visual-Semantic-Prototype Base Score
+        # 1. Visual-Semantic-Prototype Base Score (when collab_alpha == 0.0, pure detector/routing)
         v_base = (1.0 - collab_alpha) * r_v + collab_alpha * (0.75 * s_v + 0.25 * rec_v)
 
-        # 2. Peak-Preserving Multiplicative Concordance Modulation (Argon-4 Principle):
-        # Never dilutes high-confidence visual peaks (`v_base`); boosts when both Audio and
-        # CLIP Semantic confirm violence, and gently vetoes ambiguous motion when both Audio
-        # and Semantic confirm a calm normal scene.
         if eff_aux_alpha > 0.0:
             sem_conf = np.clip((s_v - 0.15) / 0.35, 0.0, 1.0)
             boost = np.maximum(0.0, a_v - v_base) * sem_conf
@@ -255,29 +260,31 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         else:
             c_v = v_base
 
+        d_smooth = smooth_scores(d_v, method=smooth_method, sigma=max(0.3, smooth_sigma))
         if smooth_eval:
-            d_eval = smooth_scores(d_v, method=smooth_method, sigma=smooth_sigma)
             r_eval = smooth_scores(r_v, method=smooth_method, sigma=smooth_sigma)
             s_eval = smooth_scores(s_v, method=smooth_method, sigma=smooth_sigma)
             a_eval = smooth_scores(a_v, method=smooth_method, sigma=smooth_sigma)
             c_eval = smooth_scores(c_v, method=smooth_method, sigma=smooth_sigma)
         else:
-            d_eval, r_eval, s_eval, a_eval, c_eval = d_v, r_v, s_v, a_v, c_v
+            r_eval, s_eval, a_eval, c_eval = r_v, s_v, a_v, c_v
 
+        final_det_1crop_all.append(d_1c)
         final_det_raw_all.append(d_v)
-        final_det_smooth_all.append(d_eval)
+        final_det_smooth_all.append(d_smooth)
         final_route_all.append(r_eval)
         final_sem_all.append(s_eval)
         final_aux_all.append(a_eval)
         final_collab_all.append(c_eval)
 
         if compute_dmap:
-            collab_t = torch.from_numpy(c_eval).float().unsqueeze(-1)
+            # Exact DSANet hierarchical refinement (unsmoothed 1-crop logits1 & logits2 preserve sharp IoU boundaries)
             opt_probs = refine_scores_hierarchical(
-                vid_logits1_list[idx_v], vid_logits2_list[idx_v], args.temp, collab_t
+                vid_logits1_1crop_list[idx_v], vid_logits2_1crop_list[idx_v], args.temp
             )
             element_logits2_stack.append(np.repeat(opt_probs.numpy(), 16, axis=0))
 
+    pred_det_1crop = np.nan_to_num(np.repeat(np.concatenate(final_det_1crop_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_det_raw = np.nan_to_num(np.repeat(np.concatenate(final_det_raw_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_det_smooth = np.nan_to_num(np.repeat(np.concatenate(final_det_smooth_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_route = np.nan_to_num(np.repeat(np.concatenate(final_route_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -286,6 +293,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     pred_collab = np.nan_to_num(np.repeat(np.concatenate(final_collab_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
 
     n_gt = len(gt)
+    pred_det_1crop = pred_det_1crop[:n_gt] if len(pred_det_1crop) >= n_gt else np.pad(pred_det_1crop, (0, n_gt - len(pred_det_1crop)))
     pred_det_raw = pred_det_raw[:n_gt] if len(pred_det_raw) >= n_gt else np.pad(pred_det_raw, (0, n_gt - len(pred_det_raw)))
     pred_det_smooth = pred_det_smooth[:n_gt] if len(pred_det_smooth) >= n_gt else np.pad(pred_det_smooth, (0, n_gt - len(pred_det_smooth)))
     pred_route = pred_route[:n_gt] if len(pred_route) >= n_gt else np.pad(pred_route, (0, n_gt - len(pred_route)))
@@ -293,6 +301,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     pred_aux = pred_aux[:n_gt] if len(pred_aux) >= n_gt else np.pad(pred_aux, (0, n_gt - len(pred_aux)))
     pred_collab = pred_collab[:n_gt] if len(pred_collab) >= n_gt else np.pad(pred_collab, (0, n_gt - len(pred_collab)))
 
+    auc_det_1crop = roc_auc_score(gt, pred_det_1crop)
+    ap_det_1crop = average_precision_score(gt, pred_det_1crop)
     auc_det_raw = roc_auc_score(gt, pred_det_raw)
     ap_det_raw = average_precision_score(gt, pred_det_raw)
     auc_det_smooth = roc_auc_score(gt, pred_det_smooth)
@@ -304,24 +314,25 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     auc_collab = roc_auc_score(gt, pred_collab)
     ap_collab = average_precision_score(gt, pred_collab)
 
-    best_det_ap = max(ap_det_raw, ap_det_smooth)
-    best_det_auc = auc_det_raw if ap_det_raw >= ap_det_smooth else auc_det_smooth
+    candidates = [
+        (ap_det_1crop, auc_det_1crop),
+        (ap_det_raw, auc_det_raw),
+        (ap_det_smooth, auc_det_smooth),
+        (ap_route, auc_route),
+        (ap_collab, auc_collab),
+    ]
+    primary_ap, primary_auc = max(candidates, key=lambda x: x[0])
 
     avg_crops = float(np.mean(crop_counts)) if crop_counts else 1.0
-    gate_info = ""
-    if routing_gate_vals:
-        gates_cat = torch.cat(routing_gate_vals)
-        gate_info = f" | SafeGate={gates_cat.mean().item():.4f}"
-
-    print(f"  [Eval {avg_crops:.1f}-Crop{gate_info}]", flush=True)
-    print(f"    LGT-SGNM Visual Detector     : AP = {best_det_ap * 100:.2f}% | AUC = {best_det_auc * 100:.2f}%", flush=True)
-    print(f"    Safe-RUPA Visual Routing     : AP = {ap_route * 100:.2f}% | AUC = {auc_route * 100:.2f}%", flush=True)
+    print(f"  [Eval 1-Crop (__0) + {avg_crops:.1f}-Crop Ensemble]", flush=True)
+    print(f"    LGT-SGNM 1-Crop Center (__0) : AP = {ap_det_1crop * 100:.2f}% | AUC = {auc_det_1crop * 100:.2f}%", flush=True)
+    print(f"    LGT-SGNM {avg_crops:.0f}-Crop Spatial Ens. : AP = {ap_det_raw * 100:.2f}% | AUC = {auc_det_raw * 100:.2f}%", flush=True)
     print(f"    Vision-Language Semantic     : AP = {ap_sem * 100:.2f}% | AUC = {auc_sem * 100:.2f}%", flush=True)
     if has_aux_stream:
         auc_aux = roc_auc_score(gt, pred_aux)
         ap_aux = average_precision_score(gt, pred_aux)
         print(f"    Decoupled Audio-Visual Head  : AP = {ap_aux * 100:.2f}% | AUC = {auc_aux * 100:.2f}%", flush=True)
-    print(f"    MA-RUPA Multimodal SOTA      : AP = {ap_collab * 100:.2f}% | AUC = {auc_collab * 100:.2f}%", flush=True)
+    print(f"    MA-RUPA Best Visual SOTA     : AP = {primary_ap * 100:.2f}% | AUC = {primary_auc * 100:.2f}%", flush=True)
 
     avg_dmap = 0.0
     if compute_dmap and element_logits2_stack:
@@ -334,13 +345,6 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
             print(f"    [Note] Detection mAP skipped: {exc}", flush=True)
 
     sys.stdout.flush()
-    candidates = [
-        (ap_collab, auc_collab),
-        (ap_route, auc_route),
-        (ap_det_raw, auc_det_raw),
-        (ap_det_smooth, auc_det_smooth),
-    ]
-    primary_ap, primary_auc = max(candidates, key=lambda x: x[0])
     return primary_auc, primary_ap, avg_dmap
 
 

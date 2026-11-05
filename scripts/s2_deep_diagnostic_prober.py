@@ -150,8 +150,8 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
     cursor = 0
     maxlen = 256
     sem_temp = 2.0 if args.dataset == 'xd' else 2.5
-    max_crops = 10 if args.multi_crop_eval else 1
-    no_audio = (args.dataset != 'xd')
+    max_crops = (5 if args.dataset == 'xd' else 10) if args.multi_crop_eval else 1
+    no_audio = (args.dataset != 'xd') or bool(getattr(model, 'no_audio', True))
 
     with torch.no_grad():
         for idx, item in enumerate(test_loader):
@@ -184,7 +184,9 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
                 model, visual_flat, audio_flat, padding_mask, prompt_text, lengths_flat
             )
 
-            s_det = det_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float().mean(dim=0).cpu().numpy()
+            det_c = det_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float()
+            s_det_1crop = det_c[0].cpu().numpy()
+            s_det = det_c.mean(dim=0).cpu().numpy()
             s_routing = route_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float().mean(dim=0).cpu().numpy()
             s_rec = rec_s.view(C, num_splits * maxlen, -1)[:, :length, 0].float().mean(dim=0).cpu().numpy()
 
@@ -213,6 +215,7 @@ def collect_predictions_per_video(model: MARUPA, test_loader, prompt_text: List[
                 'video_idx': idx,
                 'path': raw_path,
                 'label': label_name,
+                's_det_1crop': s_det_1crop,
                 's_det': s_det,
                 's_aux': s_aux,
                 's_sem': s_sem,
@@ -260,18 +263,20 @@ def analyze_and_sweep(records: List[Dict[str, Any]], dataset: str) -> Dict[str, 
     for v in abnormal_evals[:5]:
         print(f"  {v['path']:<42} | {v['label']:<14} | mean_anom={v['mean_anomaly_score']:.3f} | miss={v['miss_rate_pct']:.1f}%")
 
+    det_1crop_all = np.concatenate([np.repeat(r.get('s_det_1crop', r['s_det']), 16)[:len(r['gt_frames'])] for r in valid_records])
     det_all = np.concatenate([np.repeat(r['s_det'], 16)[:len(r['gt_frames'])] for r in valid_records])
     route_all = np.concatenate([np.repeat(r['s_routing'], 16)[:len(r['gt_frames'])] for r in valid_records])
     sem_all = np.concatenate([np.repeat(r['s_sem'], 16)[:len(r['gt_frames'])] for r in valid_records])
     rec_all = np.concatenate([np.repeat(r['s_rec'], 16)[:len(r['gt_frames'])] for r in valid_records])
     aux_all = np.concatenate([np.repeat(r['s_aux'], 16)[:len(r['gt_frames'])] for r in valid_records])
 
+    has_any_aux = any(r.get('has_aux', False) for r in valid_records)
     g_vs_all = np.clip((np.maximum(det_all, sem_all) - 0.10) / 0.25, 0.0, 1.0)
-    aux_alphas = [0.0, 0.06, 0.08, 0.12] if dataset == 'xd' else [0.0]
+    aux_alphas = [0.0, 0.06, 0.08] if (dataset == 'xd' and has_any_aux) else [0.0]
 
     best = {'ap': 0.0, 'auc': 0.0, 'recipe': ''}
-    stream_choices = [('det', det_all), ('route', route_all)]
-    alphas = [0.0, 0.02, 0.05, 0.08, 0.12, 0.16] if dataset == 'ucf' else [0.0, 0.08, 0.12, 0.16, 0.20]
+    stream_choices = [('det_1crop', det_1crop_all), ('det_mc', det_all), ('route', route_all)]
+    alphas = [0.0, 0.02, 0.05, 0.08, 0.12] if dataset == 'ucf' else [0.0, 0.02, 0.05]
     sigmas = [0.0, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.2]
 
     for stream_name, base_s in stream_choices:
