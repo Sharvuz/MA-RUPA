@@ -332,13 +332,13 @@ subprocess.run([
     add_md(r"""## 5. Huấn luyện Đa phương thức Bảo vệ Thị giác SOTA trên XD-Violence (MA-RUPA v6 Argon-4 Gradient Conservation)
 
 * **Mục tiêu:** **$\ge 86.5\%$ Frame-level Average Precision (AP)** & **$\ge 96.2\%$ ROC-AUC** với 5-Crop + Peak-Preserving Audio Concordance.
-* **Cấu hình chuẩn thực nghiệm (Chuẩn 5-Crop của các bài báo XD-Violence):**
-  * **Stratified 5-Crop Slot Sampling (`crops_per_video = 5`, `Batch Size = 64`, `309` steps/epoch):** Khớp chính xác với giao thức **5-Crop (`19,770` clips/epoch = `309` steps/epoch)** của các bài báo gốc trên XD-Violence (Wu et al. ECCV 2020, PEL4VAD, VadCLIP, DSANet), thay vì nạp trùng lặp 10-crop (`618` steps) gây học vẹt nền.
+* **Cấu hình chuẩn thực nghiệm (Chuẩn 5-Crop + `Batch Size = 96` của DSANet = `206` steps/epoch):**
+  * **Stratified 5-Crop Slot Sampling + DSANet `Batch Size = 96` (`48` clips/GPU, `206` steps/epoch):** Khi kết hợp chuẩn **5-Crop (`19,770` clips/epoch)** với **`Batch Size = 96`** gốc của DSANet, mỗi epoch có đúng **`206` bước cập nhật** — kết thúc ngay tại đỉnh hội tụ vàng (`150–206` steps) trước khi hiện tượng học vẹt nền (`>300` steps) kịp xảy ra, đồng thời đảm bảo mọi batch đều phủ đủ các lớp hiếm (`riot`, `abuse`, `explosion`) cho nhánh `CLASM` (`loss2_weight = 5.0`).
   * **Gradient-Conserving Multi-Scale Logit-MIL + CLIP-Cone Baseline Normalization:** Phá vỡ trần điểm số `0.30` trên các phim hành động khó (`Operation.Red.Sea`, `City.of.God`, `Salt`).
   * **Peak-Preserving Multiplicative Audio Concordance:** Kết hợp âm thanh VGGish theo cơ chế đồng thuận nhân tính, tăng áp các đỉnh bạo lực có cả hình ảnh và âm thanh mà không kéo tụt các phân cảnh bạo lực câm.""")
 
     # Cell 8: Train XD-Violence Code
-    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (MA-RUPA v6 ARGON-4 MULTIMODAL | BATCH 64 | 5 CROPS/VIDEO = 309 ITERS/EP) =========================
+    add_code("""# ========================= 5. TRAIN XD-VIOLENCE (MA-RUPA v6 ARGON-4 MULTIMODAL | BATCH 96 | 5 CROPS/VIDEO = 206 ITERS/EP) =========================
 import sys, subprocess
 from pathlib import Path
 
@@ -362,7 +362,7 @@ cmd_train_xd = [
     "--gt-segment-path", "list/gt_segment.npy",
     "--gt-label-path", "list/gt_label.npy",
     "--audio-dim", "128",
-    "--batch-size", "64",
+    "--batch-size", "96",
     "--balanced-sampling", "False",
     "--sample-one-crop-per-video", "True",
     "--crops-per-video", "5",
@@ -397,14 +397,14 @@ cmd_train_xd = [
     "--aux-eval-alpha", "0.08",
     "--smooth-eval", "True",
     "--smooth-sigma", "1.00",
-    "--eval-interval", "150",
+    "--eval-interval", "100",
     "--use-ema", "True",
     "--seed", "234",
     "--model-path", str(xd_model_path),
     "--checkpoint-path", str(xd_checkpoint_path),
 ]
 
-print("🚀 Bắt đầu huấn luyện MA-RUPA v6 (Argon-4 Gradient Conservation) trên XD-Violence (Chuẩn 5-Crop = 309 steps/epoch, Target ≥86.5% AP)...\\n", flush=True)
+print("🚀 Bắt đầu huấn luyện MA-RUPA v6 (Argon-4 Gradient Conservation) trên XD-Violence (Chuẩn 5-Crop + BS 96 = 206 steps/epoch, Target ≥86.5% AP)...\\n", flush=True)
 proc = subprocess.Popen(cmd_train_xd, cwd=REPO_DIR, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
 for line in proc.stdout:
     print(line, end="", flush=True)
