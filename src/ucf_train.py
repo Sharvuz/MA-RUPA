@@ -14,7 +14,7 @@ from utils.dataset import UCFDataset
 from utils.tools import get_prompt_text, get_batch_label, safe_load_checkpoint
 from utils.StableAdamW import StableAdamW
 from utils.losses import (
-    CLAS2, CLASM, CLASM_EVENT, CLASM_BKG,
+    CLAS2, CLASM, RUPA_RESIDUAL_EVENT, CLASM_BKG,
     text_orthogonality_loss, ConsistencyLoss, routing_anchor_loss,
     edge_preserving_smoothness_loss, iam_intention_loss, acc_pseudo_label_loss,
     WarmCosineScheduler, ModelEMA,
@@ -238,10 +238,12 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
         for i in range(num_batches_per_epoch):
             global_step = e * num_batches_per_epoch + i
-            if sem_warmup_steps <= 0 or global_step >= sem_warmup_steps:
-                raw_model.sem_grad_scale = 0.0
+            if sem_warmup_steps <= 0:
+                raw_model.sem_grad_scale = 1.0
+            elif global_step >= sem_warmup_steps:
+                raw_model.sem_grad_scale = 0.35
             else:
-                raw_model.sem_grad_scale = 0.5 * (1.0 + math.cos(math.pi * float(global_step) / float(sem_warmup_steps)))
+                raw_model.sem_grad_scale = 0.35 + 0.65 * 0.5 * (1.0 + math.cos(math.pi * float(global_step) / float(sem_warmup_steps)))
 
             norm_feat, norm_lbl, norm_len = next(normal_iter)
             abn_feat, abn_lbl, abn_len = next(anomaly_iter)
@@ -258,7 +260,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
             loss2 = CLASM(logits2, text_labels, feat_lengths, device) if args.loss2_weight > 0 else logits1.sum() * 0.0
             loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num) if args.loss_sep_weight > 0 else logits1.sum() * 0.0
-            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device) if args.loss_residual_weight > 0 else logits1.sum() * 0.0
+            loss4 = RUPA_RESIDUAL_EVENT(logits3, text_labels, feat_lengths, device) if args.loss_residual_weight > 0 else logits1.sum() * 0.0
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device) if args.loss_reconstructed_normal_weight > 0 else logits1.sum() * 0.0
 
             iam_protos = raw_model.iam_module.intention_prototypes if getattr(raw_model, 'iam_module', None) is not None else None
@@ -353,7 +355,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
-                    f"Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} SemG:{raw_model.sem_grad_scale:.2f} | "
+                    f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} SemG:{raw_model.sem_grad_scale:.2f} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )
