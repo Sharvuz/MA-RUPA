@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import subprocess
@@ -268,7 +269,9 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
     consistency_loss_fn = ConsistencyLoss()
     prompt_text = get_prompt_text(label_map)
-    use_rollback = bool(getattr(args, 'use_rollback', False))
+    use_rollback = bool(getattr(args, 'use_rollback', True))
+    sem_warmup_epochs = float(getattr(args, 'sem_warmup_epochs', 1.5))
+    sem_warmup_steps = max(0, int(round(sem_warmup_epochs * num_batches_per_epoch)))
 
     ap_best = -1.0
     auc_best = -1.0
@@ -278,7 +281,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         saved_ep = checkpoint.get('epoch', -1) + 1
-        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v7_overhaul') or (args.max_epoch <= 3)
+        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v8_decoupled') or (args.max_epoch <= 3)
         if 0 < saved_ep < args.max_epoch and is_compatible_ckpt:
             load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
             best_live_state = unwrap_compact_state_dict(model)
@@ -307,17 +310,17 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
             print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AP={ap_best * 100:.2f}%", flush=True)
         elif 0 < saved_ep < args.max_epoch:
-            print(f"[Checkpoint] Ignoring legacy pre-overhaul checkpoint (epoch {saved_ep}) -> Starting fresh 10-epoch overhaul run!", flush=True)
+            print(f"[Checkpoint] Ignoring legacy pre-v8 checkpoint (epoch {saved_ep}) -> Starting fresh v8 Gradient-Decoupled run!", flush=True)
 
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
-    mode_tag = "PURE LGT-SGNM VISUAL SOTA (NO DEAD-WEIGHT AUDIO/RUPA)" if args.no_audio else "MULTIMODAL SOTA"
+    mode_tag = "GRADIENT-DECOUPLED LGT-SGNM VISUAL SOTA" if args.no_audio else "MULTIMODAL SOTA"
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v4+ ({mode_tag}) ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v8 ({mode_tag}) ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {sampling_desc}", flush=True)
     print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps | LR = {main_lr:.1e} (WD={args.weight_decay:.0e})", flush=True)
-    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Ev={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
-    print(f"  Eval Mode  : {'Simultaneous 1-Crop (__0) + 5-Crop Spatial Eval' if args.multi_crop_eval else '1-Crop (__0) Eval'} (Epoch-End Only)", flush=True)
+    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} (SemWarmup={sem_warmup_epochs:.1f}ep) | Orth={args.loss_sep_weight} | Ev={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
+    print(f"  Eval Mode  : {'Simultaneous 1-Crop (__0) + 5-Crop Spatial Eval' if args.multi_crop_eval else '1-Crop (__0) Eval'} | {'Epoch-End Best-State Anchor' if use_rollback else 'No Rollback'}", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
@@ -335,6 +338,12 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             single_iter = iter(normal_loader)
 
         for i in range(num_batches_per_epoch):
+            global_step = e * num_batches_per_epoch + i
+            if sem_warmup_steps <= 0 or global_step >= sem_warmup_steps:
+                raw_model.sem_grad_scale = 0.0
+            else:
+                raw_model.sem_grad_scale = 0.5 * (1.0 + math.cos(math.pi * float(global_step) / float(sem_warmup_steps)))
+
             if dual_loader_mode:
                 n_vis, n_lbls, n_lens, n_aud = next(normal_iter)
                 a_vis, a_lbls, a_lens, a_aud = next(anomaly_iter)
@@ -359,10 +368,10 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             )
 
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
-            loss2 = CLASM(logits2, text_labels, feat_lengths, device)
-            loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num)
-            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
-            loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
+            loss2 = CLASM(logits2, text_labels, feat_lengths, device) if args.loss2_weight > 0 else logits1.sum() * 0.0
+            loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num) if args.loss_sep_weight > 0 else logits1.sum() * 0.0
+            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device) if args.loss_residual_weight > 0 else logits1.sum() * 0.0
+            loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device) if args.loss_reconstructed_normal_weight > 0 else logits1.sum() * 0.0
 
             iam_protos = raw_model.iam_module.intention_prototypes if getattr(raw_model, 'iam_module', None) is not None else None
             loss_iam = (
@@ -438,6 +447,9 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             optimizer_refiner.zero_grad(set_to_none=True)
             loss.backward()
 
+            for p in raw_model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num_(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
 
@@ -466,13 +478,12 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{loss3.item():.4f} "
-                    f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} "
-                    f"Cons:{cons_loss.item():.4f} G:{g_loss.item():.4f}{aux_str} | "
+                    f"Cons:{cons_loss.item():.4f} G:{g_loss.item():.4f} SemG:{raw_model.sem_grad_scale:.2f}{aux_str} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )
 
-            if args.eval_interval > 0 and iter_num % args.eval_interval == 0 and iter_num < num_batches_per_epoch:
+            if e >= 1 and args.eval_interval > 0 and iter_num % args.eval_interval == 0 and iter_num < num_batches_per_epoch:
                 auc_cur, ap_cur, _ = test(
                     model, testloader, args.visual_length, prompt_text,
                     gt, gtsegments, gtlabels, DNP_use, args, device, compute_dmap=False,
@@ -510,7 +521,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
         torch.save({
             'epoch': e,
-            'arch_version': 'marupa_v7_overhaul',
+            'arch_version': 'marupa_v8_decoupled',
             'model_state_dict': (best_live_state if (use_rollback and best_live_state is not None) else live_state),
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
@@ -545,7 +556,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
                 cur_lr = optimizer_main.param_groups[0]['lr']
-                print(f"  [Rollback] Restored best checkpoint (AP={ap_best*100:.2f}%) | Cosine LR -> {cur_lr:.2e}", flush=True)
+                print(f"  [Best-State Anchor] Restored best checkpoint (AP={ap_best*100:.2f}%) | Cosine LR -> {cur_lr:.2e}", flush=True)
         print("", flush=True)
 
     print(f"[FINISH] XD-Violence Training Complete! Best AP: {ap_best * 100:.2f}% | Best AUC: {auc_best * 100:.2f}%", flush=True)

@@ -1,3 +1,4 @@
+import math
 import os
 import random
 import subprocess
@@ -156,12 +157,9 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         lr=main_lr,
         weight_decay=args.weight_decay,
     )
-    scheduler_main = WarmCosineScheduler(
+    scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer_main,
-        base_value=main_lr,
-        final_value=main_lr * 0.10,
-        total_iters=total_iters,
-        warmup_iters=min(100, max(0, total_iters // 10)),
+        T_max=max(1, args.max_epoch),
     )
 
     optimizer_refiner = StableAdamW(
@@ -182,7 +180,9 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     consistency_loss_fn = ConsistencyLoss()
     prompt_text = get_prompt_text(label_map)
-    use_rollback = bool(getattr(args, 'use_rollback', False))
+    use_rollback = bool(getattr(args, 'use_rollback', True))
+    sem_warmup_epochs = float(getattr(args, 'sem_warmup_epochs', 2.0))
+    sem_warmup_steps = max(0, int(round(sem_warmup_epochs * num_batches_per_epoch)))
 
     auc_best = -1.0
     best_live_state = None
@@ -191,7 +191,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         saved_ep = checkpoint.get('epoch', -1) + 1
-        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v7_overhaul') or (args.max_epoch <= 3)
+        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v8_decoupled') or (args.max_epoch <= 3)
         if 0 < saved_ep < args.max_epoch and is_compatible_ckpt:
             load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
             best_live_state = unwrap_compact_state_dict(model)
@@ -210,7 +210,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             auc_best = checkpoint.get('auc', checkpoint.get('ap', auc_best))
             print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AUC={auc_best * 100:.2f}%", flush=True)
         elif 0 < saved_ep < args.max_epoch:
-            print(f"[Checkpoint] Ignoring legacy pre-overhaul checkpoint (epoch {saved_ep}) -> Starting fresh 10-epoch overhaul run!", flush=True)
+            print(f"[Checkpoint] Ignoring legacy pre-v8 checkpoint (epoch {saved_ep}) -> Starting fresh v8 Gradient-Decoupled run!", flush=True)
 
     ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
 
@@ -218,11 +218,11 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v7 (COUNTERFACTUAL SGNM OVERHAUL) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v8 (GRADIENT-DECOUPLED LGT-SGNM) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)", flush=True)
-    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} gradient steps | WarmCosine LR = {main_lr:.1e}, WD = {args.weight_decay:.1e}", flush=True)
-    print(f"  Loss Eq.   : GC-MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | ResEv={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
-    print(f"  Mode       : {'Smooth 10-Epoch Convergence (No Rollback)' if not use_rollback else 'Rollback Active'} | Dual 1-Crop (__5) + 10-Crop Eval", flush=True)
+    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} gradient steps | Cosine LR = {main_lr:.1e}, WD = {args.weight_decay:.1e}", flush=True)
+    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} (SemWarmup={sem_warmup_epochs:.1f}ep) | Orth={args.loss_sep_weight} | Ev={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
+    print(f"  Mode       : {'Epoch-End Best-State Anchor (No LR Damping)' if use_rollback else 'No Rollback'} | Dual 1-Crop (__5) + 10-Crop Eval (sigma={args.smooth_sigma})", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
@@ -237,6 +237,12 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         anomaly_iter = iter(anomaly_loader)
 
         for i in range(num_batches_per_epoch):
+            global_step = e * num_batches_per_epoch + i
+            if sem_warmup_steps <= 0 or global_step >= sem_warmup_steps:
+                raw_model.sem_grad_scale = 0.0
+            else:
+                raw_model.sem_grad_scale = 0.5 * (1.0 + math.cos(math.pi * float(global_step) / float(sem_warmup_steps)))
+
             norm_feat, norm_lbl, norm_len = next(normal_iter)
             abn_feat, abn_lbl, abn_len = next(anomaly_iter)
 
@@ -250,10 +256,10 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             )
 
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
-            loss2 = CLASM(logits2, text_labels, feat_lengths, device)
-            loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num)
-            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device)
-            loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device)
+            loss2 = CLASM(logits2, text_labels, feat_lengths, device) if args.loss2_weight > 0 else logits1.sum() * 0.0
+            loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num) if args.loss_sep_weight > 0 else logits1.sum() * 0.0
+            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device) if args.loss_residual_weight > 0 else logits1.sum() * 0.0
+            loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device) if args.loss_reconstructed_normal_weight > 0 else logits1.sum() * 0.0
 
             iam_protos = raw_model.iam_module.intention_prototypes if getattr(raw_model, 'iam_module', None) is not None else None
             loss_iam = (
@@ -317,12 +323,15 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             optimizer_refiner.zero_grad(set_to_none=True)
             loss.backward()
 
+            # Guard against any non-finite gradient before L2 norm clipping so clip_coef never becomes 0.0
+            for p in raw_model.parameters():
+                if p.grad is not None:
+                    torch.nan_to_num_(p.grad, nan=0.0, posinf=1.0, neginf=-1.0)
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
 
             optimizer_main.step()
             optimizer_refiner.step()
-            scheduler_main.step()
             scheduler_refiner.step()
 
             if ema is not None:
@@ -344,7 +353,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
-                    f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} | "
+                    f"Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} SemG:{raw_model.sem_grad_scale:.2f} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )
@@ -362,6 +371,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     print(f"  [*] [NEW BEST UCF-CRIME] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
                 model.train()
 
+        scheduler_main.step()
+
         print(f"\n--- Epoch {e+1}/{args.max_epoch} Complete | Evaluating Live Weights ---", flush=True)
         auc_live, _ = test(
             model, testloader, args.visual_length, prompt_text,
@@ -377,7 +388,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
         torch.save({
             'epoch': e,
-            'arch_version': 'marupa_v7_overhaul',
+            'arch_version': 'marupa_v8_decoupled',
             'model_state_dict': (best_live_state if (use_rollback and best_live_state is not None) else live_state),
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
@@ -405,20 +416,8 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         if use_rollback and best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
-                if hasattr(scheduler_main, 'schedule'):
-                    scheduler_main.schedule *= 0.85
-                    scheduler_main.final_value *= 0.85
-                elif hasattr(scheduler_main, 'base_lrs'):
-                    scheduler_main.base_lrs = [lr * 0.85 for lr in scheduler_main.base_lrs]
-                for pg in optimizer_main.param_groups:
-                    pg['lr'] *= 0.85
-                if hasattr(scheduler_refiner, 'schedule'):
-                    scheduler_refiner.schedule *= 0.85
-                    scheduler_refiner.final_value *= 0.85
-                for pg in optimizer_refiner.param_groups:
-                    pg['lr'] *= 0.85
                 cur_lr = optimizer_main.param_groups[0]['lr']
-                print(f"  [Rollback] Restored best checkpoint (AUC={auc_best*100:.2f}%) | Gentle LR damping x0.85 -> {cur_lr:.2e}", flush=True)
+                print(f"  [Best-State Anchor] Restored best checkpoint (AUC={auc_best*100:.2f}%) | Cosine LR -> {cur_lr:.2e}", flush=True)
         print("", flush=True)
 
     print(f"[FINISH] UCF-Crime Training Complete! Best ROC-AUC: {auc_best * 100:.2f}%", flush=True)
