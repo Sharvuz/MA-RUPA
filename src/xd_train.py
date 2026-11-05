@@ -525,11 +525,16 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         if best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
-                scheduler_main.schedule *= 0.85
-                scheduler_main.final_value *= 0.85
-                scheduler_refiner.schedule *= 0.85
-                scheduler_refiner.final_value *= 0.85
-                cur_lr = scheduler_main.get_lr()[0]
+                if hasattr(scheduler_main, 'base_lrs'):
+                    scheduler_main.base_lrs = [lr * 0.85 for lr in scheduler_main.base_lrs]
+                for pg in optimizer_main.param_groups:
+                    pg['lr'] *= 0.85
+                if hasattr(scheduler_refiner, 'schedule'):
+                    scheduler_refiner.schedule *= 0.85
+                    scheduler_refiner.final_value *= 0.85
+                for pg in optimizer_refiner.param_groups:
+                    pg['lr'] *= 0.85
+                cur_lr = optimizer_main.param_groups[0]['lr']
                 print(f"  [Rollback] Restored best checkpoint (AP={ap_best*100:.2f}%) | Gentle LR damping x0.85 -> {cur_lr:.2e}", flush=True)
         print("", flush=True)
 

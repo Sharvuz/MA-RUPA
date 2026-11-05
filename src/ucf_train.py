@@ -176,7 +176,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         warmup_iters=min(100, max(0, total_iters_refiner - 1)),
     )
 
-    ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
     consistency_loss_fn = ConsistencyLoss()
     prompt_text = get_prompt_text(label_map)
 
@@ -186,19 +185,32 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
-        load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
-        best_live_state = unwrap_compact_state_dict(model)
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'optimizer_refiner_state_dict' in checkpoint:
-            optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner_state_dict'])
-        if 'scheduler_main_state_dict' in checkpoint:
-            scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
-        if 'scheduler_refiner_state_dict' in checkpoint:
-            scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
-        start_epoch = checkpoint.get('epoch', -1) + 1
-        auc_best = checkpoint.get('auc', checkpoint.get('ap', auc_best))
-        print(f"[Resume] Resumed from epoch {start_epoch}, best AUC={auc_best * 100:.2f}%", flush=True)
+        saved_ep = checkpoint.get('epoch', -1) + 1
+        if 0 < saved_ep < args.max_epoch:
+            load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
+            best_live_state = unwrap_compact_state_dict(model)
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'optimizer_refiner_state_dict' in checkpoint:
+                optimizer_refiner.load_state_dict(checkpoint['optimizer_refiner_state_dict'])
+            if 'scheduler_main_state_dict' in checkpoint:
+                scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
+            if 'scheduler_refiner_state_dict' in checkpoint:
+                scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
+            start_epoch = saved_ep
+            auc_best = checkpoint.get('auc', checkpoint.get('ap', auc_best))
+            if hasattr(scheduler_main, 'base_lrs'):
+                scheduler_main.base_lrs = [lr * 0.85 for lr in scheduler_main.base_lrs]
+            for pg in optimizer_main.param_groups:
+                pg['lr'] *= 0.85
+            if hasattr(scheduler_refiner, 'schedule'):
+                scheduler_refiner.schedule *= 0.85
+                scheduler_refiner.final_value *= 0.85
+            for pg in optimizer_refiner.param_groups:
+                pg['lr'] *= 0.85
+            print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AUC={auc_best * 100:.2f}%", flush=True)
+
+    ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
 
     eff_batch = normal_loader.batch_size * 2
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
@@ -391,11 +403,16 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         if best_live_state is not None:
             load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
             if not epoch_improved:
-                scheduler_main.schedule *= 0.85
-                scheduler_main.final_value *= 0.85
-                scheduler_refiner.schedule *= 0.85
-                scheduler_refiner.final_value *= 0.85
-                cur_lr = scheduler_main.get_lr()[0]
+                if hasattr(scheduler_main, 'base_lrs'):
+                    scheduler_main.base_lrs = [lr * 0.85 for lr in scheduler_main.base_lrs]
+                for pg in optimizer_main.param_groups:
+                    pg['lr'] *= 0.85
+                if hasattr(scheduler_refiner, 'schedule'):
+                    scheduler_refiner.schedule *= 0.85
+                    scheduler_refiner.final_value *= 0.85
+                for pg in optimizer_refiner.param_groups:
+                    pg['lr'] *= 0.85
+                cur_lr = optimizer_main.param_groups[0]['lr']
                 print(f"  [Rollback] Restored best checkpoint (AUC={auc_best*100:.2f}%) | Gentle LR damping x0.85 -> {cur_lr:.2e}", flush=True)
         print("", flush=True)
 

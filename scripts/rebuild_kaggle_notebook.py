@@ -276,6 +276,7 @@ cmd_train_ucf = [
     "--smooth-sigma", "1.00",
     "--eval-interval", "50",
     "--use-ema", "True",
+    "--use-checkpoint", "True",
     "--seed", "234",
     "--model-path", str(ucf_model_path),
     "--checkpoint-path", str(ucf_checkpoint_path),
