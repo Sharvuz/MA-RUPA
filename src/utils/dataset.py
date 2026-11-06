@@ -417,7 +417,7 @@ class UCFDataset(data.Dataset):
         if self.sample_one_crop_per_video and not self.test_mode:
             grouped = defaultdict(list)
             for p, l in zip(self.raw_paths, self.labels):
-                base_id = os.path.basename(p).split('__')[0]
+                base_id = strip_crop_suffix(p)
                 grouped[base_id].append((p, l))
             for grp in grouped.values():
                 existing_grp = [(p, l) for p, l in grp if os.path.exists(resolve_feature_path(p, self.data_dir))]
@@ -435,11 +435,13 @@ class UCFDataset(data.Dataset):
             crops = self.video_groups[vid_idx]
             n_c = len(crops)
             if n_c > 1 and self.crops_per_video > 1:
-                stride = max(1, n_c // self.crops_per_video)
-                crop_idx = (slot * stride + np.random.randint(stride)) % n_c
+                lo = (slot * n_c) // self.crops_per_video
+                hi = max(lo + 1, ((slot + 1) * n_c) // self.crops_per_video)
+                crop_idx = int(torch.randint(lo, hi, (1,)).item()) % n_c
                 raw_path, label = crops[crop_idx]
             else:
-                raw_path, label = crops[np.random.randint(n_c)]
+                crop_idx = int(torch.randint(0, n_c, (1,)).item())
+                raw_path, label = crops[crop_idx]
         else:
             raw_path = self.raw_paths[index]
             label = self.labels[index]
@@ -557,11 +559,13 @@ class XDDataset(data.Dataset):
             crops = self.video_groups[vid_idx]
             n_c = len(crops)
             if n_c > 1 and self.crops_per_video > 1:
-                stride = max(1, n_c // self.crops_per_video)
-                crop_idx = (slot * stride + np.random.randint(stride)) % n_c
+                lo = (slot * n_c) // self.crops_per_video
+                hi = max(lo + 1, ((slot + 1) * n_c) // self.crops_per_video)
+                crop_idx = int(torch.randint(lo, hi, (1,)).item()) % n_c
                 raw_path, label = crops[crop_idx]
             else:
-                raw_path, label = crops[np.random.randint(n_c)]
+                crop_idx = int(torch.randint(0, n_c, (1,)).item())
+                raw_path, label = crops[crop_idx]
         else:
             raw_path = self.raw_paths[index]
             label = self.labels[index]
@@ -591,11 +595,16 @@ class XDDataset(data.Dataset):
 
         if not self.test_mode:
             if self.no_audio:
-                v_feat, clip_length = tools.process_feat(v_raw, self.clip_dim)
+                v_feat, clip_length = tools.process_feat(v_raw, self.clip_dim, jitter=True)
                 return torch.tensor(v_feat, dtype=torch.float32), label, clip_length, None
 
             if v_len > self.clip_dim:
                 r = np.linspace(0, v_len, self.clip_dim + 1, dtype=np.int32)
+                if self.clip_dim > 2:
+                    half_w = max(1, (v_len - self.clip_dim) // (2 * self.clip_dim))
+                    shifts = torch.randint(-half_w, half_w + 1, (self.clip_dim - 1,)).numpy()
+                    r_mid = np.clip(r[1:-1] + shifts, 1, v_len - 1)
+                    r[1:-1] = np.maximum.accumulate(r_mid)
                 v_feat = np.zeros((self.clip_dim, v_raw.shape[1]), dtype=np.float32)
                 a_feat = np.zeros((self.clip_dim, a_raw.shape[1]), dtype=np.float32) if a_raw is not None else None
 
@@ -605,9 +614,10 @@ class XDDataset(data.Dataset):
                         if a_raw is not None:
                             a_feat[i, :] = np.mean(a_raw[r[i]:r[i + 1], :], axis=0)
                     else:
-                        v_feat[i, :] = v_raw[r[i], :]
+                        idx = max(0, min(int(r[i]), v_len - 1))
+                        v_feat[i, :] = v_raw[idx, :]
                         if a_raw is not None:
-                            a_feat[i, :] = a_raw[r[i], :]
+                            a_feat[i, :] = a_raw[idx, :]
                 clip_length = self.clip_dim
             else:
                 v_feat = tools.pad(v_raw, self.clip_dim)

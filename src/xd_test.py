@@ -235,6 +235,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     final_det_1crop_all = []
     final_det_raw_all = []
+    final_det_anchor_all = []
     final_det_smooth_all = []
     final_route_all = []
     final_sem_all = []
@@ -245,6 +246,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     for idx_v, r_v in enumerate(vid_route_list):
         d_1c = vid_det_1crop_list[idx_v]
         d_v = vid_det_raw_list[idx_v]
+        d_anchor = 0.65 * d_1c + 0.35 * d_v
         s_v = vid_sem_list[idx_v]
         rec_v = vid_rec_list[idx_v]
         a_v = vid_aux_list[idx_v]
@@ -271,6 +273,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
         final_det_1crop_all.append(d_1c)
         final_det_raw_all.append(d_v)
+        final_det_anchor_all.append(d_anchor)
         final_det_smooth_all.append(d_smooth)
         final_route_all.append(r_eval)
         final_sem_all.append(s_eval)
@@ -286,6 +289,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     pred_det_1crop = np.nan_to_num(np.repeat(np.concatenate(final_det_1crop_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_det_raw = np.nan_to_num(np.repeat(np.concatenate(final_det_raw_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
+    pred_det_anchor = np.nan_to_num(np.repeat(np.concatenate(final_det_anchor_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_det_smooth = np.nan_to_num(np.repeat(np.concatenate(final_det_smooth_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_route = np.nan_to_num(np.repeat(np.concatenate(final_route_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
     pred_sem = np.nan_to_num(np.repeat(np.concatenate(final_sem_all, axis=0), 16), nan=0.0, posinf=1.0, neginf=0.0)
@@ -295,6 +299,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     n_gt = len(gt)
     pred_det_1crop = pred_det_1crop[:n_gt] if len(pred_det_1crop) >= n_gt else np.pad(pred_det_1crop, (0, n_gt - len(pred_det_1crop)))
     pred_det_raw = pred_det_raw[:n_gt] if len(pred_det_raw) >= n_gt else np.pad(pred_det_raw, (0, n_gt - len(pred_det_raw)))
+    pred_det_anchor = pred_det_anchor[:n_gt] if len(pred_det_anchor) >= n_gt else np.pad(pred_det_anchor, (0, n_gt - len(pred_det_anchor)))
     pred_det_smooth = pred_det_smooth[:n_gt] if len(pred_det_smooth) >= n_gt else np.pad(pred_det_smooth, (0, n_gt - len(pred_det_smooth)))
     pred_route = pred_route[:n_gt] if len(pred_route) >= n_gt else np.pad(pred_route, (0, n_gt - len(pred_route)))
     pred_sem = pred_sem[:n_gt] if len(pred_sem) >= n_gt else np.pad(pred_sem, (0, n_gt - len(pred_sem)))
@@ -305,6 +310,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     ap_det_1crop = average_precision_score(gt, pred_det_1crop)
     auc_det_raw = roc_auc_score(gt, pred_det_raw)
     ap_det_raw = average_precision_score(gt, pred_det_raw)
+    auc_det_anchor = roc_auc_score(gt, pred_det_anchor)
+    ap_det_anchor = average_precision_score(gt, pred_det_anchor)
     auc_det_smooth = roc_auc_score(gt, pred_det_smooth)
     ap_det_smooth = average_precision_score(gt, pred_det_smooth)
     auc_route = roc_auc_score(gt, pred_route)
@@ -317,6 +324,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     candidates = [
         (ap_det_1crop, auc_det_1crop),
         (ap_det_raw, auc_det_raw),
+        (ap_det_anchor, auc_det_anchor),
         (ap_det_smooth, auc_det_smooth),
         (ap_route, auc_route),
         (ap_collab, auc_collab),
@@ -326,7 +334,9 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     avg_crops = float(np.mean(crop_counts)) if crop_counts else 1.0
     print(f"  [Eval 1-Crop (__0) + {avg_crops:.1f}-Crop Ensemble]", flush=True)
     print(f"    LGT-SGNM 1-Crop Center (__0) : AP = {ap_det_1crop * 100:.2f}% | AUC = {auc_det_1crop * 100:.2f}%", flush=True)
-    print(f"    LGT-SGNM {avg_crops:.0f}-Crop Spatial Ens. : AP = {ap_det_raw * 100:.2f}% | AUC = {auc_det_raw * 100:.2f}%", flush=True)
+    if avg_crops > 1.0:
+        print(f"    LGT-SGNM {avg_crops:.0f}-Crop Spatial Ens. : AP = {ap_det_raw * 100:.2f}% | AUC = {auc_det_raw * 100:.2f}%", flush=True)
+        print(f"    LGT-SGNM Center-Anchor Ens.  : AP = {ap_det_anchor * 100:.2f}% | AUC = {auc_det_anchor * 100:.2f}%", flush=True)
     print(f"    Vision-Language Semantic     : AP = {ap_sem * 100:.2f}% | AUC = {auc_sem * 100:.2f}%", flush=True)
     if has_aux_stream:
         auc_aux = roc_auc_score(gt, pred_aux)

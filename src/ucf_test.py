@@ -282,6 +282,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     print(f"    LGT-SGNM 1-Crop Center (__5): AUC = {auc_1c * 100:.2f}% | AP = {ap_1c * 100:.2f}% (Raw: AUC={auc_1c_raw * 100:.2f}%, AP={ap_1c_raw * 100:.2f}%)", flush=True)
     if avg_crops > 1.0:
         print(f"    LGT-SGNM 10-Crop Spatial Ens: AUC = {auc_mc * 100:.2f}% | AP = {ap_mc * 100:.2f}% (Raw: AUC={auc_mc_raw * 100:.2f}%, AP={ap_mc_raw * 100:.2f}%)", flush=True)
+        print(f"    LGT-SGNM Center-Anchor Ens. : AUC = {auc_anchor * 100:.2f}% | AP = {ap_anchor * 100:.2f}%", flush=True)
     print(f"    Vision-Language Semantic    : AUC = {auc_sem * 100:.2f}% | AP = {ap_sem * 100:.2f}%", flush=True)
     print(f"    MA-RUPA Best UCF-Crime SOTA : AUC = {primary_auc * 100:.2f}% | AP = {primary_ap * 100:.2f}%", flush=True)
 

@@ -701,13 +701,18 @@ class SGNM(nn.Module):
             selected_normal_features = torch.gather(
                 visual_features, 1, normal_indices.unsqueeze(-1).expand(-1, -1, D)
             )
+            selected_scores = torch.gather(anomaly_scores, 1, normal_indices)
+            reliability = (1.0 - selected_scores).clamp(min=0.05, max=1.0)
+            weighted_normal_features = selected_normal_features * (
+                0.5 + 0.5 * reliability.unsqueeze(-1)
+            ).to(selected_normal_features.dtype)
 
         agg_prototype = self.video_prototypes.unsqueeze(0).expand(B, -1, -1)
         for blk in self.dnp_extractor:
-            agg_prototype = blk(agg_prototype, selected_normal_features)
+            agg_prototype = blk(agg_prototype, weighted_normal_features)
 
         dynamic_normal_patterns = agg_prototype
-        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns)
+        g_loss = self.gather_loss(selected_normal_features, dynamic_normal_patterns, reliability)
 
         reconstructed_features = self.bottleneck(visual_features)
         for blk in self.decoder:
@@ -792,8 +797,9 @@ class MARUPA(nn.Module):
         self.gelu = QuickGELU()
         self.frame_position_embeddings = nn.Embedding(visual_length, visual_width)
 
-        mlp_dropout = float(getattr(args, 'mlp_dropout', 0.1))
+        mlp_dropout = float(getattr(args, 'mlp_dropout', 0.15))
         self.mlp_dropout = mlp_dropout
+        self.feat_dropout = float(getattr(args, 'feat_dropout', 0.15))
         self.mst_adapter = (
             MSTSensitivityAdapter(embed_dim=visual_width, dilations=(1, 2, 4), dropout=mlp_dropout)
             if self.use_mdtp else None
@@ -873,10 +879,6 @@ class MARUPA(nn.Module):
             QuickGELU(),
             nn.Linear(routing_gate_hidden, 1),
         )
-
-        # Semantic-to-backbone gradient scale: 1.0 during warm-up, decays to 0.0 after warm-up
-        # so multi-class scene memorization never corrupts binary anomaly detection in Epochs 2-10
-        self.sem_grad_scale = float(getattr(args, 'sem_grad_scale', 1.0))
 
         self._eval_text_cache = None
         self.initialize_parameters()
@@ -959,6 +961,12 @@ class MARUPA(nn.Module):
 
         if padding_mask is None and lengths is not None:
             padding_mask = torch.arange(T, device=dev)[None, :] >= lengths.to(dev)[:, None]
+        valid_mask = (~padding_mask).unsqueeze(-1).to(images.dtype) if padding_mask is not None else None
+
+        if valid_mask is not None:
+            images = images * valid_mask
+        if self.training and self.feat_dropout > 0.0:
+            images = F.dropout(images, p=self.feat_dropout, training=True)
 
         if T <= self.visual_length:
             pos_ids = torch.arange(T, device=dev).unsqueeze(0).expand(B, -1)
@@ -967,6 +975,9 @@ class MARUPA(nn.Module):
             base_pos = self.frame_position_embeddings.weight.unsqueeze(0).permute(0, 2, 1)
             pos_emb = F.interpolate(base_pos, size=T, mode='linear', align_corners=False).permute(0, 2, 1).expand(B, -1, -1)
 
+        if valid_mask is not None:
+            pos_emb = pos_emb * valid_mask
+
         attn_mask = (
             self.base_attn_mask
             if T == self.visual_length
@@ -974,20 +985,28 @@ class MARUPA(nn.Module):
         )
 
         x = (images + pos_emb).permute(1, 0, 2)  # [T, B, D]
-        x = self.temporal(x, attn_mask=attn_mask, padding_mask=None)
+        x = self.temporal(x, attn_mask=attn_mask, padding_mask=padding_mask)
         x = x.permute(1, 0, 2)  # [B, T, D]
+        if valid_mask is not None:
+            x = x * valid_mask
 
         adj = self.adj4(x, lengths)
         disadj = self.disAdj(B, T, device=dev, dtype=x.dtype)
+        if padding_mask is not None:
+            disadj = disadj.masked_fill(padding_mask.to(dtype=torch.bool, device=dev).unsqueeze(1), 0.0)
         x1_h = self.gelu(self.gc1(x, adj))
         x2_h = self.gelu(self.gc3(x, disadj))
+        if valid_mask is not None:
+            x1_h = x1_h * valid_mask
+            x2_h = x2_h * valid_mask
         x1 = self.gelu(self.gc2(x1_h, adj))
         x2 = self.gelu(self.gc4(x2_h, disadj))
 
         x = self.linear(torch.cat((x1, x2), dim=-1))
+        if valid_mask is not None:
+            x = x * valid_mask
 
         if self.mst_adapter is not None:
-            valid_mask = (~padding_mask).unsqueeze(-1).to(x.dtype) if padding_mask is not None else None
             x = self.mst_adapter(x, valid_mask=valid_mask)
 
         return x
@@ -1037,8 +1056,8 @@ class MARUPA(nn.Module):
             )
             logits_aux_sem = self.audio_adapter.last_logits_aux_sem
 
-        # 4. Sensitivity Anomaly Detector Head & SGNM Dynamic Normal Pattern Refiner
-        logits1 = self.classifier(visual_features + self._apply_mlp(self.mlp2, visual_features))  # [B, T, 1]
+        # 4. Sensitivity Anomaly Detector Head & Counterfactual SGNM Residual Refinement
+        logits1_init = self.classifier(visual_features + self._apply_mlp(self.mlp2, visual_features))  # [B, T, 1]
 
         reconstructed_features = None
         dynamic_normal_patterns = None
@@ -1048,61 +1067,52 @@ class MARUPA(nn.Module):
 
         if DNP_use and not self.no_rupa:
             reconstructed_features, dynamic_normal_patterns, g_loss = self.video_anomaly_refiner(
-                visual_features, logits1, lengths_dev
+                visual_features, logits1_init, lengths_dev
             )
-            residual_features = visual_features - reconstructed_features
+            residual_features = (visual_features - reconstructed_features) * valid_mask
+            cf_residual = (visual_features - reconstructed_features.detach()) * valid_mask
+            res_delta = self.res_adapter(cf_residual) * valid_mask
+            enh_visual_features = (visual_features + 0.5 * torch.tanh(self.beta_res) * res_delta) * valid_mask
+            logits1 = self.classifier(enh_visual_features + self._apply_mlp(self.mlp2, enh_visual_features))
             reconstruction_score = (
-                (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
-            ).clamp(0.0, 1.0)
+                compute_normalized_recon_error(visual_features, reconstructed_features, lengths_dev)
+                .unsqueeze(-1)
+                .to(visual_features.dtype)
+            )
+        else:
+            enh_visual_features = visual_features
+            logits1 = logits1_init
 
         detector_score = torch.sigmoid(logits1)
 
-        # 5. Gradient-Controlled Video-Conditioned Fine-Grained Text-Visual Alignment (logits2)
-        #    - During Warm-up (`sem_grad_scale = 1.0`), full CLIP semantic gradients bootstrap `encode_video`
-        #      and `logits1` (matching the 84.30% Ep1 XD & 89.17% UCF trajectory).
-        #    - Post-Warm-up (`sem_grad_scale -> 0.20`), semantic gradients into `encode_video` and `logits1`
-        #      are damped by 80% so multi-class scene memorization never drags down binary VAD in Epochs 2-10.
-        sg = float(getattr(self, 'sem_grad_scale', 1.0)) if self.training else 1.0
-        if sg <= 0.0:
-            sem_vis = visual_features.detach()
-            logits1_for_sem = logits1.detach()
-            det_for_pool = detector_score.detach()
-        elif sg >= 1.0:
-            sem_vis = visual_features
-            logits1_for_sem = logits1
-            det_for_pool = detector_score
-        else:
-            sem_vis = sg * visual_features + (1.0 - sg) * visual_features.detach()
-            logits1_for_sem = sg * logits1 + (1.0 - sg) * logits1.detach()
-            det_for_pool = sg * detector_score + (1.0 - sg) * detector_score.detach()
-
-        logits_attn = logits1_for_sem.permute(0, 2, 1)  # [B, 1, T]
-        visual_attn = F.normalize(torch.bmm(logits_attn, sem_vis), dim=-1)          # [B, 1, D]
-        visual_attn_exp = visual_attn.expand(B, text_features_ori.shape[0], -1)     # [B, C, D]
+        # 5. Video-Conditioned Fine-Grained Text-Visual Alignment (logits2)
+        logits_attn = (logits1 * valid_mask).permute(0, 2, 1)  # [B, 1, T]
+        visual_attn = F.normalize(torch.bmm(logits_attn, enh_visual_features), dim=-1, eps=1e-6)  # [B, 1, D]
+        visual_attn_exp = visual_attn.expand(B, text_features_ori.shape[0], -1)                   # [B, C, D]
 
         text_features = text_features_ori.unsqueeze(0).expand(B, -1, -1) + visual_attn_exp
         text_features = text_features + self._apply_mlp(self.mlp1, text_features)
 
-        visual_features_norm = F.normalize(sem_vis, dim=-1)
-        text_features_norm = F.normalize(text_features, dim=-1).permute(0, 2, 1)
+        visual_features_norm = F.normalize(enh_visual_features, dim=-1, eps=1e-6)
+        text_features_norm = F.normalize(text_features, dim=-1, eps=1e-6).permute(0, 2, 1)
         logits2 = torch.bmm(visual_features_norm, text_features_norm.to(visual_features_norm.dtype)) / 0.07  # [B, T, C]
 
         # 6. Numerically Guarded Video-Level Event & Background Pooling (logits3, logits4)
         #    Clamping `det_pool` in [1e-3, 1 - 1e-3] + 1e-3 floor guarantees `||abn_logits||_1 >= 1e-2`,
         #    completely eliminating F.normalize backward explosion (~10^20) and `clip_grad_norm_` Inf freeze.
-        det_pool = det_for_pool.clamp(1e-3, 1.0 - 1e-3)
+        det_pool = detector_score.clamp(1e-3, 1.0 - 1e-3)
         abn_logits = (((scale * det_pool).exp() - 1.0) + 1e-3) * valid_mask
         abn_weights = F.normalize(abn_logits, p=1, dim=1)
 
         nor_logits = (((scale * (1.0 - det_pool)).exp() - 1.0) + 1e-3) * valid_mask
         nor_weights = F.normalize(nor_logits, p=1, dim=1)
 
-        abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), sem_vis)  # [B, 1, D]
-        nor_feat = torch.bmm(nor_weights.permute(0, 2, 1), sem_vis)  # [B, 1, D]
+        abn_feat = torch.bmm(abn_weights.permute(0, 2, 1), enh_visual_features)  # [B, 1, D]
+        nor_feat = torch.bmm(nor_weights.permute(0, 2, 1), visual_features)      # [B, 1, D]
 
-        nor_text_norm = F.normalize(text_features_ori, dim=-1).t().unsqueeze(0).expand(B, -1, -1)  # [B, D, C]
-        abn_vis_norm = F.normalize(abn_feat, dim=-1)
-        nor_vis_norm = F.normalize(nor_feat, dim=-1)
+        nor_text_norm = F.normalize(text_features_ori, dim=-1, eps=1e-6).t().unsqueeze(0).expand(B, -1, -1)  # [B, D, C]
+        abn_vis_norm = F.normalize(abn_feat, dim=-1, eps=1e-6)
+        nor_vis_norm = F.normalize(nor_feat, dim=-1, eps=1e-6)
 
         logits3 = torch.bmm(abn_vis_norm, nor_text_norm.to(abn_vis_norm.dtype)) / 0.07  # [B, 1, C]
         logits4 = torch.bmm(nor_vis_norm, nor_text_norm.to(nor_vis_norm.dtype)) / 0.07  # [B, 1, C]

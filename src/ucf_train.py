@@ -14,7 +14,7 @@ from utils.dataset import UCFDataset
 from utils.tools import get_prompt_text, get_batch_label, safe_load_checkpoint
 from utils.StableAdamW import StableAdamW
 from utils.losses import (
-    CLAS2, CLASM, RUPA_RESIDUAL_EVENT, CLASM_BKG,
+    CLAS2, CLASM, CLASM_EVENT, CLASM_BKG,
     text_orthogonality_loss, ConsistencyLoss, routing_anchor_loss,
     edge_preserving_smoothness_loss, iam_intention_loss, acc_pseudo_label_loss,
     WarmCosineScheduler, ModelEMA,
@@ -136,30 +136,36 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
     refiner_params = []
-    main_model_params = []
+    main_decay_params = []
+    main_nodecay_params = []
     for name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
         if 'video_anomaly_refiner' in name or 'rupa_gate' in name:
             refiner_params.append(param)
+        elif param.ndim >= 2:
+            main_decay_params.append(param)
         else:
-            main_model_params.append(param)
+            main_nodecay_params.append(param)
 
     main_lr = args.lr if args.main_lr is None else args.main_lr
     refiner_lr = args.lr if args.refiner_lr is None else args.refiner_lr
 
     num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
     total_iters = max(1, args.max_epoch * num_batches_per_epoch)
-    total_iters_refiner = max(1, args.max_epoch * num_batches_per_epoch)
+    warmup_iters = min(60, max(10, total_iters // 15)) if total_iters > 10 else 0
 
-    optimizer_main = torch.optim.AdamW(
-        [{'params': main_model_params}],
-        lr=main_lr,
-        weight_decay=args.weight_decay,
-    )
-    scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(
+    main_param_groups = [{'params': main_decay_params, 'lr': main_lr, 'weight_decay': args.weight_decay}]
+    if main_nodecay_params:
+        main_param_groups.append({'params': main_nodecay_params, 'lr': main_lr, 'weight_decay': 0.0})
+
+    optimizer_main = torch.optim.AdamW(main_param_groups, lr=main_lr)
+    scheduler_main = WarmCosineScheduler(
         optimizer_main,
-        T_max=max(1, args.max_epoch),
+        base_value=main_lr,
+        final_value=main_lr * 0.05,
+        total_iters=total_iters,
+        warmup_iters=warmup_iters,
     )
 
     optimizer_refiner = StableAdamW(
@@ -173,28 +179,25 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     scheduler_refiner = WarmCosineScheduler(
         optimizer_refiner,
         base_value=refiner_lr,
-        final_value=refiner_lr * 0.10,
-        total_iters=total_iters_refiner,
-        warmup_iters=min(100, max(0, total_iters_refiner // 10)),
+        final_value=refiner_lr * 0.05,
+        total_iters=total_iters,
+        warmup_iters=warmup_iters,
     )
 
+    ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
     consistency_loss_fn = ConsistencyLoss()
     prompt_text = get_prompt_text(label_map)
-    use_rollback = bool(getattr(args, 'use_rollback', True))
-    sem_warmup_epochs = float(getattr(args, 'sem_warmup_epochs', 2.0))
-    sem_warmup_steps = max(0, int(round(sem_warmup_epochs * num_batches_per_epoch)))
 
     auc_best = -1.0
-    best_live_state = None
+    ap_best = -1.0
     start_epoch = 0
 
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         saved_ep = checkpoint.get('epoch', -1) + 1
-        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v8_decoupled') or (args.max_epoch <= 3)
+        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v9_anti_overfit') or (args.max_epoch <= 3)
         if 0 < saved_ep < args.max_epoch and is_compatible_ckpt:
             load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
-            best_live_state = unwrap_compact_state_dict(model)
             try:
                 if 'optimizer_state_dict' in checkpoint:
                     optimizer_main.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -204,31 +207,37 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                     scheduler_main.load_state_dict(checkpoint['scheduler_main_state_dict'])
                 if 'scheduler_refiner_state_dict' in checkpoint:
                     scheduler_refiner.load_state_dict(checkpoint['scheduler_refiner_state_dict'])
+                if ema is not None and 'ema_state_dict' in checkpoint:
+                    ema.load_state_dict(checkpoint['ema_state_dict'])
             except Exception:
                 pass
             start_epoch = saved_ep
-            auc_best = checkpoint.get('auc', checkpoint.get('ap', auc_best))
-            print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AUC={auc_best * 100:.2f}%", flush=True)
+            auc_best = checkpoint.get('auc', auc_best)
+            ap_best = checkpoint.get('ap', ap_best)
+            print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AUC={auc_best * 100:.2f}% | AP={ap_best * 100:.2f}%", flush=True)
         elif 0 < saved_ep < args.max_epoch:
-            print(f"[Checkpoint] Ignoring legacy pre-v8 checkpoint (epoch {saved_ep}) -> Starting fresh v8 Gradient-Decoupled run!", flush=True)
-
-    ema = ModelEMA(model, decay=args.ema_decay) if getattr(args, 'use_ema', True) else None
+            print(f"[Checkpoint] Ignoring legacy pre-v9 checkpoint (epoch {saved_ep}) -> Starting fresh v9 Anti-Overfitting run!", flush=True)
 
     eff_batch = normal_loader.batch_size * 2
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
+    norm_ds = normal_loader.dataset
+    crop_tag = (
+        f"Stratified {norm_ds.crops_per_video}-of-10 Random Spatial Crops + Temporal Jitter"
+        if getattr(norm_ds, 'sample_one_crop_per_video', False)
+        else "All 10 Crops"
+    )
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v8 (GRADIENT-DECOUPLED LGT-SGNM) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
-    print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved)", flush=True)
-    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} gradient steps | Cosine LR = {main_lr:.1e}, WD = {args.weight_decay:.1e}", flush=True)
-    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} (SemWarmup={sem_warmup_epochs:.1f}ep) | Orth={args.loss_sep_weight} | Ev={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
-    print(f"  Mode       : {'Epoch-End Best-State Anchor (No LR Damping)' if use_rollback else 'No Rollback'} | Dual 1-Crop (__5) + 10-Crop Eval (sigma={args.smooth_sigma})", flush=True)
+    print(f"[START] MA-RUPA v9 (ANTI-OVERFITTING LGT-SGNM) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved) | {crop_tag}", flush=True)
+    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps (Warmup={warmup_iters}) | LR = {main_lr:.1e}->3.5e-6, WD = {args.weight_decay:.1e}", flush=True)
+    print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Event={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
+    print(f"  Regularize : FeatDrop={getattr(args, 'feat_dropout', 0.15):.2f} | MLPDrop={args.mlp_dropout:.2f} | WarmupEMA={args.ema_decay} | Zero Rollback | 10-Crop Eval (sigma={args.smooth_sigma})", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
         model.train()
         DNP_use = args.DNP_use and (not args.no_rupa)
-        epoch_improved = False
 
         sum_l1 = sum_l2 = sum_l3 = sum_l4 = sum_l5 = sum_cons = sum_g = 0.0
         epoch_t0 = time.time()
@@ -237,14 +246,6 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         anomaly_iter = iter(anomaly_loader)
 
         for i in range(num_batches_per_epoch):
-            global_step = e * num_batches_per_epoch + i
-            if sem_warmup_steps <= 0:
-                raw_model.sem_grad_scale = 1.0
-            elif global_step >= sem_warmup_steps:
-                raw_model.sem_grad_scale = 0.35
-            else:
-                raw_model.sem_grad_scale = 0.35 + 0.65 * 0.5 * (1.0 + math.cos(math.pi * float(global_step) / float(sem_warmup_steps)))
-
             norm_feat, norm_lbl, norm_len = next(normal_iter)
             abn_feat, abn_lbl, abn_len = next(anomaly_iter)
 
@@ -260,7 +261,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             loss1 = CLAS2(logits1, text_labels, feat_lengths, device)
             loss2 = CLASM(logits2, text_labels, feat_lengths, device) if args.loss2_weight > 0 else logits1.sum() * 0.0
             loss3 = text_orthogonality_loss(text_features, num_classes=args.classes_num) if args.loss_sep_weight > 0 else logits1.sum() * 0.0
-            loss4 = RUPA_RESIDUAL_EVENT(logits3, text_labels, feat_lengths, device) if args.loss_residual_weight > 0 else logits1.sum() * 0.0
+            loss4 = CLASM_EVENT(logits3, text_labels, feat_lengths, device) if args.loss_residual_weight > 0 else logits1.sum() * 0.0
             loss5 = CLASM_BKG(logits4, text_labels, feat_lengths, device) if args.loss_reconstructed_normal_weight > 0 else logits1.sum() * 0.0
 
             iam_protos = raw_model.iam_module.intention_prototypes if getattr(raw_model, 'iam_module', None) is not None else None
@@ -334,6 +335,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
             optimizer_main.step()
             optimizer_refiner.step()
+            scheduler_main.step()
             scheduler_refiner.step()
 
             if ema is not None:
@@ -352,77 +354,70 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
                 elapsed = max(1e-3, time.time() - epoch_t0)
                 it_s = iter_num / elapsed
                 eta_s = (num_batches_per_epoch - iter_num) / max(it_s, 1e-4)
+                cur_lr = optimizer_main.param_groups[0]['lr']
                 print(
                     f"Epoch [{e+1}/{args.max_epoch}] Iter [{iter_num:03d}/{num_batches_per_epoch:03d}] | "
                     f"MIL:{sum_l1/iter_num:.4f} CLASM:{sum_l2/iter_num:.4f} Orth:{sum_l3/iter_num:.4f} "
-                    f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} SemG:{raw_model.sem_grad_scale:.2f} | "
+                    f"Ev:{sum_l4/iter_num:.4f} Bkg:{sum_l5/iter_num:.4f} Cons:{sum_cons/iter_num:.4f} G:{sum_g/iter_num:.4f} LR:{cur_lr:.2e} | "
                     f"{it_s:.2f} it/s ETA:{eta_s:.0f}s",
                     flush=True,
                 )
 
             if args.eval_interval > 0 and iter_num % args.eval_interval == 0 and iter_num < num_batches_per_epoch:
-                auc_cur, _ = test(
+                auc_cur, ap_cur = test(
                     model, testloader, args.visual_length, prompt_text,
                     gt, gtsegments, gtlabels, DNP_use, device, args, compute_dmap=False,
                 )
-                if auc_cur > auc_best:
+                if auc_cur > auc_best or (abs(auc_cur - auc_best) < 1e-5 and ap_cur > ap_best):
                     auc_best = auc_cur
-                    epoch_improved = True
-                    best_live_state = unwrap_compact_state_dict(model)
-                    torch.save(best_live_state, args.model_path)
-                    print(f"  [*] [NEW BEST UCF-CRIME] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
+                    ap_best = ap_cur
+                    torch.save(unwrap_compact_state_dict(model), args.model_path)
+                    print(f"  [*] [NEW BEST UCF-CRIME] AUC = {auc_best * 100:.2f}% | AP = {ap_best * 100:.2f}% saved -> {args.model_path}", flush=True)
                 model.train()
 
-        scheduler_main.step()
-
         print(f"\n--- Epoch {e+1}/{args.max_epoch} Complete | Evaluating Live Weights ---", flush=True)
-        auc_live, _ = test(
+        auc_live, ap_live = test(
             model, testloader, args.visual_length, prompt_text,
             gt, gtsegments, gtlabels, DNP_use, device, args, compute_dmap=(e == args.max_epoch - 1),
         )
         live_state = unwrap_compact_state_dict(model)
-        if auc_live > auc_best:
+        if auc_live > auc_best or (abs(auc_live - auc_best) < 1e-5 and ap_live > ap_best):
             auc_best = auc_live
-            epoch_improved = True
-            best_live_state = live_state
-            torch.save(best_live_state, args.model_path)
-            print(f"  [*] [NEW BEST UCF-CRIME (Live)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
+            ap_best = ap_live
+            torch.save(live_state, args.model_path)
+            print(f"  [*] [NEW BEST UCF-CRIME (Live)] AUC = {auc_best * 100:.2f}% | AP = {ap_best * 100:.2f}% saved -> {args.model_path}", flush=True)
 
-        torch.save({
+        if ema is not None:
+            backup = ema.apply_to(model)
+            print(f"--- Epoch {e+1}/{args.max_epoch} | Evaluating Polyak-EMA Weights ---", flush=True)
+            auc_ema, ap_ema = test(
+                model, testloader, args.visual_length, prompt_text,
+                gt, gtsegments, gtlabels, DNP_use, device, args, compute_dmap=(e == args.max_epoch - 1),
+            )
+            if auc_ema > auc_best or (abs(auc_ema - auc_best) < 1e-5 and ap_ema > ap_best):
+                auc_best = auc_ema
+                ap_best = ap_ema
+                torch.save(unwrap_compact_state_dict(model), args.model_path)
+                print(f"  [*] [NEW BEST UCF-CRIME (EMA)] AUC = {auc_best * 100:.2f}% | AP = {ap_best * 100:.2f}% saved -> {args.model_path}", flush=True)
+            ema.restore(model, backup)
+
+        ckpt_payload = {
             'epoch': e,
-            'arch_version': 'marupa_v8_decoupled',
-            'model_state_dict': (best_live_state if (use_rollback and best_live_state is not None) else live_state),
+            'arch_version': 'marupa_v9_anti_overfit',
+            'model_state_dict': live_state,
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
             'scheduler_main_state_dict': scheduler_main.state_dict(),
             'scheduler_refiner_state_dict': scheduler_refiner.state_dict(),
             'auc': auc_best,
-            'ap': auc_best,
-        }, args.checkpoint_path)
-
-        if ema is not None and e >= 1:
-            backup = ema.apply_to(model)
-            print(f"--- Epoch {e+1}/{args.max_epoch} | Evaluating Polyak-EMA Weights ---", flush=True)
-            auc_ema, _ = test(
-                model, testloader, args.visual_length, prompt_text,
-                gt, gtsegments, gtlabels, DNP_use, device, args, compute_dmap=(e == args.max_epoch - 1),
-            )
-            if auc_ema > auc_best:
-                auc_best = auc_ema
-                epoch_improved = True
-                ema_state = unwrap_compact_state_dict(model)
-                torch.save(ema_state, args.model_path)
-                print(f"  [*] [NEW BEST UCF-CRIME (EMA)] AUC = {auc_best * 100:.2f}% saved -> {args.model_path}", flush=True)
-            ema.restore(model, backup)
-
-        if use_rollback and best_live_state is not None:
-            load_compatible_model_state(model, best_live_state, allow_legacy_dsanet=True)
-            if not epoch_improved:
-                cur_lr = optimizer_main.param_groups[0]['lr']
-                print(f"  [Best-State Anchor] Restored best checkpoint (AUC={auc_best*100:.2f}%) | Cosine LR -> {cur_lr:.2e}", flush=True)
+            'ap': ap_best,
+        }
+        if ema is not None:
+            ckpt_payload['ema_state_dict'] = ema.state_dict()
+        torch.save(ckpt_payload, args.checkpoint_path)
         print("", flush=True)
 
-    print(f"[FINISH] UCF-Crime Training Complete! Best ROC-AUC: {auc_best * 100:.2f}%", flush=True)
+    print(f"[FINISH] UCF-Crime Training Complete! Best ROC-AUC: {auc_best * 100:.2f}% | Best AP: {ap_best * 100:.2f}%", flush=True)
     return auc_best
 
 
@@ -434,11 +429,11 @@ if __name__ == '__main__':
 
     try:
         commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-        print(f"[MA-RUPA v4+ Argon-4] Git Commit: {commit_hash}", flush=True)
+        print(f"[MA-RUPA v9 Anti-Overfit] Git Commit: {commit_hash}", flush=True)
     except Exception:
         pass
 
-    print(f"[MA-RUPA v4+ Argon-4] Training UCF-Crime on device: {device}", flush=True)
+    print(f"[MA-RUPA v9 Anti-Overfit] Training UCF-Crime on device: {device}", flush=True)
     setup_seed(args.seed)
     model, normal_loader, anomaly_loader, test_loader, label_map = build_ucf_components(args, device)
     train(model, normal_loader, anomaly_loader, test_loader, args, label_map, device)

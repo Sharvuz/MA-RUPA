@@ -56,15 +56,15 @@ def get_batch_mask(lengths, maxlen):
     return mask.bool()
 
 def random_extract(feat, t_max):
-   r = np.random.randint(feat.shape[0] - t_max)
-   return feat[r : r+t_max, :]
+    r = int(torch.randint(0, max(1, feat.shape[0] - t_max), (1,)).item())
+    return feat[r : r + t_max, :]
 
 def uniform_extract(feat, t_max, avg: bool = True, jitter: bool = False):
     new_feat = np.zeros((t_max, feat.shape[1])).astype(np.float32)
     r = np.linspace(0, len(feat), t_max+1, dtype=np.int32)
     if jitter and len(feat) > t_max and t_max > 2:
         half_w = max(1, (len(feat) - t_max) // (2 * t_max))
-        shifts = np.random.randint(-half_w, half_w + 1, size=t_max - 1)
+        shifts = torch.randint(-half_w, half_w + 1, (t_max - 1,)).numpy()
         r_mid = np.clip(r[1:-1] + shifts, 1, len(feat) - 1)
         r[1:-1] = np.maximum.accumulate(r_mid)
     if avg == True:
