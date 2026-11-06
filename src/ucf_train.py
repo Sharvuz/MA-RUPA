@@ -153,7 +153,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
     num_batches_per_epoch = min(len(normal_loader), len(anomaly_loader))
     total_iters = max(1, args.max_epoch * num_batches_per_epoch)
-    warmup_iters = min(60, max(10, total_iters // 15)) if total_iters > 10 else 0
+    warmup_iters = min(100, max(10, total_iters // 10)) if total_iters > 10 else 0
 
     main_param_groups = [{'params': main_decay_params, 'lr': main_lr, 'weight_decay': args.weight_decay}]
     if main_nodecay_params:
@@ -195,7 +195,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         saved_ep = checkpoint.get('epoch', -1) + 1
-        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v9_anti_overfit') or (args.max_epoch <= 3)
+        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v10_sota') or (args.max_epoch <= 3)
         if 0 < saved_ep < args.max_epoch and is_compatible_ckpt:
             load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
             try:
@@ -216,23 +216,23 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             ap_best = checkpoint.get('ap', ap_best)
             print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AUC={auc_best * 100:.2f}% | AP={ap_best * 100:.2f}%", flush=True)
         elif 0 < saved_ep < args.max_epoch:
-            print(f"[Checkpoint] Ignoring legacy pre-v9 checkpoint (epoch {saved_ep}) -> Starting fresh v9 Anti-Overfitting run!", flush=True)
+            print(f"[Checkpoint] Ignoring legacy pre-v10 checkpoint (epoch {saved_ep}) -> Starting fresh v10 Confidence-Margin SOTA run!", flush=True)
 
     eff_batch = normal_loader.batch_size * 2
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
     norm_ds = normal_loader.dataset
     crop_tag = (
-        f"Stratified {norm_ds.crops_per_video}-of-10 Random Spatial Crops + Temporal Jitter"
+        f"Stratified {norm_ds.crops_per_video}-of-10 Random Spatial Crops"
         if getattr(norm_ds, 'sample_one_crop_per_video', False)
-        else "All 10 Crops"
+        else "All 10 Spatial Crops"
     )
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v9 (ANTI-OVERFITTING LGT-SGNM) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v10 (CONFIDENCE-MARGIN LGT-SGNM) SOTA ON UCF-CRIME ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {eff_batch} ({normal_loader.batch_size} Normal + {anomaly_loader.batch_size} Abnormal interleaved) | {crop_tag}", flush=True)
-    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps (Warmup={warmup_iters}) | LR = {main_lr:.1e}->3.5e-6, WD = {args.weight_decay:.1e}", flush=True)
+    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps (Warmup={warmup_iters}) | LR = {main_lr:.1e}->{main_lr*0.05:.1e}, WD = {args.weight_decay:.1e}", flush=True)
     print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Event={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
-    print(f"  Regularize : FeatDrop={getattr(args, 'feat_dropout', 0.15):.2f} | MLPDrop={args.mlp_dropout:.2f} | WarmupEMA={args.ema_decay} | Zero Rollback | 10-Crop Eval (sigma={args.smooth_sigma})", flush=True)
+    print(f"  Regularize : Per-Bag Confidence Margin | MLPDrop={args.mlp_dropout:.2f} | WarmupEMA={args.ema_decay} | Zero Rollback | 10-Crop Eval (sigma={args.smooth_sigma})", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
@@ -403,7 +403,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
         ckpt_payload = {
             'epoch': e,
-            'arch_version': 'marupa_v9_anti_overfit',
+            'arch_version': 'marupa_v10_sota',
             'model_state_dict': live_state,
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),
@@ -429,11 +429,11 @@ if __name__ == '__main__':
 
     try:
         commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-        print(f"[MA-RUPA v9 Anti-Overfit] Git Commit: {commit_hash}", flush=True)
+        print(f"[MA-RUPA v10 SOTA] Git Commit: {commit_hash}", flush=True)
     except Exception:
         pass
 
-    print(f"[MA-RUPA v9 Anti-Overfit] Training UCF-Crime on device: {device}", flush=True)
+    print(f"[MA-RUPA v10 SOTA] Training UCF-Crime on device: {device}", flush=True)
     setup_seed(args.seed)
     model, normal_loader, anomaly_loader, test_loader, label_map = build_ucf_components(args, device)
     train(model, normal_loader, anomaly_loader, test_loader, args, label_map, device)

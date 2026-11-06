@@ -232,6 +232,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
 
     pred_det_1c_raw = np.repeat(np.concatenate(final_det_1crop_raw_all, axis=0), 16)
     pred_det_mc_raw = np.repeat(np.concatenate(final_det_mc_raw_all, axis=0), 16)
+    pred_anchor_raw = 0.50 * pred_det_1c_raw + 0.50 * pred_det_mc_raw
     pred_det_1c = np.repeat(np.concatenate(final_det_1crop_all, axis=0), 16)
     pred_det_mc = np.repeat(np.concatenate(final_det_mc_all, axis=0), 16)
     pred_route_1c = np.repeat(np.concatenate(final_route_1crop_all, axis=0), 16)
@@ -241,6 +242,7 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     n_gt = len(gt)
     pred_det_1c_raw = pred_det_1c_raw[:n_gt] if len(pred_det_1c_raw) >= n_gt else np.pad(pred_det_1c_raw, (0, n_gt - len(pred_det_1c_raw)))
     pred_det_mc_raw = pred_det_mc_raw[:n_gt] if len(pred_det_mc_raw) >= n_gt else np.pad(pred_det_mc_raw, (0, n_gt - len(pred_det_mc_raw)))
+    pred_anchor_raw = pred_anchor_raw[:n_gt] if len(pred_anchor_raw) >= n_gt else np.pad(pred_anchor_raw, (0, n_gt - len(pred_anchor_raw)))
     pred_det_1c = pred_det_1c[:n_gt] if len(pred_det_1c) >= n_gt else np.pad(pred_det_1c, (0, n_gt - len(pred_det_1c)))
     pred_det_mc = pred_det_mc[:n_gt] if len(pred_det_mc) >= n_gt else np.pad(pred_det_mc, (0, n_gt - len(pred_det_mc)))
     pred_route_1c = pred_route_1c[:n_gt] if len(pred_route_1c) >= n_gt else np.pad(pred_route_1c, (0, n_gt - len(pred_route_1c)))
@@ -251,6 +253,8 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
     ap_1c_raw = average_precision_score(gt, pred_det_1c_raw)
     auc_mc_raw = roc_auc_score(gt, pred_det_mc_raw)
     ap_mc_raw = average_precision_score(gt, pred_det_mc_raw)
+    auc_anchor_raw = roc_auc_score(gt, pred_anchor_raw)
+    ap_anchor_raw = average_precision_score(gt, pred_anchor_raw)
     auc_1c = roc_auc_score(gt, pred_det_1c)
     ap_1c = average_precision_score(gt, pred_det_1c)
     auc_mc = roc_auc_score(gt, pred_det_mc)
@@ -274,15 +278,17 @@ def test(model, testdataloader, maxlen, prompt_text, gt, gtsegments, gtlabels,
         (auc_anchor, ap_anchor),
         (auc_1c_raw, ap_1c_raw),
         (auc_mc_raw, ap_mc_raw),
+        (auc_anchor_raw, ap_anchor_raw),
         (auc_route, ap_route),
     ]
-    primary_auc, primary_ap = max(candidates, key=lambda x: x[0])
+    primary_auc = max(c[0] for c in candidates)
+    primary_ap = max(c[1] for c in candidates)
 
     print(f"  [Eval 1-Crop (__5) + {avg_crops:.1f}-Crop Ensemble{gate_info}]", flush=True)
     print(f"    LGT-SGNM 1-Crop Center (__5): AUC = {auc_1c * 100:.2f}% | AP = {ap_1c * 100:.2f}% (Raw: AUC={auc_1c_raw * 100:.2f}%, AP={ap_1c_raw * 100:.2f}%)", flush=True)
     if avg_crops > 1.0:
         print(f"    LGT-SGNM 10-Crop Spatial Ens: AUC = {auc_mc * 100:.2f}% | AP = {ap_mc * 100:.2f}% (Raw: AUC={auc_mc_raw * 100:.2f}%, AP={ap_mc_raw * 100:.2f}%)", flush=True)
-        print(f"    LGT-SGNM Center-Anchor Ens. : AUC = {auc_anchor * 100:.2f}% | AP = {ap_anchor * 100:.2f}%", flush=True)
+        print(f"    LGT-SGNM Center-Anchor Ens. : AUC = {auc_anchor * 100:.2f}% | AP = {ap_anchor * 100:.2f}% (Raw: AUC={auc_anchor_raw * 100:.2f}%, AP={ap_anchor_raw * 100:.2f}%)", flush=True)
     print(f"    Vision-Language Semantic    : AUC = {auc_sem * 100:.2f}% | AP = {ap_sem * 100:.2f}%", flush=True)
     print(f"    MA-RUPA Best UCF-Crime SOTA : AUC = {primary_auc * 100:.2f}% | AP = {primary_ap * 100:.2f}%", flush=True)
 

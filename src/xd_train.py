@@ -180,10 +180,10 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
         device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
             commit_hash = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], stderr=subprocess.DEVNULL).decode().strip()
-            print(f"[MA-RUPA v9 Anti-Overfit] Git Commit: {commit_hash}", flush=True)
+            print(f"[MA-RUPA v10 SOTA] Git Commit: {commit_hash}", flush=True)
         except Exception:
             pass
-        print(f"[MA-RUPA v9 Anti-Overfit] Training XD-Violence on device: {device}", flush=True)
+        print(f"[MA-RUPA v10 SOTA] Training XD-Violence on device: {device}", flush=True)
         setup_seed(args.seed)
         model, normal_loader, anomaly_loader, testloader, label_map = build_xd_components(args, device)
     else:
@@ -288,7 +288,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
     if args.use_checkpoint and os.path.exists(args.checkpoint_path):
         checkpoint = safe_load_checkpoint(args.checkpoint_path, map_location=device)
         saved_ep = checkpoint.get('epoch', -1) + 1
-        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v9_anti_overfit') or (args.max_epoch <= 3)
+        is_compatible_ckpt = (checkpoint.get('arch_version') == 'marupa_v10_sota') or (args.max_epoch <= 3)
         if 0 < saved_ep < args.max_epoch and is_compatible_ckpt:
             load_compatible_model_state(model, checkpoint['model_state_dict'], allow_legacy_dsanet=True)
             try:
@@ -309,17 +309,17 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
             auc_best = checkpoint.get('best_auc', checkpoint.get('auc', auc_best))
             print(f"[Resume] Resumed from epoch {start_epoch + 1}/{args.max_epoch}, best AP={ap_best * 100:.2f}% | AUC={auc_best * 100:.2f}%", flush=True)
         elif 0 < saved_ep < args.max_epoch:
-            print(f"[Checkpoint] Ignoring legacy pre-v9 checkpoint (epoch {saved_ep}) -> Starting fresh v9 Anti-Overfitting run!", flush=True)
+            print(f"[Checkpoint] Ignoring legacy pre-v10 checkpoint (epoch {saved_ep}) -> Starting fresh v10 Confidence-Margin SOTA run!", flush=True)
 
     lambda_iam = float(getattr(args, 'lambda_iam', 0.0))
     lambda_acc = float(getattr(args, 'lambda_acc', 0.0))
-    mode_tag = "ANTI-OVERFITTING LGT-SGNM VISUAL SOTA" if args.no_audio else "MULTIMODAL SOTA"
+    mode_tag = "CONFIDENCE-MARGIN LGT-SGNM VISUAL SOTA" if args.no_audio else "MULTIMODAL SOTA"
     print("\n" + "=" * 78, flush=True)
-    print(f"[START] MA-RUPA v9 ({mode_tag}) ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
+    print(f"[START] MA-RUPA v10 ({mode_tag}) ON XD-VIOLENCE ({args.max_epoch} EPOCHS)", flush=True)
     print(f"  Batch Size : {sampling_desc}", flush=True)
-    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps (Warmup={warmup_iters}) | LR = {main_lr:.1e}->5.0e-7 (WD={args.weight_decay:.0e})", flush=True)
+    print(f"  Schedule   : {num_batches_per_epoch} iters/epoch | Total = {total_iters} steps (Warmup={warmup_iters}) | LR = {main_lr:.1e}->{main_lr*0.05:.1e} (WD={args.weight_decay:.0e})", flush=True)
     print(f"  Loss Eq.   : MIL=1.0 | CLASM={args.loss2_weight} | Orth={args.loss_sep_weight} | Event={args.loss_residual_weight} | Bkg={args.loss_reconstructed_normal_weight} | Cons={args.loss_consistency_weight} | Gather={args.loss_gather_weight}", flush=True)
-    print(f"  Regularize : FeatDrop={getattr(args, 'feat_dropout', 0.15):.2f} | MLPDrop={args.mlp_dropout:.2f} | WarmupEMA={args.ema_decay} | Zero Rollback | {'1-Crop + 5-Crop Eval' if args.multi_crop_eval else '1-Crop Eval'}", flush=True)
+    print(f"  Regularize : Per-Bag Confidence Margin | MLPDrop={args.mlp_dropout:.2f} | WarmupEMA={args.ema_decay} | Zero Rollback | {'1-Crop + 5-Crop Eval' if args.multi_crop_eval else '1-Crop Eval'}", flush=True)
     print("=" * 78 + "\n", flush=True)
 
     for e in range(start_epoch, args.max_epoch):
@@ -531,7 +531,7 @@ def train(model_or_args, normal_loader=None, anomaly_loader=None, testloader=Non
 
         ckpt_payload = {
             'epoch': e,
-            'arch_version': 'marupa_v9_anti_overfit',
+            'arch_version': 'marupa_v10_sota',
             'model_state_dict': live_state,
             'optimizer_state_dict': optimizer_main.state_dict(),
             'optimizer_refiner_state_dict': optimizer_refiner.state_dict(),

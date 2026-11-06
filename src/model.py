@@ -799,7 +799,7 @@ class MARUPA(nn.Module):
 
         mlp_dropout = float(getattr(args, 'mlp_dropout', 0.15))
         self.mlp_dropout = mlp_dropout
-        self.feat_dropout = float(getattr(args, 'feat_dropout', 0.15))
+        self.feat_dropout = float(getattr(args, 'feat_dropout', 0.0))
         self.mst_adapter = (
             MSTSensitivityAdapter(embed_dim=visual_width, dilations=(1, 2, 4), dropout=mlp_dropout)
             if self.use_mdtp else None
@@ -961,10 +961,7 @@ class MARUPA(nn.Module):
 
         if padding_mask is None and lengths is not None:
             padding_mask = torch.arange(T, device=dev)[None, :] >= lengths.to(dev)[:, None]
-        valid_mask = (~padding_mask).unsqueeze(-1).to(images.dtype) if padding_mask is not None else None
 
-        if valid_mask is not None:
-            images = images * valid_mask
         if self.training and self.feat_dropout > 0.0:
             images = F.dropout(images, p=self.feat_dropout, training=True)
 
@@ -975,9 +972,6 @@ class MARUPA(nn.Module):
             base_pos = self.frame_position_embeddings.weight.unsqueeze(0).permute(0, 2, 1)
             pos_emb = F.interpolate(base_pos, size=T, mode='linear', align_corners=False).permute(0, 2, 1).expand(B, -1, -1)
 
-        if valid_mask is not None:
-            pos_emb = pos_emb * valid_mask
-
         attn_mask = (
             self.base_attn_mask
             if T == self.visual_length
@@ -985,28 +979,20 @@ class MARUPA(nn.Module):
         )
 
         x = (images + pos_emb).permute(1, 0, 2)  # [T, B, D]
-        x = self.temporal(x, attn_mask=attn_mask, padding_mask=padding_mask)
+        x = self.temporal(x, attn_mask=attn_mask, padding_mask=None)
         x = x.permute(1, 0, 2)  # [B, T, D]
-        if valid_mask is not None:
-            x = x * valid_mask
 
         adj = self.adj4(x, lengths)
         disadj = self.disAdj(B, T, device=dev, dtype=x.dtype)
-        if padding_mask is not None:
-            disadj = disadj.masked_fill(padding_mask.to(dtype=torch.bool, device=dev).unsqueeze(1), 0.0)
         x1_h = self.gelu(self.gc1(x, adj))
         x2_h = self.gelu(self.gc3(x, disadj))
-        if valid_mask is not None:
-            x1_h = x1_h * valid_mask
-            x2_h = x2_h * valid_mask
         x1 = self.gelu(self.gc2(x1_h, adj))
         x2 = self.gelu(self.gc4(x2_h, disadj))
 
         x = self.linear(torch.cat((x1, x2), dim=-1))
-        if valid_mask is not None:
-            x = x * valid_mask
 
         if self.mst_adapter is not None:
+            valid_mask = (~padding_mask).unsqueeze(-1).to(x.dtype) if padding_mask is not None else None
             x = self.mst_adapter(x, valid_mask=valid_mask)
 
         return x
@@ -1069,16 +1055,15 @@ class MARUPA(nn.Module):
             reconstructed_features, dynamic_normal_patterns, g_loss = self.video_anomaly_refiner(
                 visual_features, logits1_init, lengths_dev
             )
-            residual_features = (visual_features - reconstructed_features) * valid_mask
+            residual_features = visual_features - reconstructed_features
+            reconstruction_score = (
+                (1.0 - F.cosine_similarity(visual_features, reconstructed_features, dim=-1)).unsqueeze(-1) / 2.0
+            ).clamp(0.0, 1.0)
+
             cf_residual = (visual_features - reconstructed_features.detach()) * valid_mask
             res_delta = self.res_adapter(cf_residual) * valid_mask
-            enh_visual_features = (visual_features + 0.5 * torch.tanh(self.beta_res) * res_delta) * valid_mask
+            enh_visual_features = visual_features + torch.tanh(self.beta_res) * res_delta
             logits1 = self.classifier(enh_visual_features + self._apply_mlp(self.mlp2, enh_visual_features))
-            reconstruction_score = (
-                compute_normalized_recon_error(visual_features, reconstructed_features, lengths_dev)
-                .unsqueeze(-1)
-                .to(visual_features.dtype)
-            )
         else:
             enh_visual_features = visual_features
             logits1 = logits1_init
@@ -1086,7 +1071,7 @@ class MARUPA(nn.Module):
         detector_score = torch.sigmoid(logits1)
 
         # 5. Video-Conditioned Fine-Grained Text-Visual Alignment (logits2)
-        logits_attn = (logits1 * valid_mask).permute(0, 2, 1)  # [B, 1, T]
+        logits_attn = logits1.permute(0, 2, 1)  # [B, 1, T]
         visual_attn = F.normalize(torch.bmm(logits_attn, enh_visual_features), dim=-1, eps=1e-6)  # [B, 1, D]
         visual_attn_exp = visual_attn.expand(B, text_features_ori.shape[0], -1)                   # [B, C, D]
 
